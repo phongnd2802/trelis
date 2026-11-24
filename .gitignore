@@ -1,0 +1,27 @@
+# Go build output
+/bin/
+# `go build ./cmd/<name>` drops the binary in the repo root
+/trelis
+/server
+*.test
+*.out
+coverage*.html
+go.work
+go.work.sum
+
+# Local config / secrets
+.env
+.env.*
+!.env.example
+
+# anydoc Rust build artifacts (rebuilt by scripts/build-anydoc-lib.sh)
+/third_party/anydoc-go/target/
+/third_party/anydoc-go/lib/
+/third_party/anydoc-go/patched-anydoc/
+/third_party/anydoc-go/.anydoc-*
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
