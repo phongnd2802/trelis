@@ -86,7 +86,7 @@ func TestConvertDocxWithEmbeddedImage(t *testing.T) {
 	before := strings.Index(result.Markdown, "Widgets shipped on time.")
 	at := strings.Index(result.Markdown, imageLink)
 	after := strings.Index(result.Markdown, "Closing remarks.")
-	if before < 0 || at < 0 || after < 0 || !(before < at && at < after) {
+	if before < 0 || at < 0 || after < 0 || before >= at || at >= after {
 		t.Fatalf("image is not between the surrounding paragraphs:\n%s", result.Markdown)
 	}
 }
