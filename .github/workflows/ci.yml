@@ -15,6 +15,20 @@ jobs:
   # Default build: no Rust, the anydoc engine compiles as a stub.
   lite:
     runs-on: ubuntu-latest
+    # Same image as compose.yaml, so migration tests see pg_search and pgvector.
+    services:
+      postgres:
+        image: paradedb/paradedb:0.27.1-pg18
+        env:
+          POSTGRES_USER: trelis
+          POSTGRES_PASSWORD: trelis
+          POSTGRES_DB: trelis
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U trelis -d trelis"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      TRELIS_TEST_POSTGRES_DSN: postgres://trelis:trelis@localhost:5432/trelis?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

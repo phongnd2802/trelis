@@ -1,0 +1,132 @@
+# Local stack: `docker compose up --build`.
+#
+#   trelis       http://localhost:8080   (/healthz liveness, /readyz dependencies)
+#   temporal-ui  http://localhost:8233
+#   neo4j        http://localhost:7474   (bolt on 7687)
+#   postgres     localhost:5432          (databases: trelis, temporal, temporal_visibility)
+#
+# Credentials are development defaults; override them through a .env file
+# next to this one (see .env.example).
+
+x-pg-env: &pg-env
+  POSTGRES_USER: ${POSTGRES_USER:-trelis}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trelis}
+
+services:
+  postgres:
+    # ParadeDB bundles pg_search (BM25) and pgvector on Postgres 18.
+    image: paradedb/paradedb:0.27.1-pg18
+    environment:
+      <<: *pg-env
+      POSTGRES_DB: trelis
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql]
+    healthcheck:
+      # Over TCP: during first-boot init the image runs a socket-only server
+      # that a socket check would already report as ready.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d trelis"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  neo4j:
+    image: neo4j:5.26.34-community
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-trelis-dev}
+    ports: ["127.0.0.1:7474:7474", "127.0.0.1:7687:7687"]
+    volumes: [neo4jdata:/data]
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p $${NEO4J_AUTH#neo4j/} 'RETURN 1' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Creates Temporal's own databases on the shared Postgres and brings their
+  # schemas up to the server version. Every step is idempotent, so it re-runs
+  # on each `up`; any real error fails it and blocks the server.
+  temporal-schema:
+    image: temporalio/admin-tools:1.32.2
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      <<: *pg-env
+    entrypoint: ["sh", "-euc"]
+    command:
+      - |
+        sql() { temporal-sql-tool --plugin postgres12 --ep postgres -p 5432 -u "$$POSTGRES_USER" --pw "$$POSTGRES_PASSWORD" --db "$$1" $$2; }
+        for db in temporal temporal_visibility; do
+          case $$db in temporal) dir=temporal ;; *) dir=visibility ;; esac
+          sql $$db create-database
+          sql $$db "setup-schema -v 0.0"
+          sql $$db "update-schema -d /etc/temporal/schema/postgresql/v12/$$dir/versioned"
+        done
+    restart: "no"
+
+  temporal:
+    image: temporalio/server:1.32.2
+    depends_on:
+      temporal-schema: { condition: service_completed_successfully }
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_SEEDS: postgres
+      POSTGRES_USER: ${POSTGRES_USER:-trelis}
+      POSTGRES_PWD: ${POSTGRES_PASSWORD:-trelis}
+      BIND_ON_IP: 0.0.0.0
+      DYNAMIC_CONFIG_FILE_PATH: /etc/temporal/config/dynamicconfig/docker.yaml
+    volumes:
+      - ./deploy/temporal/dynamicconfig.yaml:/etc/temporal/config/dynamicconfig/docker.yaml:ro
+    healthcheck:
+      # The frontend binds the container IP (BIND_ON_IP), not localhost.
+      test: ["CMD-SHELL", "nc -z $$(hostname -i) 7233"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    restart: on-failure
+    ports: ["127.0.0.1:7233:7233"]
+
+  # Registers the namespace Trelis runs its workflows in. Safe to re-run.
+  temporal-namespace:
+    image: temporalio/admin-tools:1.32.2
+    depends_on:
+      temporal: { condition: service_healthy }
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    entrypoint: ["sh", "-euc"]
+    command:
+      - |
+        n=0
+        until temporal operator cluster health >/dev/null 2>&1; do
+          n=$$((n+1)); [ $$n -lt 60 ] || { echo "temporal not serving after 60s"; exit 1; }
+          sleep 1
+        done
+        temporal operator namespace describe -n default >/dev/null 2>&1 \
+          || temporal operator namespace create -n default --retention 72h
+    restart: "no"
+
+  temporal-ui:
+    image: temporalio/ui:2.58.1
+    depends_on: [temporal]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    ports: ["127.0.0.1:8233:8080"]
+
+  trelis:
+    build: .
+    depends_on:
+      postgres: { condition: service_healthy }
+      neo4j: { condition: service_healthy }
+      temporal-namespace: { condition: service_completed_successfully }
+    environment:
+      TRELIS_POSTGRES_HOST: postgres
+      TRELIS_POSTGRES_USER: ${POSTGRES_USER:-trelis}
+      TRELIS_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trelis}
+      TRELIS_NEO4J_HOST: neo4j
+      TRELIS_NEO4J_PASSWORD: ${NEO4J_PASSWORD:-trelis-dev}
+      TRELIS_TEMPORAL_HOST: temporal
+    ports: ["127.0.0.1:8080:8080"]
+    restart: on-failure
+
+volumes:
+  pgdata:
+  neo4jdata:

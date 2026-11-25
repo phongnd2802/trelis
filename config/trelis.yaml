@@ -1,8 +1,28 @@
 # Trelis service configuration. Any key can be overridden by an environment
 # variable: TRELIS_ + the key path in upper case, dots as underscores.
-#   server.addr             -> TRELIS_SERVER_ADDR
-#   server.shutdown_timeout -> TRELIS_SERVER_SHUTDOWN_TIMEOUT
+#   server.addr        -> TRELIS_SERVER_ADDR
+#   postgres.password  -> TRELIS_POSTGRES_PASSWORD
+# Defaults target the ports compose.yaml publishes on localhost.
 server:
   addr: ":8080"
   # How long SIGTERM waits for in-flight requests before giving up.
   shutdown_timeout: 10s
+
+postgres:
+  host: localhost
+  port: 5432
+  dbname: trelis
+  user: trelis
+  password: trelis
+  sslmode: disable
+
+neo4j:
+  host: localhost
+  port: 7687
+  user: neo4j
+  password: trelis-dev
+
+temporal:
+  host: localhost
+  port: 7233
+  namespace: default

@@ -25,7 +25,10 @@ const minShutdownTimeout = time.Second
 
 // Config is the whole service configuration.
 type Config struct {
-	Server Server `mapstructure:"server"`
+	Server   Server   `mapstructure:"server"`
+	Postgres Postgres `mapstructure:"postgres"`
+	Neo4j    Neo4j    `mapstructure:"neo4j"`
+	Temporal Temporal `mapstructure:"temporal"`
 }
 
 // Server configures the HTTP listener.
@@ -41,7 +44,25 @@ type Server struct {
 var defaults = map[string]any{
 	"server.addr":             ":8080",
 	"server.shutdown_timeout": 10 * time.Second,
+
+	"postgres.host":     "localhost",
+	"postgres.port":     5432,
+	"postgres.dbname":   "trelis",
+	"postgres.user":     "trelis",
+	"postgres.password": "",
+	"postgres.sslmode":  "disable",
+
+	"neo4j.host":     "localhost",
+	"neo4j.port":     7687,
+	"neo4j.user":     "neo4j",
+	"neo4j.password": "",
+
+	"temporal.host":      "localhost",
+	"temporal.port":      7233,
+	"temporal.namespace": "default",
 }
+
+var sslModes = []string{"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
 
 // Load reads the YAML file at path, applies env overrides and validates the
 // result. Every error names the file or the offending key.
@@ -102,5 +123,33 @@ func (c *Config) validate() error {
 	if c.Server.ShutdownTimeout < minShutdownTimeout {
 		errs = append(errs, fmt.Errorf("server.shutdown_timeout must be at least %v (write a unit, e.g. 10s), got %v", minShutdownTimeout, c.Server.ShutdownTimeout))
 	}
+
+	required := func(key, value string) {
+		if strings.TrimSpace(value) == "" {
+			errs = append(errs, fmt.Errorf("%s is required", key))
+		}
+	}
+	port := func(key string, value int) {
+		if value < 1 || value > 65535 {
+			errs = append(errs, fmt.Errorf("%s must be between 1 and 65535, got %d", key, value))
+		}
+	}
+
+	required("postgres.host", c.Postgres.Host)
+	port("postgres.port", c.Postgres.Port)
+	required("postgres.dbname", c.Postgres.DBName)
+	required("postgres.user", c.Postgres.User)
+	if !slices.Contains(sslModes, c.Postgres.SSLMode) {
+		errs = append(errs, fmt.Errorf("postgres.sslmode must be one of %s, got %q", strings.Join(sslModes, ", "), c.Postgres.SSLMode))
+	}
+
+	required("neo4j.host", c.Neo4j.Host)
+	port("neo4j.port", c.Neo4j.Port)
+	required("neo4j.user", c.Neo4j.User)
+
+	required("temporal.host", c.Temporal.Host)
+	port("temporal.port", c.Temporal.Port)
+	required("temporal.namespace", c.Temporal.Namespace)
+
 	return errors.Join(errs...)
 }
