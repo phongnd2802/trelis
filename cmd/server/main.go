@@ -25,7 +25,7 @@ import (
 	temporallog "go.temporal.io/sdk/log"
 
 	"github.com/phongnd2802/trelis/internal/config"
-	"github.com/phongnd2802/trelis/internal/postgres"
+	"github.com/phongnd2802/trelis/internal/db"
 	"github.com/phongnd2802/trelis/internal/router"
 )
 
@@ -54,12 +54,12 @@ func run(configPath string) error {
 	// force-quits instead of waiting out the drain.
 	go func() { <-ctx.Done(); stop() }()
 
-	pool, err := postgres.Open(ctx, cfg.Postgres.DSN())
+	pool, err := db.Open(ctx, cfg.Postgres.DSN())
 	if err != nil {
 		return err
 	}
 	defer pool.Close()
-	applied, err := postgres.Migrate(ctx, pool)
+	applied, err := db.Migrate(ctx, pool)
 	if err != nil {
 		return err
 	}
