@@ -48,4 +48,4 @@ Used by `/wayfinder`. The **map** is a single issue with **child** issues as tic
 
 ## Watching CI
 
-`gh pr checks <n> --watch` can fail with a transient GraphQL error. Fall back to `gh run list --branch <branch> --limit 1 --json status,conclusion,databaseId`, then `gh run view <id> --json jobs`.
+`scripts/ci-wait.sh <branch>` waits for the latest run on the branch, prints each job's conclusion and exits non-zero on failure. Prefer it to `gh pr checks --watch`, which can fail with a transient GraphQL error.

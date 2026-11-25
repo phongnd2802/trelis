@@ -112,6 +112,9 @@ services:
     ports: ["127.0.0.1:8233:8080"]
 
   trelis:
+    # Named so CI can build it once with a cache (docker/bake-action) and
+    # `up` reuses it instead of rebuilding.
+    image: trelis:dev
     build: .
     depends_on:
       postgres: { condition: service_healthy }

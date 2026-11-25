@@ -1,6 +1,6 @@
 ## Workflow
 
-Each ticket gets its own branch `<type>/<slug>` (e.g. `ci/build-green`, `feat/chunker-core`) cut from `main`, and a PR whose body has `Closes #N`. `main` only changes through merged PRs. Before pushing, run `make lint vet test` (CI also runs the `-linked` variants, see `.github/workflows/ci.yml`).
+Each ticket gets its own branch `<type>/<slug>` (e.g. `ci/build-green`, `feat/chunker-core`) cut from `main`, and a PR whose body has `Closes #N`. `main` only changes through merged PRs. Before pushing, run `make lint vet test` (CI also runs the `-linked` variants and a compose smoke test, see `.github/workflows/ci.yml`). Start the local stack with `make stack-up`; after pushing, wait for CI with `scripts/ci-wait.sh <branch>`.
 
 ## Agent skills
 
