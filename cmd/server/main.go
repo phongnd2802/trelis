@@ -1,43 +1,56 @@
+// Command server runs the Trelis HTTP service.
+//
+//	server -config config/trelis.yaml
+//
+// SIGINT or SIGTERM stops accepting connections and drains in-flight
+// requests for up to server.shutdown_timeout before exiting.
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
+	"log/slog"
+	"net"
 	"os"
-	"path/filepath"
-	"strings"
+	"os/signal"
+	"syscall"
 
-	"github.com/phongnd2802/trelis/internal/parser"
-	"github.com/phongnd2802/trelis/internal/types"
+	"github.com/phongnd2802/trelis/internal/config"
+	"github.com/phongnd2802/trelis/internal/router"
 )
 
 func main() {
-	filePath := "TN06.docx"
+	configPath := flag.String("config", "config/trelis.yaml", "path to the YAML config file")
+	flag.Parse()
 
-	anydocParser := parser.NewAnydocParser(false)
-	fileContent, err := os.ReadFile(filePath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "read %s: %v\n", filePath, err)
+	if err := run(*configPath); err != nil {
+		fmt.Fprintln(os.Stderr, "trelis:", err)
 		os.Exit(1)
 	}
+}
 
-	fileName := filepath.Base(filePath)
-	fileType := strings.TrimPrefix(filepath.Ext(fileName), ".")
-	title := strings.TrimSuffix(fileName, filepath.Ext(fileName))
-
-	ctx := context.Background()
-	req := &types.ParseRequest{
-		FileContent: fileContent,
-		FileName:    fileName,
-		FileType:    fileType,
-		Title:       title,
-	}
-	result, err := anydocParser.Parse(ctx, req)
+func run(configPath string) error {
+	cfg, err := config.Load(configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "parse %s: %v\n", filePath, err)
-		os.Exit(1)
+		return err
 	}
 
-	fmt.Println("======Result=====")
-	fmt.Println(result.MarkdownContent)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	// After the first signal, restore default handling so a second one
+	// force-quits instead of waiting out the drain.
+	go func() { <-ctx.Done(); stop() }()
+
+	ln, err := net.Listen("tcp", cfg.Server.Addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", cfg.Server.Addr, err)
+	}
+	slog.Info("trelis listening", "addr", ln.Addr().String(), "config", configPath)
+
+	if err := router.Serve(ctx, ln, router.New(), cfg.Server.ShutdownTimeout); err != nil {
+		return err
+	}
+	slog.Info("trelis stopped")
+	return nil
 }

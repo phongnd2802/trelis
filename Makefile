@@ -27,8 +27,8 @@ build:
 build-lite:
 	go build -o $(BINARY) $(PKG)
 
-# Runs cmd/server/main.go from the repo root, so relative paths in it resolve
-# here. Builds the anydoc archive first if it is missing.
+# Runs the service from the repo root, so the default -config path
+# (config/trelis.yaml) resolves. Builds the anydoc archive first if missing.
 ANYDOC_ARCHIVE := third_party/anydoc-go/lib/linux_amd64_gnu/libanydoc_go.a
 
 dev:
