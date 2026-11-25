@@ -1,4 +1,4 @@
-.PHONY: help anydoc-lib build build-lite dev test test-linked vet vet-lite vet-linked lint lint-linked clean
+.PHONY: help tools anydoc-lib build build-lite dev test test-linked vet vet-lite vet-linked lint lint-linked stack-up clean
 
 BIN_DIR := bin
 BINARY  := $(BIN_DIR)/trelis
@@ -6,6 +6,7 @@ PKG     := ./cmd/server
 
 help:
 	@echo "Targets:"
+	@echo "  tools        install pinned dev tools (golangci-lint) into GOPATH/bin"
 	@echo "  anydoc-lib   build the anydoc Rust static archive (needs cargo)"
 	@echo "  build        build trelis with the anydoc engine linked (needs anydoc-lib)"
 	@echo "  build-lite   build trelis without anydoc (no Rust needed; engine unavailable)"
@@ -14,6 +15,7 @@ help:
 	@echo "  test-linked  full tests against the linked anydoc archive"
 	@echo "  vet          go vet both build variants (vet-lite / vet-linked for one)"
 	@echo "  lint         golangci-lint incl. gofmt, no archive (lint-linked: -tags anydoc)"
+	@echo "  stack-up     docker compose up --build and wait; on failure print the broken services' logs"
 	@echo "  clean        remove bin/ and Rust build output"
 
 # The archive is a ~30 MB build artifact and is git-ignored, see
@@ -49,12 +51,22 @@ vet-lite:
 vet-linked:
 	CGO_ENABLED=1 go vet -tags anydoc ./...
 
-# Config in .golangci.yml. Install: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
+# Config in .golangci.yml. Resolved from GOPATH/bin so it works without
+# GOPATH/bin on PATH; `make tools` installs the pinned version there.
+GOLANGCI_LINT_VERSION := v2.15.0
+GOLANGCI_LINT ?= $(shell go env GOPATH)/bin/golangci-lint
+
+tools:
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+
 lint:
-	golangci-lint run ./...
+	$(GOLANGCI_LINT) run ./...
 
 lint-linked:
-	CGO_ENABLED=1 golangci-lint run --build-tags anydoc ./...
+	CGO_ENABLED=1 $(GOLANGCI_LINT) run --build-tags anydoc ./...
+
+stack-up:
+	./scripts/stack-up.sh
 
 clean:
 	rm -rf $(BIN_DIR) third_party/anydoc-go/target third_party/anydoc-go/patched-anydoc

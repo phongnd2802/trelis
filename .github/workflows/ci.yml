@@ -8,9 +8,6 @@ on:
 permissions:
   contents: read
 
-env:
-  GOLANGCI_LINT_VERSION: v2.15.0
-
 jobs:
   # Default build: no Rust, the anydoc engine compiles as a stub.
   lite:
@@ -34,8 +31,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}
+      - name: Install golangci-lint (version pinned in Makefile)
+        run: make tools
       - name: Lint (golangci-lint + gofmt)
         run: make lint
       - name: Vet
@@ -57,8 +54,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: third_party/anydoc-go
-      - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}
+      - name: Install golangci-lint (version pinned in Makefile)
+        run: make tools
       - name: Build anydoc archive
         run: make anydoc-lib
       - name: Lint
@@ -69,3 +66,23 @@ jobs:
         run: make test-linked
       - name: Build
         run: make build
+
+  # The whole compose stack on a fresh runner (the clean-checkout case), then
+  # again over the same volumes to prove every init step is idempotent.
+  compose-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: First boot (empty volumes)
+        run: WAIT_TIMEOUT=600 make stack-up
+      - name: Ready
+        run: curl -fsS --retry 15 --retry-delay 2 --retry-all-errors localhost:8080/readyz
+      - name: Second boot (same volumes)
+        run: |
+          docker compose down
+          WAIT_TIMEOUT=300 make stack-up
+      - name: Ready again, no migration re-applied
+        run: |
+          curl -fsS --retry 15 --retry-delay 2 --retry-all-errors localhost:8080/readyz
+          docker compose logs --no-color trelis | grep 'postgres migrated' | tail -1 | tee /dev/stderr | grep -q 'applied=0'
