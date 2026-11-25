@@ -1,14 +1,15 @@
-.PHONY: help anydoc-lib build build-lite test test-linked vet clean
+.PHONY: help anydoc-lib build build-lite dev test test-linked vet clean
 
 BIN_DIR := bin
 BINARY  := $(BIN_DIR)/trelis
-PKG     := ./cmd/trelis
+PKG     := ./cmd/server
 
 help:
 	@echo "Targets:"
 	@echo "  anydoc-lib   build the anydoc Rust static archive (needs cargo)"
 	@echo "  build        build trelis with the anydoc engine linked (needs anydoc-lib)"
 	@echo "  build-lite   build trelis without anydoc (no Rust needed; engine unavailable)"
+	@echo "  dev          go run ./cmd/server with anydoc linked (ARGS=... passes flags)"
 	@echo "  test         unit tests that need no archive"
 	@echo "  test-linked  full tests against the linked anydoc archive"
 	@echo "  vet          go vet both build variants"
@@ -24,6 +25,14 @@ build:
 
 build-lite:
 	go build -o $(BINARY) $(PKG)
+
+# Runs cmd/server/main.go from the repo root, so relative paths in it resolve
+# here. Builds the anydoc archive first if it is missing.
+ANYDOC_ARCHIVE := third_party/anydoc-go/lib/linux_amd64_gnu/libanydoc_go.a
+
+dev:
+	@test -f $(ANYDOC_ARCHIVE) || $(MAKE) anydoc-lib
+	CGO_ENABLED=1 go run -tags anydoc ./cmd/server $(ARGS)
 
 test:
 	go test ./...
