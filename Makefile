@@ -1,4 +1,4 @@
-.PHONY: help anydoc-lib build build-lite dev test test-linked vet clean
+.PHONY: help anydoc-lib build build-lite dev test test-linked vet vet-lite vet-linked lint lint-linked clean
 
 BIN_DIR := bin
 BINARY  := $(BIN_DIR)/trelis
@@ -12,7 +12,8 @@ help:
 	@echo "  dev          go run ./cmd/server with anydoc linked (ARGS=... passes flags)"
 	@echo "  test         unit tests that need no archive"
 	@echo "  test-linked  full tests against the linked anydoc archive"
-	@echo "  vet          go vet both build variants"
+	@echo "  vet          go vet both build variants (vet-lite / vet-linked for one)"
+	@echo "  lint         golangci-lint incl. gofmt, no archive (lint-linked: -tags anydoc)"
 	@echo "  clean        remove bin/ and Rust build output"
 
 # The archive is a ~30 MB build artifact and is git-ignored, see
@@ -40,9 +41,20 @@ test:
 test-linked:
 	CGO_ENABLED=1 go test -tags anydoc ./...
 
-vet:
+vet: vet-lite vet-linked
+
+vet-lite:
 	go vet ./...
+
+vet-linked:
 	CGO_ENABLED=1 go vet -tags anydoc ./...
+
+# Config in .golangci.yml. Install: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
+lint:
+	golangci-lint run ./...
+
+lint-linked:
+	CGO_ENABLED=1 golangci-lint run --build-tags anydoc ./...
 
 clean:
 	rm -rf $(BIN_DIR) third_party/anydoc-go/target third_party/anydoc-go/patched-anydoc

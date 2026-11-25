@@ -2,10 +2,7 @@ package openairesponses
 
 import "github.com/phongnd2802/trelis/internal/models/api"
 
-// defaultPath is where the Responses API lives under the base URL.
-// Chat and streaming arrive with #19.
-const defaultPath = "/responses"
-
+// Client talks to an OpenAI Responses endpoint. Chat and streaming arrive with #19.
 type Client struct {
 	cfg Config
 }

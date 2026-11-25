@@ -25,3 +25,10 @@ go.work.sum
 .vscode/
 *.swp
 .DS_Store
+
+# Personal notes and sample inputs kept out of the repo
+/.scratch/
+/TN06.docx
+
+# Claude Code per-user settings
+/.claude/settings.local.json

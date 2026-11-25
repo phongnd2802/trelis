@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"strings"
 
@@ -42,7 +43,7 @@ func (r *AnydocParser) Parse(ctx context.Context, req *types.ParseRequest) (*typ
 	}
 
 	if converted.AssetsError != nil {
-		fmt.Printf("[anydoc] %q parsed as text but its images were dropped: %v\n", req.FileName, converted.AssetsError)
+		slog.WarnContext(ctx, "anydoc parsed text but dropped images", "file", req.FileName, "err", converted.AssetsError)
 	}
 	return &types.ParseResult{
 		MarkdownContent: converted.Markdown,
