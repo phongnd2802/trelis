@@ -10,8 +10,9 @@
 #
 # Every trelis route except the probes needs an API key. Create one with:
 #   docker compose run --rm trelis admin principal create alice
-#   docker compose run --rm trelis admin key create alice
-# then send it as "Authorization: Bearer <key>", e.g. GET /me.
+#   docker compose run --rm trelis admin key create alice   # prints <id> <key>
+# then send the key as "Authorization: Bearer <key>", e.g. GET /me.
+# `admin key list alice` and `admin key revoke <id>` manage keys afterwards.
 
 name: trelis
 

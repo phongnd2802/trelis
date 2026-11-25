@@ -7,6 +7,7 @@ package sqlc
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -26,8 +27,9 @@ func (q *Queries) AddGroupMember(ctx context.Context, arg AddGroupMemberParams) 
 	return err
 }
 
-const createAPIKey = `-- name: CreateAPIKey :exec
+const createAPIKey = `-- name: CreateAPIKey :one
 INSERT INTO api_keys (principal_id, key_hash) VALUES ($1, $2)
+RETURNING id, created_at, revoked_at
 `
 
 type CreateAPIKeyParams struct {
@@ -35,9 +37,17 @@ type CreateAPIKeyParams struct {
 	KeyHash     []byte
 }
 
-func (q *Queries) CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) error {
-	_, err := q.db.Exec(ctx, createAPIKey, arg.PrincipalID, arg.KeyHash)
-	return err
+type CreateAPIKeyRow struct {
+	ID        uuid.UUID
+	CreatedAt time.Time
+	RevokedAt *time.Time
+}
+
+func (q *Queries) CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (CreateAPIKeyRow, error) {
+	row := q.db.QueryRow(ctx, createAPIKey, arg.PrincipalID, arg.KeyHash)
+	var i CreateAPIKeyRow
+	err := row.Scan(&i.ID, &i.CreatedAt, &i.RevokedAt)
+	return i, err
 }
 
 const createGroup = `-- name: CreateGroup :one
@@ -92,7 +102,7 @@ const getPrincipalByKeyHash = `-- name: GetPrincipalByKeyHash :one
 SELECT p.id, p.name
 FROM api_keys k
 JOIN principals p ON p.id = k.principal_id
-WHERE k.key_hash = $1
+WHERE k.key_hash = $1 AND k.revoked_at IS NULL
 `
 
 type GetPrincipalByKeyHashRow struct {
@@ -121,6 +131,39 @@ func (q *Queries) GetPrincipalByName(ctx context.Context, name string) (GetPrinc
 	var i GetPrincipalByNameRow
 	err := row.Scan(&i.ID, &i.Name)
 	return i, err
+}
+
+const listAPIKeys = `-- name: ListAPIKeys :many
+SELECT id, created_at, revoked_at
+FROM api_keys
+WHERE principal_id = $1
+ORDER BY created_at, id
+`
+
+type ListAPIKeysRow struct {
+	ID        uuid.UUID
+	CreatedAt time.Time
+	RevokedAt *time.Time
+}
+
+func (q *Queries) ListAPIKeys(ctx context.Context, principalID uuid.UUID) ([]ListAPIKeysRow, error) {
+	rows, err := q.db.Query(ctx, listAPIKeys, principalID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAPIKeysRow
+	for rows.Next() {
+		var i ListAPIKeysRow
+		if err := rows.Scan(&i.ID, &i.CreatedAt, &i.RevokedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listPrincipalGroups = `-- name: ListPrincipalGroups :many
@@ -154,4 +197,17 @@ func (q *Queries) ListPrincipalGroups(ctx context.Context, principalID uuid.UUID
 		return nil, err
 	}
 	return items, nil
+}
+
+const revokeAPIKey = `-- name: RevokeAPIKey :execrows
+UPDATE api_keys SET revoked_at = coalesce(revoked_at, now()) WHERE id = $1
+`
+
+// Revoking twice keeps the first revocation time.
+func (q *Queries) RevokeAPIKey(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeAPIKey, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

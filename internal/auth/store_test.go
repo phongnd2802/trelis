@@ -6,6 +6,8 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/phongnd2802/trelis/internal/auth"
 	"github.com/phongnd2802/trelis/internal/db/dbtest"
 )
@@ -22,7 +24,7 @@ func TestAKeyAuthenticatesAsItsPrincipal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreatePrincipal: %v", err)
 	}
-	key, err := s.CreateKey(ctx, "alice")
+	_, key, err := s.CreateKey(ctx, "alice")
 	if err != nil {
 		t.Fatalf("CreateKey: %v", err)
 	}
@@ -42,7 +44,7 @@ func TestAnUnknownKeyIsUnauthenticated(t *testing.T) {
 	if _, err := s.CreatePrincipal(ctx, "alice"); err != nil {
 		t.Fatal(err)
 	}
-	key, err := s.CreateKey(ctx, "alice")
+	_, key, err := s.CreateKey(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +75,7 @@ func TestAuthenticateReturnsThePrincipalsGroups(t *testing.T) {
 		}
 	}
 
-	aliceKey, err := s.CreateKey(ctx, "alice")
+	_, aliceKey, err := s.CreateKey(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +94,7 @@ func TestAPrincipalWithNoGroupsHasAnEmptyList(t *testing.T) {
 	if _, err := s.CreatePrincipal(ctx, "carol"); err != nil {
 		t.Fatal(err)
 	}
-	key, err := s.CreateKey(ctx, "carol")
+	_, key, err := s.CreateKey(ctx, "carol")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +122,7 @@ func TestAddMemberRejectsUnknownNames(t *testing.T) {
 	if err := s.AddMember(ctx, "tax", "nope"); !errors.Is(err, auth.ErrNotFound) {
 		t.Errorf("unknown principal: err = %v, want ErrNotFound", err)
 	}
-	if _, err := s.CreateKey(ctx, "nope"); !errors.Is(err, auth.ErrNotFound) {
+	if _, _, err := s.CreateKey(ctx, "nope"); !errors.Is(err, auth.ErrNotFound) {
 		t.Errorf("key for unknown principal: err = %v, want ErrNotFound", err)
 	}
 }
@@ -140,7 +142,7 @@ func TestKeysAreStoredHashed(t *testing.T) {
 	if _, err := s.CreatePrincipal(ctx, "alice"); err != nil {
 		t.Fatal(err)
 	}
-	key, err := s.CreateKey(ctx, "alice")
+	_, key, err := s.CreateKey(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,5 +177,109 @@ func TestNamesAreUnique(t *testing.T) {
 	}
 	if _, err := s.CreateGroup(ctx, "tax"); !errors.Is(err, auth.ErrExists) {
 		t.Errorf("second group tax: err = %v, want ErrExists", err)
+	}
+}
+
+func TestARevokedKeyNoLongerAuthenticates(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	if _, err := s.CreatePrincipal(ctx, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	leaked, leakedKey, err := s.CreateKey(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, otherKey, err := s.CreateKey(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.RevokeKey(ctx, leaked.ID); err != nil {
+		t.Fatalf("RevokeKey: %v", err)
+	}
+	if _, err := s.Authenticate(ctx, leakedKey); !errors.Is(err, auth.ErrUnauthenticated) {
+		t.Errorf("revoked key: err = %v, want ErrUnauthenticated", err)
+	}
+	if p, err := s.Authenticate(ctx, otherKey); err != nil || p.Name != "alice" {
+		t.Errorf("alice's other key = (%+v, %v), want it to still authenticate", p, err)
+	}
+}
+
+func TestListKeysShowsEachKeyAndWhetherItIsRevoked(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	for _, name := range []string{"alice", "bob"} {
+		if _, err := s.CreatePrincipal(ctx, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, _, err := s.CreateKey(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := s.CreateKey(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.CreateKey(ctx, "bob"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RevokeKey(ctx, first.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	keys, err := s.ListKeys(ctx, "alice")
+	if err != nil {
+		t.Fatalf("ListKeys: %v", err)
+	}
+	if len(keys) != 2 || keys[0].ID != first.ID || keys[1].ID != second.ID {
+		t.Fatalf("ListKeys(alice) = %+v, want alice's two keys, oldest first", keys)
+	}
+	if keys[0].RevokedAt == nil || keys[1].RevokedAt != nil {
+		t.Errorf("revoked = [%v %v], want [revoked, active]", keys[0].RevokedAt, keys[1].RevokedAt)
+	}
+	if keys[1].CreatedAt.IsZero() || !keys[1].CreatedAt.Equal(second.CreatedAt) {
+		t.Errorf("CreatedAt = %v, want %v from CreateKey", keys[1].CreatedAt, second.CreatedAt)
+	}
+
+	if _, err := s.ListKeys(ctx, "ghost"); !errors.Is(err, auth.ErrNotFound) {
+		t.Errorf("ListKeys(ghost) err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRevokingTwiceKeepsTheFirstRevocation(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	if _, err := s.CreatePrincipal(ctx, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	k, _, err := s.CreateKey(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RevokeKey(ctx, k.ID); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.ListKeys(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RevokeKey(ctx, k.ID); err != nil {
+		t.Fatalf("second RevokeKey: %v, want a no-op", err)
+	}
+	after, err := s.ListKeys(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after[0].RevokedAt.Equal(*before[0].RevokedAt) {
+		t.Errorf("RevokedAt moved from %v to %v", before[0].RevokedAt, after[0].RevokedAt)
+	}
+}
+
+func TestRevokingAnUnknownKeyIsNotFound(t *testing.T) {
+	s := newStore(t)
+	if err := s.RevokeKey(context.Background(), uuid.New()); !errors.Is(err, auth.ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
 	}
 }
