@@ -1,0 +1,6 @@
+# Temporal dynamic config for the local stack. The server refuses to start
+# without a file here; add overrides as needed.
+# Reference: https://docs.temporal.io/references/dynamic-configuration
+limit.maxIDLength:
+  - value: 255
+    constraints: {}

@@ -1,0 +1,13 @@
+.git
+.github
+.scratch
+.claude
+.env
+.env.*
+bin
+*.docx
+!internal/parser/anydoc/testdata/**
+third_party/anydoc-go/target
+third_party/anydoc-go/lib
+third_party/anydoc-go/patched-anydoc
+third_party/anydoc-go/.anydoc-*

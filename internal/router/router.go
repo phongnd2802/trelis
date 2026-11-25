@@ -10,11 +10,13 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 )
 
-// New returns the service's routes.
-func New() http.Handler {
+// New returns the service's routes. GET /healthz is liveness and ignores
+// dependencies; GET /readyz probes every dependency in ready.
+func New(ready Readiness) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Get("/healthz", healthz)
+	r.Get("/readyz", ready.handler)
 	return r
 }
 
