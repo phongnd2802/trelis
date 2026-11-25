@@ -4,11 +4,14 @@
 #
 # Usage: scripts/stack-up.sh [extra `docker compose up` args]
 #   WAIT_TIMEOUT=600 scripts/stack-up.sh    # seconds, default 300
+#   BUILD=0 scripts/stack-up.sh             # use the already built trelis:dev image
 set -uo pipefail
 
 timeout=${WAIT_TIMEOUT:-300}
+build_flag=--build
+[ "${BUILD:-1}" = 0 ] && build_flag=--no-build
 
-if docker compose up -d --build --wait --wait-timeout "$timeout" "$@"; then
+if docker compose up -d "$build_flag" --wait --wait-timeout "$timeout" "$@"; then
   docker compose ps -a
   exit 0
 fi

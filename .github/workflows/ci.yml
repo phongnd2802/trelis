@@ -74,14 +74,28 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # Layers (including the Rust stage that builds the anydoc archive) are
+      # cached in the GitHub Actions cache, so an unchanged third_party/ skips
+      # the Rust build. RUN --mount=type=cache contents are not exported.
+      - name: Build trelis image (GitHub Actions cache)
+        uses: docker/bake-action@v6
+        with:
+          source: .
+          files: compose.yaml
+          targets: trelis
+          load: true
+          set: |
+            trelis.cache-from=type=gha,scope=trelis
+            trelis.cache-to=type=gha,scope=trelis,mode=max
       - name: First boot (empty volumes)
-        run: WAIT_TIMEOUT=600 make stack-up
+        run: BUILD=0 WAIT_TIMEOUT=600 make stack-up
       - name: Ready
         run: curl -fsS --retry 15 --retry-delay 2 --retry-all-errors localhost:8080/readyz
       - name: Second boot (same volumes)
         run: |
           docker compose down
-          WAIT_TIMEOUT=300 make stack-up
+          BUILD=0 WAIT_TIMEOUT=300 make stack-up
       - name: Ready again, no migration re-applied
         run: |
           curl -fsS --retry 15 --retry-delay 2 --retry-all-errors localhost:8080/readyz
