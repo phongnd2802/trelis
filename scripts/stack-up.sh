@@ -5,6 +5,7 @@
 # Usage: scripts/stack-up.sh [extra `docker compose up` args]
 #   WAIT_TIMEOUT=600 scripts/stack-up.sh    # seconds, default 300
 #   BUILD=0 scripts/stack-up.sh             # use the already built trelis:dev image
+#   COMPOSE_FILE=compose.dev.yaml scripts/stack-up.sh   # dependencies only (make dev-up)
 set -uo pipefail
 
 timeout=${WAIT_TIMEOUT:-300}

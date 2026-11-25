@@ -1,4 +1,4 @@
-.PHONY: help tools sqlc anydoc-lib build build-lite dev test test-linked vet vet-lite vet-linked lint lint-linked stack-up clean
+.PHONY: help tools sqlc anydoc-lib build build-lite dev test test-linked vet vet-lite vet-linked lint lint-linked stack-up dev-up dev-down clean
 
 BIN_DIR := bin
 BINARY  := $(BIN_DIR)/trelis
@@ -16,7 +16,9 @@ help:
 	@echo "  test-linked  full tests against the linked anydoc archive"
 	@echo "  vet          go vet both build variants (vet-lite / vet-linked for one)"
 	@echo "  lint         golangci-lint incl. gofmt, no archive (lint-linked: -tags anydoc)"
-	@echo "  stack-up     docker compose up --build and wait; on failure print the broken services' logs"
+	@echo "  dev-up       start only the dependencies (compose.dev.yaml) for \`make dev\`, and wait"
+	@echo "  dev-down     stop the local stack (dev or full), keeping its volumes"
+	@echo "  stack-up     full stack (compose.yaml, builds trelis) and wait; on failure print the broken services' logs"
 	@echo "  clean        remove bin/ and Rust build output"
 
 # The archive is a ~30 MB build artifact and is git-ignored, see
@@ -74,6 +76,16 @@ lint-linked:
 
 stack-up:
 	./scripts/stack-up.sh
+
+# The dependencies `make dev` needs, without building the trelis image.
+# docker compose reads COMPOSE_FILE, so stack-up.sh needs no flag for it.
+dev-up:
+	COMPOSE_FILE=compose.dev.yaml ./scripts/stack-up.sh
+
+# Through compose.yaml, which includes every service, so it also stops a
+# trelis container left by `make stack-up` instead of orphaning it.
+dev-down:
+	docker compose down
 
 clean:
 	rm -rf $(BIN_DIR) third_party/anydoc-go/target third_party/anydoc-go/patched-anydoc
