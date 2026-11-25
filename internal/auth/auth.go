@@ -20,9 +20,10 @@ import (
 )
 
 var (
-	// ErrUnauthenticated means a key belongs to no Principal.
+	// ErrUnauthenticated means a key belongs to no Principal or has been revoked.
 	ErrUnauthenticated = errors.New("auth: unauthenticated")
-	// ErrNotFound means no Principal or Group has the given name.
+	// ErrNotFound means no Principal or Group has the given name, or no API
+	// key has the given ID.
 	ErrNotFound = errors.New("auth: not found")
 	// ErrExists means a Principal or Group with that name already exists.
 	ErrExists = errors.New("auth: already exists")
@@ -90,7 +91,26 @@ func (s *Store) AddMember(ctx context.Context, group, principal string) error {
 // and secret scanners.
 const keyPrefix = "trelis_"
 
-// APIKey describes one of a Principal's keys, never the key itself.
+// CreateKey issues a new API key for the named Principal and returns it with
+// its description. Only its hash is stored, so this is the only time the key
+// can be read.
+func (s *Store) CreateKey(ctx context.Context, principal string) (APIKey, string, error) {
+	p, err := s.q.GetPrincipalByName(ctx, principal)
+	if err != nil {
+		return APIKey{}, "", lookupErr("principal", principal, err)
+	}
+	secret := make([]byte, 32)
+	_, _ = rand.Read(secret) // crypto/rand.Read never returns an error
+	key := keyPrefix + base64.RawURLEncoding.EncodeToString(secret)
+	row, err := s.q.CreateAPIKey(ctx, sqlc.CreateAPIKeyParams{PrincipalID: p.ID, KeyHash: hashKey(key)})
+	if err != nil {
+		return APIKey{}, "", fmt.Errorf("auth: create key for %q: %w", principal, err)
+	}
+	return APIKey(row), key, nil
+}
+
+// APIKey describes one of a Principal's keys, never the key itself. Its
+// fields match the sqlc rows of the key queries, so a row converts to it.
 type APIKey struct {
 	ID        uuid.UUID
 	CreatedAt time.Time
@@ -111,7 +131,7 @@ func (s *Store) ListKeys(ctx context.Context, principal string) ([]APIKey, error
 	}
 	keys := make([]APIKey, 0, len(rows))
 	for _, r := range rows {
-		keys = append(keys, APIKey{ID: r.ID, CreatedAt: r.CreatedAt, RevokedAt: r.RevokedAt})
+		keys = append(keys, APIKey(r))
 	}
 	return keys, nil
 }
@@ -128,24 +148,6 @@ func (s *Store) RevokeKey(ctx context.Context, id uuid.UUID) error {
 		return fmt.Errorf("%w: key %s", ErrNotFound, id)
 	}
 	return nil
-}
-
-// CreateKey issues a new API key for the named Principal and returns it with
-// its description. Only its hash is stored, so this is the only time the key
-// can be read.
-func (s *Store) CreateKey(ctx context.Context, principal string) (APIKey, string, error) {
-	p, err := s.q.GetPrincipalByName(ctx, principal)
-	if err != nil {
-		return APIKey{}, "", lookupErr("principal", principal, err)
-	}
-	secret := make([]byte, 32)
-	_, _ = rand.Read(secret) // crypto/rand.Read never returns an error
-	key := keyPrefix + base64.RawURLEncoding.EncodeToString(secret)
-	row, err := s.q.CreateAPIKey(ctx, sqlc.CreateAPIKeyParams{PrincipalID: p.ID, KeyHash: hashKey(key)})
-	if err != nil {
-		return APIKey{}, "", fmt.Errorf("auth: create key for %q: %w", principal, err)
-	}
-	return APIKey{ID: row.ID, CreatedAt: row.CreatedAt, RevokedAt: row.RevokedAt}, key, nil
 }
 
 // Authenticate returns the Principal that key belongs to, with their Groups,

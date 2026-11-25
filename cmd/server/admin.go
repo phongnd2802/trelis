@@ -71,11 +71,11 @@ func admin(ctx context.Context, s *auth.Store, args []string, out io.Writer) err
 		if err := need(1); err != nil {
 			return err
 		}
-		k, key, err := s.CreateKey(ctx, rest[0])
+		issued, key, err := s.CreateKey(ctx, rest[0])
 		if err != nil {
 			return err
 		}
-		_, err = fmt.Fprintf(out, "%s\t%s\n", k.ID, key)
+		_, err = fmt.Fprintf(out, "%s\t%s\n", issued.ID, key)
 		return err
 	case "key list":
 		if err := need(1); err != nil {
