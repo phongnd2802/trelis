@@ -247,7 +247,7 @@ TARGET=aarch64-unknown-linux-musl scripts/build-anydoc-lib.sh
 Then build trelis with the engine linked in:
 
 ```bash
-make build                 # or: go build -tags anydoc ./cmd/trelis
+make build                 # or: go build -tags anydoc ./cmd/server
 ```
 
 Builds without the `anydoc` tag need no Rust toolchain and no archive; the

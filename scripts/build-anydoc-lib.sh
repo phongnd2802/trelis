@@ -165,4 +165,4 @@ cp "$crate_dir/target/$target/release/$lib_name" "$dest/$lib_name"
 strip_llvm_lto_sections "$dest/$lib_name"
 
 echo "Wrote $dest/$lib_name"
-echo "Build trelis with the archive: go build -tags anydoc ./cmd/trelis"
+echo "Build trelis with the archive: go build -tags anydoc ./cmd/server"
