@@ -7,6 +7,11 @@
 #
 # Credentials are development defaults; override them through a .env file
 # next to this one (see .env.example).
+#
+# Every trelis route except the probes needs an API key. Create one with:
+#   docker compose run --rm trelis admin principal create alice
+#   docker compose run --rm trelis admin key create alice
+# then send it as "Authorization: Bearer <key>", e.g. GET /me.
 
 x-pg-env: &pg-env
   POSTGRES_USER: ${POSTGRES_USER:-trelis}
