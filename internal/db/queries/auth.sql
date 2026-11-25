@@ -14,14 +14,25 @@ SELECT id, name FROM groups WHERE name = $1;
 INSERT INTO group_members (group_id, principal_id) VALUES ($1, $2)
 ON CONFLICT DO NOTHING;
 
--- name: CreateAPIKey :exec
-INSERT INTO api_keys (principal_id, key_hash) VALUES ($1, $2);
+-- name: CreateAPIKey :one
+INSERT INTO api_keys (principal_id, key_hash) VALUES ($1, $2)
+RETURNING id, created_at, revoked_at;
+
+-- name: ListAPIKeys :many
+SELECT id, created_at, revoked_at
+FROM api_keys
+WHERE principal_id = $1
+ORDER BY created_at, id;
+
+-- Revoking twice keeps the first revocation time.
+-- name: RevokeAPIKey :execrows
+UPDATE api_keys SET revoked_at = coalesce(revoked_at, now()) WHERE id = $1;
 
 -- name: GetPrincipalByKeyHash :one
 SELECT p.id, p.name
 FROM api_keys k
 JOIN principals p ON p.id = k.principal_id
-WHERE k.key_hash = $1;
+WHERE k.key_hash = $1 AND k.revoked_at IS NULL;
 
 -- name: ListPrincipalGroups :many
 SELECT g.id, g.name

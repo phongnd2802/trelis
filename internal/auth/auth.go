@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -89,24 +90,66 @@ func (s *Store) AddMember(ctx context.Context, group, principal string) error {
 // and secret scanners.
 const keyPrefix = "trelis_"
 
-// CreateKey issues a new API key for the named Principal and returns it. Only
-// its hash is stored, so this is the only time the key can be read.
-func (s *Store) CreateKey(ctx context.Context, principal string) (string, error) {
+// APIKey describes one of a Principal's keys, never the key itself.
+type APIKey struct {
+	ID        uuid.UUID
+	CreatedAt time.Time
+	// RevokedAt is when the key was revoked, or nil while it still works.
+	RevokedAt *time.Time
+}
+
+// ListKeys describes the named Principal's keys, oldest first, revoked ones
+// included.
+func (s *Store) ListKeys(ctx context.Context, principal string) ([]APIKey, error) {
 	p, err := s.q.GetPrincipalByName(ctx, principal)
 	if err != nil {
-		return "", lookupErr("principal", principal, err)
+		return nil, lookupErr("principal", principal, err)
+	}
+	rows, err := s.q.ListAPIKeys(ctx, p.ID)
+	if err != nil {
+		return nil, fmt.Errorf("auth: keys of %q: %w", principal, err)
+	}
+	keys := make([]APIKey, 0, len(rows))
+	for _, r := range rows {
+		keys = append(keys, APIKey{ID: r.ID, CreatedAt: r.CreatedAt, RevokedAt: r.RevokedAt})
+	}
+	return keys, nil
+}
+
+// RevokeKey stops the key with that ID from authenticating, from the next
+// request on. Revoking a revoked key again is a no-op; an unknown ID is
+// ErrNotFound.
+func (s *Store) RevokeKey(ctx context.Context, id uuid.UUID) error {
+	n, err := s.q.RevokeAPIKey(ctx, id)
+	if err != nil {
+		return fmt.Errorf("auth: revoke key %s: %w", id, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: key %s", ErrNotFound, id)
+	}
+	return nil
+}
+
+// CreateKey issues a new API key for the named Principal and returns it with
+// its description. Only its hash is stored, so this is the only time the key
+// can be read.
+func (s *Store) CreateKey(ctx context.Context, principal string) (APIKey, string, error) {
+	p, err := s.q.GetPrincipalByName(ctx, principal)
+	if err != nil {
+		return APIKey{}, "", lookupErr("principal", principal, err)
 	}
 	secret := make([]byte, 32)
 	_, _ = rand.Read(secret) // crypto/rand.Read never returns an error
 	key := keyPrefix + base64.RawURLEncoding.EncodeToString(secret)
-	if err := s.q.CreateAPIKey(ctx, sqlc.CreateAPIKeyParams{PrincipalID: p.ID, KeyHash: hashKey(key)}); err != nil {
-		return "", fmt.Errorf("auth: create key for %q: %w", principal, err)
+	row, err := s.q.CreateAPIKey(ctx, sqlc.CreateAPIKeyParams{PrincipalID: p.ID, KeyHash: hashKey(key)})
+	if err != nil {
+		return APIKey{}, "", fmt.Errorf("auth: create key for %q: %w", principal, err)
 	}
-	return key, nil
+	return APIKey{ID: row.ID, CreatedAt: row.CreatedAt, RevokedAt: row.RevokedAt}, key, nil
 }
 
 // Authenticate returns the Principal that key belongs to, with their Groups,
-// or ErrUnauthenticated if it belongs to none.
+// or ErrUnauthenticated if it belongs to none or has been revoked.
 func (s *Store) Authenticate(ctx context.Context, key string) (Principal, error) {
 	row, err := s.q.GetPrincipalByKeyHash(ctx, hashKey(key))
 	if errors.Is(err, pgx.ErrNoRows) {

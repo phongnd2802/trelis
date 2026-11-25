@@ -5,21 +5,23 @@
 package sqlc
 
 import (
+	"time"
+
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type ApiKey struct {
 	ID          uuid.UUID
 	PrincipalID uuid.UUID
 	KeyHash     []byte
-	CreatedAt   pgtype.Timestamptz
+	CreatedAt   time.Time
+	RevokedAt   *time.Time
 }
 
 type Group struct {
 	ID        uuid.UUID
 	Name      string
-	CreatedAt pgtype.Timestamptz
+	CreatedAt time.Time
 }
 
 type GroupMember struct {
@@ -30,5 +32,5 @@ type GroupMember struct {
 type Principal struct {
 	ID        uuid.UUID
 	Name      string
-	CreatedAt pgtype.Timestamptz
+	CreatedAt time.Time
 }
