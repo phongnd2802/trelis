@@ -8,7 +8,7 @@ import (
 
 func TestHealthzReturnsOK(t *testing.T) {
 	rec := httptest.NewRecorder()
-	New(Readiness{}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	New(Readiness{}, keyring{}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -23,7 +23,7 @@ func TestHealthzReturnsOK(t *testing.T) {
 
 func TestUnknownRouteIs404(t *testing.T) {
 	rec := httptest.NewRecorder()
-	New(Readiness{}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/nope", nil))
+	New(Readiness{}, keyring{}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/nope", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}

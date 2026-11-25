@@ -1,0 +1,16 @@
+# sqlc generates type-safe query code from the goose migrations (schema) and
+# the queries in internal/db/queries, one .sql file per module. Regenerate
+# with `make sqlc`; the output in internal/db/sqlc is committed.
+version: "2"
+sql:
+  - engine: postgresql
+    schema: migrations
+    queries: internal/db/queries
+    gen:
+      go:
+        package: sqlc
+        out: internal/db/sqlc
+        sql_package: pgx/v5
+        overrides:
+          - db_type: uuid
+            go_type: github.com/google/uuid.UUID

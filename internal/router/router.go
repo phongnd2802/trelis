@@ -11,18 +11,30 @@ import (
 )
 
 // New returns the service's routes. GET /healthz is liveness and ignores
-// dependencies; GET /readyz probes every dependency in ready.
-func New(ready Readiness) http.Handler {
+// dependencies; GET /readyz probes every dependency in ready. Both are open
+// so orchestrators can probe them; every other route needs an API key that
+// authn accepts.
+func New(ready Readiness, authn Authenticator) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Get("/healthz", healthz)
 	r.Get("/readyz", ready.handler)
+
+	r.Group(func(r chi.Router) {
+		r.Use(authenticate(authn))
+		r.Get("/me", me)
+	})
 	return r
 }
 
 // healthz answers 200 for as long as the process is serving requests.
 func healthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// writeError answers with {"error": msg}.
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

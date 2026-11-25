@@ -1,4 +1,4 @@
-.PHONY: help tools anydoc-lib build build-lite dev test test-linked vet vet-lite vet-linked lint lint-linked stack-up clean
+.PHONY: help tools sqlc anydoc-lib build build-lite dev test test-linked vet vet-lite vet-linked lint lint-linked stack-up clean
 
 BIN_DIR := bin
 BINARY  := $(BIN_DIR)/trelis
@@ -7,6 +7,7 @@ PKG     := ./cmd/server
 help:
 	@echo "Targets:"
 	@echo "  tools        install pinned dev tools (golangci-lint) into GOPATH/bin"
+	@echo "  sqlc         regenerate internal/db/sqlc from migrations/ and internal/db/queries/"
 	@echo "  anydoc-lib   build the anydoc Rust static archive (needs cargo)"
 	@echo "  build        build trelis with the anydoc engine linked (needs anydoc-lib)"
 	@echo "  build-lite   build trelis without anydoc (no Rust needed; engine unavailable)"
@@ -55,9 +56,15 @@ vet-linked:
 # GOPATH/bin on PATH; `make tools` installs the pinned version there.
 GOLANGCI_LINT_VERSION := v2.15.0
 GOLANGCI_LINT ?= $(shell go env GOPATH)/bin/golangci-lint
+SQLC_VERSION  := v1.30.0
 
 tools:
 	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+
+# Config in sqlc.yaml. The generated code is committed, so building needs no
+# sqlc; `go run` with a pinned version keeps it out of `make tools` and CI.
+sqlc:
+	go run github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION) generate
 
 lint:
 	$(GOLANGCI_LINT) run ./...

@@ -1,6 +1,11 @@
 // Command server runs the Trelis HTTP service.
 //
 //	server -config config/trelis.yaml
+//	server -config config/trelis.yaml admin <command>
+//
+// The admin commands create Principals, Groups, memberships and API keys
+// (run `server admin` for the list); they migrate Postgres and exit without
+// serving. Every HTTP route except /healthz and /readyz needs an API key.
 //
 // On start it applies pending Postgres migrations, then serves. GET /readyz
 // probes Postgres, Neo4j and Temporal; Neo4j and Temporal are connected
@@ -24,6 +29,7 @@ import (
 	"go.temporal.io/sdk/client"
 	temporallog "go.temporal.io/sdk/log"
 
+	"github.com/phongnd2802/trelis/internal/auth"
 	"github.com/phongnd2802/trelis/internal/config"
 	"github.com/phongnd2802/trelis/internal/db"
 	"github.com/phongnd2802/trelis/internal/router"
@@ -36,13 +42,16 @@ func main() {
 	configPath := flag.String("config", "config/trelis.yaml", "path to the YAML config file")
 	flag.Parse()
 
-	if err := run(*configPath); err != nil {
+	if err := run(*configPath, flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "trelis:", err)
 		os.Exit(1)
 	}
 }
 
-func run(configPath string) error {
+func run(configPath string, args []string) error {
+	if len(args) > 0 && args[0] != "admin" {
+		return fmt.Errorf("unknown command %q (want none, or admin)", args[0])
+	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
@@ -64,6 +73,11 @@ func run(configPath string) error {
 		return err
 	}
 	slog.Info("postgres migrated", "applied", applied)
+	principals := auth.NewStore(pool)
+
+	if len(args) > 0 {
+		return admin(ctx, principals, args[1:], os.Stdout)
+	}
 
 	graph, err := neo4j.NewDriver(cfg.Neo4j.URI(), neo4j.BasicAuth(cfg.Neo4j.User, cfg.Neo4j.Password, ""))
 	if err != nil {
@@ -96,7 +110,7 @@ func run(configPath string) error {
 	}
 	slog.Info("trelis listening", "addr", ln.Addr().String(), "config", configPath)
 
-	if err := router.Serve(ctx, ln, router.New(ready), cfg.Server.ShutdownTimeout); err != nil {
+	if err := router.Serve(ctx, ln, router.New(ready, principals), cfg.Server.ShutdownTimeout); err != nil {
 		return err
 	}
 	slog.Info("trelis stopped")
