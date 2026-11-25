@@ -53,6 +53,7 @@ func bearer(header string) (string, bool) {
 	return token, token != ""
 }
 
+// unauthorized answers 401 with the challenge RFC 6750 asks for.
 func unauthorized(w http.ResponseWriter, msg string) {
 	w.Header().Set("WWW-Authenticate", "Bearer")
 	writeError(w, http.StatusUnauthorized, msg)

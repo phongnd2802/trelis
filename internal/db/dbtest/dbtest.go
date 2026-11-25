@@ -26,17 +26,17 @@ func Fresh(t testing.TB) *pgxpool.Pool {
 		t.Skip("set TRELIS_TEST_POSTGRES_DSN (e.g. from `docker compose up postgres`) to run")
 	}
 	ctx := context.Background()
-	admin, err := pgx.Connect(ctx, dsn)
+	adminConn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	t.Cleanup(func() { _ = admin.Close(ctx) })
+	t.Cleanup(func() { _ = adminConn.Close(ctx) })
 
 	name := fmt.Sprintf("trelis_test_%d", time.Now().UnixNano())
-	if _, err := admin.Exec(ctx, "CREATE DATABASE "+name); err != nil {
+	if _, err := adminConn.Exec(ctx, "CREATE DATABASE "+name); err != nil {
 		t.Fatalf("create database: %v", err)
 	}
-	t.Cleanup(func() { _, _ = admin.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)") })
+	t.Cleanup(func() { _, _ = adminConn.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)") })
 
 	u, err := url.Parse(dsn)
 	if err != nil {

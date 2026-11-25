@@ -12,16 +12,23 @@ import (
 
 // New returns the service's routes. GET /healthz is liveness and ignores
 // dependencies; GET /readyz probes every dependency in ready. Both are open
-// so orchestrators can probe them; every other route needs an API key that
-// authn accepts.
+// so orchestrators can probe them; everything else, unknown paths and
+// methods included, needs an API key that authn accepts, so a caller
+// without one cannot map the routes.
 func New(ready Readiness, authn Authenticator) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Get("/healthz", healthz)
 	r.Get("/readyz", ready.handler)
 
+	authed := authenticate(authn)
+	r.NotFound(authed(http.NotFoundHandler()).ServeHTTP)
+	r.MethodNotAllowed(authed(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	})).ServeHTTP)
+
 	r.Group(func(r chi.Router) {
-		r.Use(authenticate(authn))
+		r.Use(authed)
 		r.Get("/me", me)
 	})
 	return r

@@ -73,10 +73,10 @@ func run(configPath string, args []string) error {
 		return err
 	}
 	slog.Info("postgres migrated", "applied", applied)
-	principals := auth.NewStore(pool)
+	store := auth.NewStore(pool)
 
 	if len(args) > 0 {
-		return admin(ctx, principals, args[1:], os.Stdout)
+		return admin(ctx, store, args[1:], os.Stdout)
 	}
 
 	graph, err := neo4j.NewDriver(cfg.Neo4j.URI(), neo4j.BasicAuth(cfg.Neo4j.User, cfg.Neo4j.Password, ""))
@@ -110,7 +110,7 @@ func run(configPath string, args []string) error {
 	}
 	slog.Info("trelis listening", "addr", ln.Addr().String(), "config", configPath)
 
-	if err := router.Serve(ctx, ln, router.New(ready, principals), cfg.Server.ShutdownTimeout); err != nil {
+	if err := router.Serve(ctx, ln, router.New(ready, store), cfg.Server.ShutdownTimeout); err != nil {
 		return err
 	}
 	slog.Info("trelis stopped")

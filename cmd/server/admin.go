@@ -14,7 +14,8 @@ const adminUsage = `usage: server [-config file] admin <command>
 
   principal create <name>            create a Principal, print its ID
   group create <name>                create a Group, print its ID
-  group add-member <group> <name>    add a Principal to a Group
+  group add-member <group> <principal>
+                                     add a Principal to a Group
   key create <principal>             issue an API key and print it; it is
                                      stored hashed and cannot be shown again`
 

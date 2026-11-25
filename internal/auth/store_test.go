@@ -73,7 +73,10 @@ func TestAuthenticateReturnsThePrincipalsGroups(t *testing.T) {
 		}
 	}
 
-	aliceKey, _ := s.CreateKey(ctx, "alice")
+	aliceKey, err := s.CreateKey(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
 	alice, err := s.Authenticate(ctx, aliceKey)
 	if err != nil {
 		t.Fatal(err)
@@ -89,7 +92,10 @@ func TestAPrincipalWithNoGroupsHasAnEmptyList(t *testing.T) {
 	if _, err := s.CreatePrincipal(ctx, "carol"); err != nil {
 		t.Fatal(err)
 	}
-	key, _ := s.CreateKey(ctx, "carol")
+	key, err := s.CreateKey(ctx, "carol")
+	if err != nil {
+		t.Fatal(err)
+	}
 	carol, err := s.Authenticate(ctx, key)
 	if err != nil {
 		t.Fatal(err)
