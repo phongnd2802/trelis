@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"slices"
 	"strings"
 
 	"github.com/phongnd2802/trelis/internal/types"
@@ -104,24 +103,18 @@ func readStream(ctx context.Context, body io.Reader, out chan<- types.StreamingR
 
 // toolCallAssembler joins streamed tool-call fragments: the first fragment
 // of a call carries its id and name, later ones append to the arguments.
+// Fragments are matched by index; a provider that omits index sends calls
+// one after another, so there a new id starts a new call and a fragment
+// without one continues the last call.
 type toolCallAssembler struct {
-	byIndex map[int]*types.ToolCall
+	calls   []types.ToolCall
+	byIndex map[int]int // stream index -> position in calls
 }
 
 func (a *toolCallAssembler) add(deltas []wireToolCall) {
-	for i, d := range deltas {
-		idx := i
-		if d.Index != nil {
-			idx = *d.Index
-		}
-		if a.byIndex == nil {
-			a.byIndex = map[int]*types.ToolCall{}
-		}
-		tc, ok := a.byIndex[idx]
-		if !ok {
-			tc = &types.ToolCall{}
-			a.byIndex[idx] = tc
-		}
+	for _, d := range deltas {
+		pos := a.position(d)
+		tc := &a.calls[pos]
 		if d.ID != "" {
 			tc.ID = d.ID
 		}
@@ -132,18 +125,23 @@ func (a *toolCallAssembler) add(deltas []wireToolCall) {
 	}
 }
 
+// position finds the call d continues, starting a new one when needed.
+func (a *toolCallAssembler) position(d wireToolCall) int {
+	if d.Index != nil {
+		if pos, ok := a.byIndex[*d.Index]; ok {
+			return pos
+		}
+		if a.byIndex == nil {
+			a.byIndex = map[int]int{}
+		}
+		a.byIndex[*d.Index] = len(a.calls)
+	} else if n := len(a.calls); n > 0 && (d.ID == "" || a.calls[n-1].ID == d.ID) {
+		return n - 1
+	}
+	a.calls = append(a.calls, types.ToolCall{})
+	return len(a.calls) - 1
+}
+
 func (a *toolCallAssembler) result() []types.ToolCall {
-	if len(a.byIndex) == 0 {
-		return nil
-	}
-	idxs := make([]int, 0, len(a.byIndex))
-	for i := range a.byIndex {
-		idxs = append(idxs, i)
-	}
-	slices.Sort(idxs)
-	out := make([]types.ToolCall, 0, len(idxs))
-	for _, i := range idxs {
-		out = append(out, *a.byIndex[i])
-	}
-	return out
+	return a.calls
 }

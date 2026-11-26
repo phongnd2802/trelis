@@ -23,7 +23,6 @@ type Endpoint struct {
 	BaseURL string
 	Model   string
 	Auth    AuthFunc
-	Headers map[string]string
 	// Client defaults to http.DefaultClient.
 	Client *http.Client
 }
@@ -48,9 +47,6 @@ func (e Endpoint) Post(ctx context.Context, path string, body []byte) (*http.Res
 		return nil, fmt.Errorf("build request to %s: %w", url, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	for k, v := range e.Headers {
-		req.Header.Set(k, v)
-	}
 	if e.Auth != nil {
 		e.Auth(req, body)
 	}

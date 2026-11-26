@@ -9,17 +9,19 @@ import (
 
 // Models points each model role at its own OpenAI-compatible provider.
 // Every role embeds Endpoint (base_url, model, api_key) and adds only what
-// is specific to it: chat roles pick a protocol; the embedding role (#16)
-// and rerank role (#18) are added here as their own fields beside these.
+// is specific to it: a chat role adds its protocol. The embedding (#16) and
+// rerank (#18) roles become fields here of their own types that embed
+// Endpoint too, registered with registerEndpoint and checked with
+// Endpoint.validate.
 //
-// A role whose endpoint keys are all empty is unconfigured, so the service
+// A role with neither base_url nor model is unconfigured, so the service
 // starts without models until a feature needs one.
 type Models struct {
-	// Chat answers questions (Pipeline Answer and Agent Answer).
+	// Chat writes answers (Pipeline Answer and Agent Answer).
 	Chat ChatRole `mapstructure:"chat"`
 	// Extraction reads Extractions out of Chunks.
 	Extraction ChatRole `mapstructure:"extraction"`
-	// Judge scores answers in the eval harness; it should differ from Chat.
+	// Judge is the judge model a Grader uses; it should differ from Chat.
 	Judge ChatRole `mapstructure:"judge"`
 }
 
@@ -32,15 +34,23 @@ type Endpoint struct {
 	APIKey string `mapstructure:"api_key"`
 }
 
+// ChatProtocol is the wire protocol a chat role speaks.
+type ChatProtocol string
+
+const (
+	// ProtocolChatCompletions is POST {base_url}/chat/completions.
+	ProtocolChatCompletions ChatProtocol = "chat_completions"
+)
+
+// chatProtocols lists the valid protocols; Responses joins with #19.
+var chatProtocols = []ChatProtocol{ProtocolChatCompletions}
+
 // ChatRole is a role served by a chat model.
 type ChatRole struct {
 	Endpoint `mapstructure:",squash"`
-	// Protocol is the wire protocol: chat_completions (default). responses
-	// arrives with #19.
-	Protocol string `mapstructure:"protocol"`
+	// Protocol defaults to chat_completions.
+	Protocol ChatProtocol `mapstructure:"protocol"`
 }
-
-var chatProtocols = []string{"chat_completions"}
 
 // chatRoles names every chat role by its key, for defaults and validation.
 func (m *Models) chatRoles() map[string]*ChatRole {
@@ -51,25 +61,32 @@ func (m *Models) chatRoles() map[string]*ChatRole {
 	}
 }
 
-// Configured reports whether any endpoint key is set.
-func (e Endpoint) Configured() bool {
-	return strings.TrimSpace(e.BaseURL) != "" || strings.TrimSpace(e.Model) != "" || strings.TrimSpace(e.APIKey) != ""
-}
-
 func init() {
 	for key := range (&Models{}).chatRoles() {
-		defaults[key+".protocol"] = "chat_completions"
-		defaults[key+".base_url"] = ""
-		defaults[key+".model"] = ""
-		defaults[key+".api_key"] = ""
+		registerEndpoint(key)
+		defaults[key+".protocol"] = string(ProtocolChatCompletions)
 	}
+}
+
+// registerEndpoint adds the endpoint keys under key to the defaults, so env
+// variables can set a role the YAML file leaves out.
+func registerEndpoint(key string) {
+	for _, k := range []string{"base_url", "model", "api_key"} {
+		defaults[key+"."+k] = ""
+	}
+}
+
+// Configured reports whether the role names a provider. An api_key alone
+// does not count, so a key left in the environment cannot block startup.
+func (e Endpoint) Configured() bool {
+	return strings.TrimSpace(e.BaseURL) != "" || strings.TrimSpace(e.Model) != ""
 }
 
 func (m *Models) validate() []error {
 	var errs []error
 	for key, role := range m.chatRoles() {
 		if !slices.Contains(chatProtocols, role.Protocol) {
-			errs = append(errs, fmt.Errorf("%s.protocol must be one of %s, got %q", key, strings.Join(chatProtocols, ", "), role.Protocol))
+			errs = append(errs, fmt.Errorf("%s.protocol must be one of %v, got %q", key, chatProtocols, role.Protocol))
 		}
 		errs = append(errs, role.validate(key)...)
 	}
@@ -78,18 +95,19 @@ func (m *Models) validate() []error {
 	return errs
 }
 
+// validate checks a configured endpoint under key.
 func (e Endpoint) validate(key string) []error {
 	if !e.Configured() {
 		return nil
 	}
 	var errs []error
 	if strings.TrimSpace(e.BaseURL) == "" {
-		errs = append(errs, fmt.Errorf("%s.base_url is required when the role is configured", key))
+		errs = append(errs, fmt.Errorf("%s.base_url is required when %s.model is set", key, key))
 	} else if u, err := url.Parse(e.BaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		errs = append(errs, fmt.Errorf("%s.base_url %q must be an http(s) URL", key, e.BaseURL))
 	}
 	if strings.TrimSpace(e.Model) == "" {
-		errs = append(errs, fmt.Errorf("%s.model is required when the role is configured", key))
+		errs = append(errs, fmt.Errorf("%s.model is required when %s.base_url is set", key, key))
 	}
 	return errs
 }

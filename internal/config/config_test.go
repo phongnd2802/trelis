@@ -219,6 +219,18 @@ func TestLoadModelRolesFromEnvOnly(t *testing.T) {
 	}
 }
 
+func TestLoadIgnoresAKeyWithoutAProvider(t *testing.T) {
+	t.Setenv("TRELIS_MODELS_JUDGE_API_KEY", "sk-left-over")
+
+	cfg, err := Load(writeConfig(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Models.Judge.Configured() {
+		t.Errorf("Models.Judge = %+v, want unconfigured with only a key", cfg.Models.Judge)
+	}
+}
+
 func TestLoadRejectsInvalidModelRoles(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -229,7 +241,6 @@ func TestLoadRejectsInvalidModelRoles(t *testing.T) {
 		{"base url without model", map[string]string{"TRELIS_MODELS_JUDGE_MODEL": " "}, "models.judge.model"},
 		{"base url not http", map[string]string{"TRELIS_MODELS_EXTRACTION_BASE_URL": "litellm:4000"}, "models.extraction.base_url"},
 		{"unknown protocol", map[string]string{"TRELIS_MODELS_CHAT_PROTOCOL": "grpc"}, "models.chat.protocol"},
-		{"key alone", map[string]string{"TRELIS_MODELS_CHAT_BASE_URL": " ", "TRELIS_MODELS_CHAT_MODEL": " "}, "models.chat.base_url"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

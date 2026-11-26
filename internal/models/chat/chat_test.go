@@ -50,7 +50,16 @@ func jsonReply(body string) func(http.ResponseWriter) {
 	}
 }
 
-func mustNew(t *testing.T, cfg Config) Chat {
+// role is a configured chat role; key is optional.
+func role(baseURL, model string, key ...string) config.ChatRole {
+	r := config.ChatRole{Protocol: config.ProtocolChatCompletions, Endpoint: config.Endpoint{BaseURL: baseURL, Model: model}}
+	if len(key) > 0 {
+		r.APIKey = key[0]
+	}
+	return r
+}
+
+func mustNew(t *testing.T, cfg config.ChatRole) Chat {
 	t.Helper()
 	c, err := New(cfg)
 	if err != nil {
@@ -65,7 +74,7 @@ func TestChatReturnsContentAndUsage(t *testing.T) {
 		"choices": [{"index": 0, "message": {"role": "assistant", "content": "Hà Nội"}, "finish_reason": "stop"}],
 		"usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}
 	}`))
-	c := mustNew(t, Config{BaseURL: p.srv.URL + "/v1", Model: "gpt-4o-mini", APIKey: "sk-test"})
+	c := mustNew(t, role(p.srv.URL+"/v1", "gpt-4o-mini", "sk-test"))
 
 	resp, err := c.Chat(context.Background(), []types.ChatMessage{
 		{Role: types.RoleSystem, Content: "Answer briefly."},
@@ -143,7 +152,7 @@ func TestChatStreamDeltasAndUsage(t *testing.T) {
 		`{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}`,
 		`[DONE]`,
 	))
-	c := mustNew(t, Config{BaseURL: p.srv.URL, Model: "m"})
+	c := mustNew(t, role(p.srv.URL, "m"))
 
 	ch, err := c.ChatStream(context.Background(), []types.ChatMessage{{Role: types.RoleUser, Content: "q"}}, nil)
 	if err != nil {
@@ -180,7 +189,7 @@ func TestChatStreamAssemblesToolCalls(t *testing.T) {
 		`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":30,"completion_tokens":20,"total_tokens":50}}`,
 		`[DONE]`,
 	))
-	c := mustNew(t, Config{BaseURL: p.srv.URL, Model: "m"})
+	c := mustNew(t, role(p.srv.URL, "m"))
 
 	ch, err := c.ChatStream(context.Background(), []types.ChatMessage{{Role: types.RoleUser, Content: "q"}},
 		&types.ChatOptions{Tools: []types.Tool{searchTool}})
@@ -204,9 +213,34 @@ func TestChatStreamAssemblesToolCalls(t *testing.T) {
 	}
 }
 
+// Some providers omit index on tool-call deltas; a new id starts a new call.
+func TestChatStreamToolCallsWithoutIndex(t *testing.T) {
+	p := newFakeProvider(t, sseReply(
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","type":"function","function":{"name":"chunk_search","arguments":"{\"query\":"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"\"x\"}"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_b","type":"function","function":{"name":"graph_query","arguments":"{}"}}]}}]}`,
+		`{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		`[DONE]`,
+	))
+	c := mustNew(t, role(p.srv.URL, "m"))
+
+	ch, err := c.ChatStream(context.Background(), []types.ChatMessage{{Role: types.RoleUser, Content: "q"}}, nil)
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+	_, last := collect(t, ch)
+	want := []types.ToolCall{
+		{ID: "call_a", Name: "chunk_search", Arguments: `{"query":"x"}`},
+		{ID: "call_b", Name: "graph_query", Arguments: `{}`},
+	}
+	if !reflect.DeepEqual(last.ToolCalls, want) {
+		t.Errorf("ToolCalls = %+v, want %+v", last.ToolCalls, want)
+	}
+}
+
 func TestChatStreamCutOffReportsAnError(t *testing.T) {
 	p := newFakeProvider(t, sseReply(`{"choices":[{"index":0,"delta":{"content":"Hà"}}]}`))
-	c := mustNew(t, Config{BaseURL: p.srv.URL, Model: "m"})
+	c := mustNew(t, role(p.srv.URL, "m"))
 
 	ch, err := c.ChatStream(context.Background(), []types.ChatMessage{{Role: types.RoleUser, Content: "q"}}, nil)
 	if err != nil {
@@ -220,7 +254,7 @@ func TestChatStreamCutOffReportsAnError(t *testing.T) {
 
 func TestChatStreamProviderErrorEvent(t *testing.T) {
 	p := newFakeProvider(t, sseReply(`{"error":{"message":"overloaded"}}`))
-	c := mustNew(t, Config{BaseURL: p.srv.URL, Model: "m"})
+	c := mustNew(t, role(p.srv.URL, "m"))
 
 	ch, err := c.ChatStream(context.Background(), []types.ChatMessage{{Role: types.RoleUser, Content: "q"}}, nil)
 	if err != nil {
@@ -236,7 +270,7 @@ func TestFailedCallReturnsTheStatus(t *testing.T) {
 	p := newFakeProvider(t, func(w http.ResponseWriter) {
 		http.Error(w, `{"error":{"message":"rate limited"}}`, http.StatusTooManyRequests)
 	})
-	c := mustNew(t, Config{BaseURL: p.srv.URL, Model: "m"})
+	c := mustNew(t, role(p.srv.URL, "m"))
 	msgs := []types.ChatMessage{{Role: types.RoleUser, Content: "q"}}
 
 	_, chatErr := c.Chat(context.Background(), msgs, nil)
@@ -260,7 +294,7 @@ func TestChatStreamStopsWhenContextIsCancelled(t *testing.T) {
 		<-release
 	})
 	defer close(release)
-	c := mustNew(t, Config{BaseURL: p.srv.URL, Model: "m"})
+	c := mustNew(t, role(p.srv.URL, "m"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	ch, err := c.ChatStream(ctx, []types.ChatMessage{{Role: types.RoleUser, Content: "q"}}, nil)
@@ -278,8 +312,8 @@ func TestChatStreamStopsWhenContextIsCancelled(t *testing.T) {
 func TestEachRoleCallsItsOwnProvider(t *testing.T) {
 	chatP := newFakeProvider(t, jsonReply(`{"choices":[{"message":{"content":"from chat"}}],"usage":{"total_tokens":1}}`))
 	judgeP := newFakeProvider(t, jsonReply(`{"choices":[{"message":{"content":"from judge"}}],"usage":{"total_tokens":2}}`))
-	chatRole := mustNew(t, Config{BaseURL: chatP.srv.URL, Model: "gen-model", APIKey: "key-chat"})
-	judgeRole := mustNew(t, Config{BaseURL: judgeP.srv.URL, Model: "judge-model", APIKey: "key-judge"})
+	chatRole := mustNew(t, role(chatP.srv.URL, "gen-model", "key-chat"))
+	judgeRole := mustNew(t, role(judgeP.srv.URL, "judge-model", "key-judge"))
 	msgs := []types.ChatMessage{{Role: types.RoleUser, Content: "q"}}
 
 	got, err := judgeRole.Chat(context.Background(), msgs, nil)
@@ -302,11 +336,14 @@ func TestEachRoleCallsItsOwnProvider(t *testing.T) {
 }
 
 func TestNewRejectsIncompleteConfig(t *testing.T) {
-	cases := map[string]Config{
-		"no base URL":      {Model: "gpt-4o-mini"},
-		"no model":         {BaseURL: "http://localhost:4000/v1"},
-		"blank base URL":   {BaseURL: "   ", Model: "gpt-4o-mini"},
-		"unknown protocol": {BaseURL: "http://localhost:4000/v1", Model: "m", Protocol: "carrier_pigeon"},
+	unknown := role("http://localhost:4000/v1", "m")
+	unknown.Protocol = "carrier_pigeon"
+	cases := map[string]config.ChatRole{
+		"unconfigured":     {},
+		"no base URL":      role("", "gpt-4o-mini"),
+		"no model":         role("http://localhost:4000/v1", ""),
+		"blank base URL":   role("   ", "gpt-4o-mini"),
+		"unknown protocol": unknown,
 	}
 	for name, cfg := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -317,22 +354,9 @@ func TestNewRejectsIncompleteConfig(t *testing.T) {
 	}
 }
 
-func TestFromRoleCarriesTheRoleEndpoint(t *testing.T) {
-	p := newFakeProvider(t, jsonReply(`{"choices":[{"message":{"content":"x"}}]}`))
-	role := config.ChatRole{Protocol: "chat_completions", Endpoint: config.Endpoint{BaseURL: p.srv.URL, Model: "judge-model", APIKey: "k"}}
-
-	c := mustNew(t, FromRole(role))
-	if _, err := c.Chat(context.Background(), []types.ChatMessage{{Role: types.RoleUser, Content: "q"}}, nil); err != nil {
-		t.Fatal(err)
-	}
-	if p.lastBody["model"] != "judge-model" || p.lastAuth != "Bearer k" {
-		t.Errorf("provider got model %v auth %q", p.lastBody["model"], p.lastAuth)
-	}
-}
-
 func TestNoKeySendsNoAuthorization(t *testing.T) {
 	p := newFakeProvider(t, jsonReply(`{"choices":[{"message":{"content":"x"}}]}`))
-	c := mustNew(t, Config{BaseURL: p.srv.URL, Model: "m"})
+	c := mustNew(t, role(p.srv.URL, "m"))
 	if _, err := c.Chat(context.Background(), []types.ChatMessage{{Role: types.RoleUser, Content: "q"}}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +383,7 @@ func TestChatSendsToolsAndParsesToolCalls(t *testing.T) {
 		}}],
 		"usage": {"prompt_tokens": 40, "completion_tokens": 9, "total_tokens": 49}
 	}`))
-	c := mustNew(t, Config{BaseURL: p.srv.URL, Model: "m"})
+	c := mustNew(t, role(p.srv.URL, "m"))
 
 	resp, err := c.Chat(context.Background(), []types.ChatMessage{
 		{Role: types.RoleUser, Content: "What amends Decree 15?"},
@@ -412,7 +436,7 @@ func TestChatSendsToolsAndParsesToolCalls(t *testing.T) {
 
 func TestChatForcesANamedTool(t *testing.T) {
 	p := newFakeProvider(t, jsonReply(`{"choices":[{"message":{"content":"x"},"finish_reason":"stop"}]}`))
-	c := mustNew(t, Config{BaseURL: p.srv.URL, Model: "m"})
+	c := mustNew(t, role(p.srv.URL, "m"))
 
 	if _, err := c.Chat(context.Background(), []types.ChatMessage{{Role: types.RoleUser, Content: "q"}},
 		&types.ChatOptions{Tools: []types.Tool{searchTool}, ToolChoice: "chunk_search"}); err != nil {
