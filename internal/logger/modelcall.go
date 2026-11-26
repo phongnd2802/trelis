@@ -24,15 +24,17 @@ type ModelCall struct {
 	Failed bool
 	// HTTPStatus is the vendor status when the failure was an *api.HTTPError.
 	HTTPStatus int
-	// HasUsage is true when the provider reported token counts.
-	HasUsage     bool
-	InputTokens  int
-	OutputTokens int
+	// HasUsage is true when the provider reported input token counts.
+	HasUsage bool
+	// HasOutputTokens is true when output_tokens is meaningful (chat replies).
+	HasOutputTokens bool
+	InputTokens     int
+	OutputTokens    int
 }
 
 // LogModelCall writes the one INFO line for a model call, successful or not.
 func LogModelCall(ctx context.Context, c ModelCall) {
-	fields := make([]zap.Field, 0, 10)
+	fields := make([]zap.Field, 0, 11)
 	if c.Role != "" {
 		fields = append(fields, zap.String("role", c.Role))
 	}
@@ -51,9 +53,10 @@ func LogModelCall(ctx context.Context, c ModelCall) {
 		fields = append(fields, zap.Int("http_status", c.HTTPStatus))
 	}
 	if c.HasUsage {
-		fields = append(fields,
-			zap.Int("input_tokens", c.InputTokens),
-			zap.Int("output_tokens", c.OutputTokens))
+		fields = append(fields, zap.Int("input_tokens", c.InputTokens))
+		if c.HasOutputTokens {
+			fields = append(fields, zap.Int("output_tokens", c.OutputTokens))
+		}
 	}
 	Ctx(ctx).Info("model call", fields...)
 }

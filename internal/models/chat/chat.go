@@ -106,6 +106,7 @@ func (c *loggingChat) Chat(ctx context.Context, messages []Message, opts *ChatOp
 	call := c.call(start, err != nil, api.HTTPStatusCode(err))
 	if err == nil && resp != nil {
 		call.HasUsage = resp.Usage.PromptTokens != 0 || resp.Usage.CompletionTokens != 0
+		call.HasOutputTokens = true
 		call.InputTokens = resp.Usage.PromptTokens
 		call.OutputTokens = resp.Usage.CompletionTokens
 	}
@@ -151,6 +152,7 @@ func (c *loggingChat) ChatStream(ctx context.Context, messages []Message, opts *
 		call := c.call(start, failed, 0)
 		if usage != nil {
 			call.HasUsage = true
+			call.HasOutputTokens = true
 			call.InputTokens = usage.PromptTokens
 			call.OutputTokens = usage.CompletionTokens
 		}

@@ -328,13 +328,47 @@ func TestRerankLogsOneModelCallAndCountsRetries(t *testing.T) {
 		"protocol": "rerank",
 		"status":   "ok",
 		"attempts": int64(2),
+		// The fake counts one token per word in the query and documents.
+		"input_tokens": int64(4),
 	}
 	for k, v := range want {
 		if fields[k] != v {
 			t.Errorf("%s = %v, want %v", k, fields[k], v)
 		}
 	}
+	if _, ok := fields["output_tokens"]; ok {
+		t.Errorf("output_tokens = %v, want it omitted for rerank", fields["output_tokens"])
+	}
 	if s := fmt.Sprint(entry); strings.Contains(s, "secret query") || strings.Contains(s, "secret document") {
 		t.Errorf("the model call log carries the query or a document: %s", s)
+	}
+}
+
+// A reply without a usage object logs no token fields at all.
+func TestRerankLogsNoTokensWhenUsageIsAbsent(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	previous := zap.L()
+	zap.ReplaceGlobals(zap.New(core))
+	t.Cleanup(func() { zap.ReplaceGlobals(previous) })
+
+	base, _ := stub(t, map[string]any{"results": []any{result(0, 0.9)}})
+	r, err := New(role(base, model, key), WithRetry(api.Retry{MaxAttempts: 1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Rerank(context.Background(), "secret query", []string{"secret document"}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries := logs.FilterMessage("model call").All()
+	if len(entries) != 1 {
+		t.Fatalf("logger saw %d model call lines, want 1", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if _, ok := fields["input_tokens"]; ok {
+		t.Errorf("input_tokens = %v, want it omitted without usage", fields["input_tokens"])
+	}
+	if _, ok := fields["output_tokens"]; ok {
+		t.Errorf("output_tokens = %v, want it omitted without usage", fields["output_tokens"])
 	}
 }
