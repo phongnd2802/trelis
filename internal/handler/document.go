@@ -132,8 +132,6 @@ func (h *DocumentHandler) GetDocument(w http.ResponseWriter, r *http.Request) {
 	writeData(w, http.StatusOK, doc)
 }
 
-// ListDocuments answers GET /documents?page=&page_size= with a page of the
-// Documents the caller can read, newest first, without Access Lists.
 // DownloadDocumentFile streams a Document's Source File to a caller who can
 // read it, like Omnisc's DownloadKnowledgeFile. It is always an attachment,
 // never rendered in the API's origin (ADR-0006).
@@ -156,7 +154,11 @@ func (h *DocumentHandler) DownloadDocumentFile(w http.ResponseWriter, r *http.Re
 	}
 	hdr := w.Header()
 	hdr.Set("Content-Type", contentType)
-	hdr.Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": doc.FileName}))
+	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": doc.FileName})
+	if disposition == "" {
+		disposition = "attachment" // a name FormatMediaType cannot encode
+	}
+	hdr.Set("Content-Disposition", disposition)
 	hdr.Set("Content-Length", strconv.FormatInt(doc.FileSize, 10))
 	hdr.Set("X-Content-Type-Options", "nosniff")
 	hdr.Set("Content-Security-Policy", "sandbox")
@@ -168,6 +170,8 @@ func (h *DocumentHandler) DownloadDocumentFile(w http.ResponseWriter, r *http.Re
 	}
 }
 
+// ListDocuments answers GET /documents?page=&page_size= with a page of the
+// Documents the caller can read, newest first, without Access Lists.
 func (h *DocumentHandler) ListDocuments(w http.ResponseWriter, r *http.Request) {
 	page, err := parsePagination(r)
 	if err != nil {

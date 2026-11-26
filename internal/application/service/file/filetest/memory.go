@@ -1,6 +1,6 @@
 // Package filetest holds an in-memory FileService for tests, so service and
-// router tests need no object store. Build tag is intentionally absent, as
-// in modeltest and dbtest: keep production code from importing it.
+// router tests need no object store. It is test support only; production
+// code must not import it.
 package filetest
 
 import (

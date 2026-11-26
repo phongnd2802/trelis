@@ -166,8 +166,8 @@ func TestLoadDependencyDefaults(t *testing.T) {
 	if cfg.Storage.MaxFileSize() != 50<<20 {
 		t.Errorf("default max file size = %d bytes, want 50 MB", cfg.Storage.MaxFileSize())
 	}
-	if s := cfg.Storage.S3; s.Bucket != "trelis" || s.Region != "us-east-1" || !s.CreateBucket || s.Endpoint != "" {
-		t.Errorf("default storage.s3 = %+v, want bucket trelis in us-east-1, created on start, AWS endpoint", s)
+	if s := cfg.Storage.S3; s.Bucket != "trelis" || s.Region != "us-east-1" || s.CreateBucket || s.Endpoint != "" {
+		t.Errorf("default storage.s3 = %+v, want bucket trelis in us-east-1, not created on start, AWS endpoint", s)
 	}
 }
 
@@ -311,7 +311,7 @@ func TestS3StorageIsReadFromEnv(t *testing.T) {
 		"TRELIS_STORAGE_S3_ACCESS_KEY_ID":     "trelis",
 		"TRELIS_STORAGE_S3_SECRET_ACCESS_KEY": "s3cr3t-dev",
 		"TRELIS_STORAGE_S3_FORCE_PATH_STYLE":  "true",
-		"TRELIS_STORAGE_S3_CREATE_BUCKET":     "false",
+		"TRELIS_STORAGE_S3_CREATE_BUCKET":     "true",
 	} {
 		t.Setenv(k, v)
 	}
@@ -319,7 +319,7 @@ func TestS3StorageIsReadFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	want := S3{Endpoint: "http://silo:9000", Region: "us-east-1", Bucket: "docs", AccessKeyID: "trelis", SecretAccessKey: "s3cr3t-dev", ForcePathStyle: true}
+	want := S3{Endpoint: "http://silo:9000", Region: "us-east-1", Bucket: "docs", AccessKeyID: "trelis", SecretAccessKey: "s3cr3t-dev", ForcePathStyle: true, CreateBucket: true}
 	if cfg.Storage.S3 != want {
 		t.Errorf("storage.s3 = %+v, want %+v", cfg.Storage.S3, want)
 	}

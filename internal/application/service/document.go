@@ -132,17 +132,31 @@ func (s *documentService) createErr(ctx context.Context, owner uuid.UUID, hash s
 	}
 }
 
-// GetDocumentByID returns a Document the caller can read, with its Access
-// List when the caller owns it.
-func (s *documentService) GetDocumentByID(ctx context.Context, id uuid.UUID) (*types.Document, error) {
+// errDocumentNotFound is what a caller sees for a Document that is missing
+// and for one they cannot read alike.
+func errDocumentNotFound() error { return werrors.NewNotFoundError("Document not found") }
+
+// readableDocument returns the caller and the Document if the caller can
+// read it, else errDocumentNotFound.
+func (s *documentService) readableDocument(ctx context.Context, id uuid.UUID) (auth.Principal, *types.Document, error) {
 	p, err := caller(ctx)
 	if err != nil {
-		return nil, err
+		return auth.Principal{}, nil, err
 	}
 	doc, err := s.repo.GetReadableDocumentByID(ctx, p.ID, id)
 	if errors.Is(err, repository.ErrDocumentNotFound) {
-		return nil, werrors.NewNotFoundError("Document not found")
+		return auth.Principal{}, nil, errDocumentNotFound()
 	}
+	if err != nil {
+		return auth.Principal{}, nil, err
+	}
+	return p, doc, nil
+}
+
+// GetDocumentByID returns a Document the caller can read, with its Access
+// List when the caller owns it.
+func (s *documentService) GetDocumentByID(ctx context.Context, id uuid.UUID) (*types.Document, error) {
+	p, doc, err := s.readableDocument(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -158,21 +172,14 @@ func (s *documentService) GetDocumentByID(ctx context.Context, id uuid.UUID) (*t
 // A Document they cannot read is the same not-found error as a missing one,
 // and so is a row whose object is gone. The caller closes the reader.
 func (s *documentService) GetDocumentFile(ctx context.Context, id uuid.UUID) (*types.Document, io.ReadCloser, error) {
-	p, err := caller(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	doc, err := s.repo.GetReadableDocumentByID(ctx, p.ID, id)
-	if errors.Is(err, repository.ErrDocumentNotFound) {
-		return nil, nil, werrors.NewNotFoundError("Document not found")
-	}
+	_, doc, err := s.readableDocument(ctx, id)
 	if err != nil {
 		return nil, nil, err
 	}
 	body, err := s.fileSvc.GetFile(ctx, doc.ObjectKey)
 	if errors.Is(err, interfaces.ErrFileNotFound) {
 		slog.ErrorContext(ctx, "source file missing from object storage", "document", doc.ID, "key", doc.ObjectKey)
-		return nil, nil, werrors.NewNotFoundError("Document not found")
+		return nil, nil, errDocumentNotFound()
 	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("open source file of document %s: %w", doc.ID, err)

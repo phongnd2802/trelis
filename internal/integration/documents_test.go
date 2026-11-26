@@ -105,26 +105,18 @@ func TestAnUploadedSourceFileIsStoredInTheBucketAndDownloadable(t *testing.T) {
 	if d := resp.Header.Get("Content-Disposition"); !strings.HasPrefix(d, "attachment") {
 		t.Errorf("Content-Disposition = %q, want an attachment", d)
 	}
+	if resp.Header.Get("X-Content-Type-Options") != "nosniff" || resp.Header.Get("Content-Security-Policy") != "sandbox" {
+		t.Errorf("headers = %v, want nosniff and a sandbox CSP", resp.Header)
+	}
 	if resp := tr.get(t, "/documents/"+id+"/file", bob); resp.StatusCode != http.StatusNotFound {
 		t.Errorf("bob GET file = %d, want 404", resp.StatusCode)
 	}
 }
 
-func TestReadinessSeesTheBucket(t *testing.T) {
-	tr := start(t)
-	var ready struct {
-		Checks map[string]struct{ Status string } `json:"checks"`
-	}
-	if err := json.NewDecoder(tr.get(t, "/readyz", "").Body).Decode(&ready); err != nil {
-		t.Fatal(err)
-	}
-	if got := ready.Checks["storage"].Status; got != "up" {
-		t.Errorf("storage = %q, want up", got)
-	}
-}
-
-func TestAMissingBucketFailsReadinessWhenNotCreatedOnStart(t *testing.T) {
-	tr := startWith(t, "TRELIS_STORAGE_S3_CREATE_BUCKET=false")
+// readiness GETs /readyz and returns its status code and per-dependency
+// statuses.
+func (tr *trelis) readiness(t *testing.T) (int, map[string]string) {
+	t.Helper()
 	resp := tr.get(t, "/readyz", "")
 	var ready struct {
 		Checks map[string]struct{ Status string } `json:"checks"`
@@ -132,7 +124,30 @@ func TestAMissingBucketFailsReadinessWhenNotCreatedOnStart(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&ready); err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != http.StatusServiceUnavailable || ready.Checks["storage"].Status == "up" {
-		t.Errorf("readyz = %d, storage %q; want 503 with storage down", resp.StatusCode, ready.Checks["storage"].Status)
+	statuses := map[string]string{}
+	for dep, c := range ready.Checks {
+		statuses[dep] = c.Status
+	}
+	return resp.StatusCode, statuses
+}
+
+func TestReadinessSeesTheBucket(t *testing.T) {
+	tr := start(t)
+	if _, checks := tr.readiness(t); checks["storage"] != "up" {
+		t.Errorf("storage = %q, want up", checks["storage"])
+	}
+}
+
+func TestAMissingBucketFailsReadinessWhenNotCreatedOnStart(t *testing.T) {
+	tr := startWith(t, "TRELIS_STORAGE_S3_CREATE_BUCKET=false")
+	if code, checks := tr.readiness(t); code != http.StatusServiceUnavailable || checks["storage"] == "up" {
+		t.Errorf("readyz = %d, storage %q; want 503 with storage down", code, checks["storage"])
+	}
+}
+
+func TestTrelisServesWhileObjectStorageIsUnreachable(t *testing.T) {
+	tr := startWith(t, "TRELIS_STORAGE_S3_ENDPOINT=http://127.0.0.1:1")
+	if code, checks := tr.readiness(t); code != http.StatusServiceUnavailable || checks["storage"] == "up" || checks["postgres"] != "up" {
+		t.Errorf("readyz = %d %v; want 503 with storage down and postgres up", code, checks)
 	}
 }

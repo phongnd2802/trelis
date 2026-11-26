@@ -70,8 +70,8 @@ type Storage struct {
 	S3            S3    `mapstructure:"s3"`
 }
 
-// S3 configures the S3-compatible bucket (silo in development and CI; AWS
-// S3, R2, Ceph or Garage in production).
+// S3 configures the S3-compatible bucket (silo, a MinIO fork, in
+// development and CI; AWS S3, R2, Ceph or Garage in production).
 type S3 struct {
 	// Endpoint is the server's base URL, e.g. http://localhost:9000; empty
 	// means AWS S3 in Region.
@@ -83,10 +83,12 @@ type S3 struct {
 	// TRELIS_STORAGE_S3_SECRET_ACCESS_KEY.
 	AccessKeyID     string `mapstructure:"access_key_id"`
 	SecretAccessKey string `mapstructure:"secret_access_key"`
-	// ForcePathStyle addresses buckets as {endpoint}/{bucket} even on AWS.
+	// ForcePathStyle addresses buckets as {endpoint}/{bucket} even on AWS;
+	// every other endpoint is always addressed path-style.
 	ForcePathStyle bool `mapstructure:"force_path_style"`
-	// CreateBucket creates the bucket on start when it is missing (the
-	// development default). Off, a missing bucket fails /readyz.
+	// CreateBucket creates the bucket on start when it is missing; the
+	// development config turns it on. Off (the default), a missing bucket
+	// fails /readyz.
 	CreateBucket bool `mapstructure:"create_bucket"`
 }
 

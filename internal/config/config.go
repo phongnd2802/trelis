@@ -70,7 +70,7 @@ var defaults = map[string]any{
 	"storage.s3.access_key_id":     "",
 	"storage.s3.secret_access_key": "",
 	"storage.s3.force_path_style":  false,
-	"storage.s3.create_bucket":     true,
+	"storage.s3.create_bucket":     false,
 }
 
 var sslModes = []string{"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}

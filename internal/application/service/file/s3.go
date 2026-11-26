@@ -24,7 +24,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/aws/smithy-go"
 	"github.com/google/uuid"
 
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
@@ -64,10 +63,12 @@ type S3FileService struct {
 // addressing. S3-compatible services default to path-style; AWS uses
 // virtual-hosted style. force_path_style always wins.
 func s3UsePathStyle(endpoint string, forcePathStyle bool) bool {
-	if forcePathStyle {
-		return true
-	}
-	return !strings.Contains(endpoint, "amazonaws.com")
+	return forcePathStyle || !isAWSEndpoint(endpoint)
+}
+
+// isAWSEndpoint reports whether endpoint is AWS S3 itself.
+func isAWSEndpoint(endpoint string) bool {
+	return strings.Contains(endpoint, "amazonaws.com")
 }
 
 // NewS3FileService returns a FileService on opts.Bucket. It does not touch
@@ -105,7 +106,7 @@ func NewS3FileService(opts S3Options) (*S3FileService, error) {
 		}
 		o.BaseEndpoint = aws.String(opts.Endpoint)
 		o.UsePathStyle = s3UsePathStyle(opts.Endpoint, opts.ForcePathStyle)
-		if !strings.Contains(opts.Endpoint, "amazonaws.com") {
+		if !isAWSEndpoint(opts.Endpoint) {
 			// S3-compatible services commonly reject the SDK's default
 			// trailing checksum negotiation. Only relax this for explicit
 			// non-AWS endpoints; standard AWS S3 keeps its default behavior.
@@ -174,7 +175,7 @@ func (s *S3FileService) SaveFile(ctx context.Context,
 
 	src, err := file.Open()
 	if err != nil {
-		return "", fmt.Errorf("failed to open file: %w", err)
+		return "", fmt.Errorf("s3: open upload: %w", err)
 	}
 	defer func() { _ = src.Close() }()
 
@@ -191,7 +192,7 @@ func (s *S3FileService) SaveFile(ctx context.Context,
 		ContentType:   aws.String("application/octet-stream"),
 	})
 	if err != nil {
-		return "", fmt.Errorf("failed to upload file to S3: %w", err)
+		return "", fmt.Errorf("s3: put source file %s: %w", key, err)
 	}
 	return key, nil
 }
@@ -209,7 +210,7 @@ func (s *S3FileService) GetFile(ctx context.Context, key string) (io.ReadCloser,
 		if errors.As(err, &noKey) {
 			return nil, interfaces.ErrFileNotFound
 		}
-		return nil, fmt.Errorf("failed to get file from S3: %w", err)
+		return nil, fmt.Errorf("s3: get %s: %w", key, err)
 	}
 	return &boundReadCloser{ReadCloser: resp.Body, cancel: cancel}, nil
 }
@@ -224,11 +225,7 @@ func (s *S3FileService) DeleteFile(ctx context.Context, key string) error {
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		var apiErr smithy.APIError
-		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchKey" {
-			return nil
-		}
-		return fmt.Errorf("failed to delete file: %w", err)
+		return fmt.Errorf("s3: delete %s: %w", key, err)
 	}
 	return nil
 }
