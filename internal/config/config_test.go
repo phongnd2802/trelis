@@ -192,6 +192,10 @@ models:
     model: text-embedding-3-small
     api_key: sk-embed
     batch_size: 16
+  rerank:
+    base_url: https://api.jina.ai/v1
+    model: jina-reranker-v2-base-multilingual
+    api_key: sk-rerank
 `
 
 func TestLoadModelRoles(t *testing.T) {
@@ -210,9 +214,32 @@ func TestLoadModelRoles(t *testing.T) {
 			BaseURL: "https://api.openai.com/v1", Model: "gpt-4.1", APIKey: "sk-judge"}},
 		Embedding: EmbeddingRole{BatchSize: 16, Endpoint: Endpoint{
 			BaseURL: "http://litellm:4000/v1", Model: "text-embedding-3-small", APIKey: "sk-embed"}},
+		Rerank: RerankRole{Endpoint: Endpoint{
+			BaseURL: "https://api.jina.ai/v1", Model: "jina-reranker-v2-base-multilingual", APIKey: "sk-rerank"}},
 	}
 	if cfg.Models != want {
 		t.Errorf("Models = %+v,\nwant     %+v", cfg.Models, want)
+	}
+}
+
+func TestLoadRerankRoleOnItsOwn(t *testing.T) {
+	t.Setenv("TRELIS_MODELS_RERANK_BASE_URL", "http://localhost:4000/v1")
+	t.Setenv("TRELIS_MODELS_RERANK_MODEL", "local-rerank")
+	t.Setenv("TRELIS_MODELS_RERANK_API_KEY", "sk-local")
+
+	cfg, err := Load(writeConfig(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := RerankRole{Endpoint: Endpoint{
+		BaseURL: "http://localhost:4000/v1", Model: "local-rerank", APIKey: "sk-local"}}
+	if cfg.Models.Rerank != want {
+		t.Errorf("Models.Rerank = %+v,\nwant          %+v", cfg.Models.Rerank, want)
+	}
+	// A provider for one role is not a provider for the others.
+	if cfg.Models.Chat.Configured() || cfg.Models.Extraction.Configured() ||
+		cfg.Models.Judge.Configured() || cfg.Models.Embedding.Configured() {
+		t.Errorf("Models = %+v, want the other roles unconfigured", cfg.Models)
 	}
 }
 
@@ -289,6 +316,9 @@ func TestLoadRejectsInvalidModelRoles(t *testing.T) {
 		{"embedding model without base url", map[string]string{"TRELIS_MODELS_EMBEDDING_BASE_URL": " "}, "models.embedding.base_url"},
 		{"embedding batch size zero", map[string]string{"TRELIS_MODELS_EMBEDDING_BATCH_SIZE": "0"}, "models.embedding.batch_size"},
 		{"embedding batch size negative", map[string]string{"TRELIS_MODELS_EMBEDDING_BATCH_SIZE": "-4"}, "models.embedding.batch_size"},
+		{"rerank model without base url", map[string]string{"TRELIS_MODELS_RERANK_BASE_URL": " "}, "models.rerank.base_url"},
+		{"rerank base url without model", map[string]string{"TRELIS_MODELS_RERANK_MODEL": " "}, "models.rerank.model"},
+		{"rerank base url not http", map[string]string{"TRELIS_MODELS_RERANK_BASE_URL": "jina.ai"}, "models.rerank.base_url"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -15,12 +15,8 @@ package embedding
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"math/rand/v2"
 	"net/http"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/phongnd2802/trelis/internal/config"
@@ -30,16 +26,6 @@ import (
 // defaultPath is where an OpenAI-compatible provider takes embeddings, under
 // the role's base URL.
 const defaultPath = "/embeddings"
-
-// How one batch tries before it gives up: a few attempts, backing off from
-// half a second, never waiting longer than ten seconds between two, and never
-// waiting out a Retry-After longer than a minute.
-const (
-	defaultMaxAttempts   = 4
-	defaultBaseDelay     = 500 * time.Millisecond
-	defaultMaxDelay      = 10 * time.Second
-	defaultMaxRetryAfter = 60 * time.Second
-)
 
 // Embedder is the embedding model role.
 type Embedder interface {
@@ -59,36 +45,31 @@ func WithHTTPClient(hc *http.Client) Option {
 	return func(c *client) { c.endpoint.Client = hc }
 }
 
-// WithRetry bounds the retries of one batch: maxAttempts sends in total (1
-// sends the batch once), waiting baseDelay before the second and doubling that
-// wait up to maxDelay.
+// WithRetry bounds the retries of one batch: maxAttempts sends in total (a
+// value below 1 sends the batch once), waiting baseDelay before the second
+// and doubling that wait up to maxDelay. Negative waits mean none.
 func WithRetry(maxAttempts int, baseDelay, maxDelay time.Duration) Option {
 	return func(c *client) {
-		c.maxAttempts = max(1, maxAttempts)
-		c.baseDelay = max(0, baseDelay)
-		c.maxDelay = max(0, maxDelay)
+		c.retry.MaxAttempts = maxAttempts
+		c.retry.BaseDelay = baseDelay
+		c.retry.MaxDelay = maxDelay
 	}
 }
 
 // WithMaxRetryAfter bounds how long a Retry-After is waited out. A provider
 // that asks for longer than d gets its error back instead of a client that
-// either stalls or comes back earlier than it was told to. Zero waits out
-// none: any positive Retry-After returns the error at once.
+// either stalls or comes back earlier than it was told to. Zero or less waits
+// out none: any positive Retry-After returns the error at once.
 func WithMaxRetryAfter(d time.Duration) Option {
-	return func(c *client) { c.maxRetryAfter = max(0, d) }
+	return func(c *client) { c.retry.MaxRetryAfter = d }
 }
 
 // client is the embedding role's client.
 type client struct {
-	endpoint    api.Endpoint
-	batchSize   int
-	maxAttempts int
-	baseDelay   time.Duration
-	maxDelay    time.Duration
-	// maxRetryAfter is the longest Retry-After this client waits out. A
-	// provider that asks for longer gets its error back, because coming back
-	// earlier than it asked only earns the same answer. Zero waits out none.
-	maxRetryAfter time.Duration
+	endpoint  api.Endpoint
+	batchSize int
+	// retry is how one batch is sent again after a failure worth waiting out.
+	retry api.Retry
 	// timeout is the fallback deadline of ONE request, applied only when the
 	// caller's ctx carries none. It is per request rather than per Embed
 	// because a long ingest sends dozens of batches, and one deadline over all
@@ -103,12 +84,9 @@ func New(role config.EmbeddingRole, opts ...Option) (Embedder, error) {
 		return nil, err
 	}
 	c := &client{
-		endpoint:      endpoint,
-		batchSize:     role.BatchSize,
-		maxAttempts:   defaultMaxAttempts,
-		baseDelay:     defaultBaseDelay,
-		maxDelay:      defaultMaxDelay,
-		maxRetryAfter: defaultMaxRetryAfter,
+		endpoint:  endpoint,
+		batchSize: role.BatchSize,
+		retry:     api.DefaultRetry(),
 		// Embeddings are non-streaming calls, so the chat timeout is the right
 		// fallback for one of them.
 		timeout: api.DefaultChatTimeout,
@@ -164,65 +142,26 @@ func (c *client) Embed(ctx context.Context, texts []string) ([][]float32, error)
 // the provider gave. dims is the vector length an earlier batch of the same
 // Embed call established, or 0 when this is the first.
 func (c *client) embedBatch(ctx context.Context, batch []string, dims int) ([][]float32, error) {
-	var last error
-	for attempt := 1; attempt <= c.maxAttempts; attempt++ {
-		if attempt > 1 {
-			d, ok := c.retryWait(attempt-1, last)
-			if !ok {
-				// The provider asked for a wait this client will not serve; its
-				// own answer goes back to the caller.
-				return nil, last
-			}
-			if err := wait(ctx, d); err != nil {
-				return nil, err
-			}
-		}
-		vectors, err := c.send(ctx, batch, dims)
-		if err == nil {
-			return vectors, nil
-		}
-		last = err
-		if !retryable(err) {
-			return nil, err
-		}
-		// The caller went away: waiting out a backoff for a retry nobody will
-		// read is worse than reporting the cancellation.
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
+	var vectors [][]float32
+	err := c.retry.Do(ctx, func(ctx context.Context) error {
+		var err error
+		vectors, err = c.send(ctx, batch, dims)
+		return err
+	})
+	if err != nil {
+		return nil, err
 	}
-	return nil, last
+	return vectors, nil
 }
 
 // send posts one batch and returns its vectors in the batch's order. dims is
 // the vector length an earlier batch of the same Embed call established, or 0
 // to accept whatever this reply carries.
 func (c *client) send(ctx context.Context, batch []string, dims int) ([][]float32, error) {
-	// One deadline per request rather than per Embed, and only when the caller
-	// set none of its own: a long ingest sends dozens of batches, and a single
-	// deadline over all of them would cut the call off and throw away the
-	// batches that had already finished.
-	ctx, cancel := api.WithLLMTimeout(ctx, c.timeout)
-	defer cancel()
-
 	body := requestBody{Model: c.endpoint.Model, Input: batch}
-	req, _, err := c.endpoint.NewRequest(ctx, c.endpoint.Resolve(defaultPath), body, false)
+	raw, err := c.endpoint.PostJSON(ctx, defaultPath, body, c.timeout)
 	if err != nil {
 		return nil, err
-	}
-	resp, err := c.endpoint.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, err := api.ReadResponseCapped(resp.Body, 0)
-	if err != nil {
-		// An oversized body is the same size every time, so it is the one read
-		// failure that sending the batch again cannot fix.
-		if errors.Is(err, api.ErrResponseTooLarge) {
-			return nil, fmt.Errorf("read response: %w", err)
-		}
-		return nil, &api.TransportError{Op: "read response", Err: err}
 	}
 	return vectorsOf(raw, len(batch), dims)
 }
@@ -292,89 +231,4 @@ func vectorsOf(raw []byte, want, dims int) ([][]float32, error) {
 		}
 	}
 	return vectors, nil
-}
-
-// retryable reports whether err is worth sending again: a rate limit, a
-// server-side failure, or a request that never got a whole answer. Any other
-// 4xx is the request's own fault and would fail the same way again.
-func retryable(err error) bool {
-	var httpErr *api.HTTPError
-	if errors.As(err, &httpErr) {
-		return httpErr.StatusCode == http.StatusTooManyRequests ||
-			httpErr.StatusCode >= http.StatusInternalServerError
-	}
-	var transportErr *api.TransportError
-	return errors.As(err, &transportErr)
-}
-
-// retryWait is how long to wait before the next attempt, after failed attempts
-// went wrong with err. It reports false when waiting is pointless: the provider
-// asked for a Retry-After longer than maxRetryAfter, and coming back earlier
-// than it asked would only earn the same answer.
-func (c *client) retryWait(failed int, err error) (time.Duration, bool) {
-	if after, ok := retryAfter(err); ok {
-		if after > c.maxRetryAfter {
-			return 0, false
-		}
-		// Jitter may only lengthen a wait the vendor asked for, and never past
-		// the cap on it.
-		return min(after+jitter(after), c.maxRetryAfter), true
-	}
-	d := c.backoff(failed)
-	// Shorten rather than lengthen: backoff is already capped, so adding jitter
-	// and clipping back to the cap would leave every caller waiting exactly
-	// maxDelay and coming back in lockstep.
-	return d - jitter(d), true
-}
-
-// jitter is up to a quarter of d.
-func jitter(d time.Duration) time.Duration {
-	if d <= 0 {
-		return 0
-	}
-	return time.Duration(rand.Int64N(int64(d)/4 + 1))
-}
-
-// backoff is baseDelay doubled once per failed attempt, capped at maxDelay.
-func (c *client) backoff(failed int) time.Duration {
-	d := c.baseDelay
-	for i := 1; i < failed && d < c.maxDelay; i++ {
-		d *= 2
-	}
-	return min(d, c.maxDelay)
-}
-
-// retryAfter is the wait a 429 or 503 asks for, in whole seconds. A header
-// naming an HTTP date instead is left alone and the backoff applies: a vendor
-// that will not say how long it needs gets this client's own schedule.
-func retryAfter(err error) (time.Duration, bool) {
-	var httpErr *api.HTTPError
-	if !errors.As(err, &httpErr) {
-		return 0, false
-	}
-	if httpErr.StatusCode != http.StatusTooManyRequests &&
-		httpErr.StatusCode != http.StatusServiceUnavailable {
-		return 0, false
-	}
-	seconds, convErr := strconv.Atoi(strings.TrimSpace(httpErr.Header.Get("Retry-After")))
-	if convErr != nil || seconds < 0 {
-		return 0, false
-	}
-	return time.Duration(seconds) * time.Second, true
-}
-
-// wait sleeps d, or returns ctx's error as soon as ctx is done, so a cancelled
-// Embed is not held up by the backoff it happened to be in.
-func wait(ctx context.Context, d time.Duration) error {
-	if d <= 0 {
-		return ctx.Err()
-	}
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }

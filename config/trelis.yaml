@@ -59,3 +59,6 @@ storage:
 #     base_url: https://api.openai.com/v1
 #     model: text-embedding-3-small
 #     batch_size: 64               # texts per request, at least 1
+#   rerank:                        # POST {base_url}/rerank
+#     base_url: https://api.jina.ai/v1
+#     model: jina-reranker-v2-base-multilingual

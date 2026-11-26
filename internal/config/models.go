@@ -9,12 +9,11 @@ import (
 	"github.com/phongnd2802/trelis/internal/models/api"
 )
 
-// Models points each model role at its own OpenAI-compatible provider.
-// Every role embeds Endpoint (base_url, model, api_key) and adds only what
-// is specific to it: a chat role adds its protocol, the embedding role the
-// size of the batches it sends. The rerank (#18) role becomes a field here
-// of its own type that embeds Endpoint too, registered with registerEndpoint
-// and checked with Endpoint.validate.
+// Models points each model role at its own provider. Every role embeds
+// Endpoint (base_url, model, api_key) and adds only what is specific to it:
+// a chat role adds its protocol, the embedding role the size of the batches
+// it sends. The rerank role needs nothing beyond its endpoint: the
+// Jina/Cohere schema carries no setting of its own.
 //
 // A role with neither base_url nor model is unconfigured, so the service
 // starts without models until a feature needs one.
@@ -27,6 +26,9 @@ type Models struct {
 	Judge ChatRole `mapstructure:"judge"`
 	// Embedding turns Chunk text into the vectors dense retrieval searches.
 	Embedding EmbeddingRole `mapstructure:"embedding"`
+	// Rerank scores retrieval candidates against a query, so the ones that
+	// answer it best come first.
+	Rerank RerankRole `mapstructure:"rerank"`
 }
 
 // Endpoint is the provider one role calls.
@@ -65,6 +67,18 @@ type EmbeddingRole struct {
 	BatchSize int `mapstructure:"batch_size"`
 }
 
+// rerankKey names the rerank role where its key is spelled out: in the
+// defaults, in the env variable that overrides them and in errors.
+const rerankKey = "models.rerank"
+
+// RerankRole is a role served by a rerank model over /v1/rerank. The
+// Jina/Cohere schema the endpoint speaks has no setting beyond the endpoint
+// itself: the client always asks for a score per document, in the caller's
+// order.
+type RerankRole struct {
+	Endpoint `mapstructure:",squash"`
+}
+
 // chatRoles names every chat role by its key, for defaults and validation.
 func (m *Models) chatRoles() map[string]*ChatRole {
 	return map[string]*ChatRole{
@@ -81,6 +95,7 @@ func init() {
 	}
 	registerEndpoint(embeddingKey)
 	defaults[embeddingKey+".batch_size"] = DefaultEmbeddingBatchSize
+	registerEndpoint(rerankKey)
 }
 
 // registerEndpoint adds the endpoint keys under key to the defaults, so env
@@ -99,8 +114,8 @@ func (e Endpoint) Configured() bool {
 
 // APIEndpoint is the endpoint a role's client calls: the same base URL and
 // model, with the key turned into the auth the wire wants. role names the
-// caller in an error ("chat", "embedding", and rerank with #18), so a message
-// says which role is missing its base URL or its model.
+// caller in an error ("chat", "embedding", "rerank"), so a message says
+// which role is missing its base URL or its model.
 func (e Endpoint) APIEndpoint(role string) (api.Endpoint, error) {
 	if strings.TrimSpace(e.BaseURL) == "" {
 		return api.Endpoint{}, fmt.Errorf("%s: base URL is required", role)
@@ -120,6 +135,7 @@ func (m *Models) validate() []error {
 		errs = append(errs, role.validate(key)...)
 	}
 	errs = append(errs, m.Embedding.validate(embeddingKey)...)
+	errs = append(errs, m.Rerank.validate(rerankKey)...)
 	// Map order is random; keep messages stable.
 	slices.SortFunc(errs, func(a, b error) int { return strings.Compare(a.Error(), b.Error()) })
 	return errs
