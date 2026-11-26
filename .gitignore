@@ -13,6 +13,8 @@ go.work.sum
 .env
 .env.*
 !.env.example
+# Local dev credentials and notes (API keys, IDs)
+/.local/
 
 # anydoc Rust build artifacts (rebuilt by scripts/build-anydoc-lib.sh)
 /third_party/anydoc-go/target/
