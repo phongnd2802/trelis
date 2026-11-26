@@ -168,6 +168,99 @@ func TestLoadDependencyDefaults(t *testing.T) {
 	}
 }
 
+const modelsYAML = `
+server:
+  addr: ":8080"
+  shutdown_timeout: 5s
+models:
+  chat:
+    base_url: http://litellm:4000/v1
+    model: gpt-4o-mini
+    api_key: sk-chat
+  extraction:
+    protocol: openai-completions
+    base_url: https://openrouter.ai/api/v1
+    model: qwen/qwen3-32b
+  judge:
+    base_url: https://api.openai.com/v1
+    model: gpt-4.1
+`
+
+func TestLoadModelRoles(t *testing.T) {
+	t.Setenv("TRELIS_MODELS_JUDGE_API_KEY", "sk-judge")
+
+	cfg, err := Load(writeConfig(t, modelsYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := Models{
+		Chat: ChatRole{Protocol: "openai-completions", Endpoint: Endpoint{
+			BaseURL: "http://litellm:4000/v1", Model: "gpt-4o-mini", APIKey: "sk-chat"}},
+		Extraction: ChatRole{Protocol: "openai-completions", Endpoint: Endpoint{
+			BaseURL: "https://openrouter.ai/api/v1", Model: "qwen/qwen3-32b"}},
+		Judge: ChatRole{Protocol: "openai-completions", Endpoint: Endpoint{
+			BaseURL: "https://api.openai.com/v1", Model: "gpt-4.1", APIKey: "sk-judge"}},
+	}
+	if cfg.Models != want {
+		t.Errorf("Models = %+v,\nwant     %+v", cfg.Models, want)
+	}
+}
+
+func TestLoadModelRolesFromEnvOnly(t *testing.T) {
+	t.Setenv("TRELIS_MODELS_CHAT_BASE_URL", "http://localhost:4000/v1")
+	t.Setenv("TRELIS_MODELS_CHAT_MODEL", "local")
+
+	cfg, err := Load(writeConfig(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Models.Chat.Configured() || cfg.Models.Chat.Model != "local" {
+		t.Errorf("Models.Chat = %+v, want the env values", cfg.Models.Chat)
+	}
+	if cfg.Models.Judge.Configured() {
+		t.Errorf("Models.Judge = %+v, want unconfigured", cfg.Models.Judge)
+	}
+}
+
+func TestLoadIgnoresAKeyWithoutAProvider(t *testing.T) {
+	t.Setenv("TRELIS_MODELS_JUDGE_API_KEY", "sk-left-over")
+
+	cfg, err := Load(writeConfig(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Models.Judge.Configured() {
+		t.Errorf("Models.Judge = %+v, want unconfigured with only a key", cfg.Models.Judge)
+	}
+}
+
+func TestLoadRejectsInvalidModelRoles(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     map[string]string
+		wantMsg string
+	}{
+		{"model without base url", map[string]string{"TRELIS_MODELS_CHAT_BASE_URL": " "}, "models.chat.base_url"},
+		{"base url without model", map[string]string{"TRELIS_MODELS_JUDGE_MODEL": " "}, "models.judge.model"},
+		{"base url not http", map[string]string{"TRELIS_MODELS_EXTRACTION_BASE_URL": "litellm:4000"}, "models.extraction.base_url"},
+		{"unknown protocol", map[string]string{"TRELIS_MODELS_CHAT_PROTOCOL": "grpc"}, "models.chat.protocol"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			_, err := Load(writeConfig(t, modelsYAML))
+			if err == nil {
+				t.Fatal("Load succeeded, want an error")
+			}
+			if !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Errorf("error %q does not mention %q", err, tc.wantMsg)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsInvalidDependencies(t *testing.T) {
 	cases := []struct {
 		name    string

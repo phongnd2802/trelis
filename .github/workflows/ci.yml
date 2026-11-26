@@ -67,6 +67,19 @@ jobs:
       - name: Build
         run: make build
 
+  # The HTTP API against Postgres and Neo4j in testcontainers, with the fake
+  # model provider (internal/integration). The runner's Docker hosts them.
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Integration tests
+        run: make test-integration
+
   # The whole compose stack on a fresh runner (the clean-checkout case), then
   # again over the same volumes to prove every init step is idempotent.
   compose-smoke:

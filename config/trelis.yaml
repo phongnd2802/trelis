@@ -32,3 +32,18 @@ storage:
   # volume at /data/files and sets TRELIS_STORAGE_LOCAL_DIR).
   local_dir: data/files
   max_file_size_mb: 50
+
+# Model roles. Each role points at its own OpenAI-compatible provider
+# (base_url, model, api_key); a role left empty is unconfigured. Keep keys
+# out of this file: set TRELIS_MODELS_<ROLE>_API_KEY instead.
+# models:
+#   chat:
+#     protocol: openai-completions   # POST {base_url}/chat/completions
+#     base_url: http://localhost:4000/v1
+#     model: gpt-4o-mini
+#   extraction:
+#     base_url: https://openrouter.ai/api/v1
+#     model: qwen/qwen3-32b
+#   judge:                         # should differ from the chat model
+#     base_url: https://api.openai.com/v1
+#     model: gpt-4.1

@@ -30,6 +30,7 @@ type Config struct {
 	Neo4j    Neo4j    `mapstructure:"neo4j"`
 	Temporal Temporal `mapstructure:"temporal"`
 	Storage  Storage  `mapstructure:"storage"`
+	Models   Models   `mapstructure:"models"`
 }
 
 // Server configures the HTTP listener.
@@ -159,6 +160,7 @@ func (c *Config) validate() error {
 	if c.Storage.MaxFileSizeMB < 1 {
 		errs = append(errs, fmt.Errorf("storage.max_file_size_mb must be at least 1, got %d", c.Storage.MaxFileSizeMB))
 	}
+	errs = append(errs, c.Models.validate()...)
 
 	return errors.Join(errs...)
 }

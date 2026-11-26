@@ -1,0 +1,348 @@
+//go:build integration
+
+package integration
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/testcontainers/testcontainers-go"
+	tcneo4j "github.com/testcontainers/testcontainers-go/modules/neo4j"
+	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+
+	"github.com/phongnd2802/trelis/internal/models/modeltest"
+)
+
+// The images compose.dev.yaml runs; keep them in step.
+const (
+	postgresImage = "paradedb/paradedb:0.27.1-pg18"
+	neo4jImage    = "neo4j:5.26.34-community"
+)
+
+const (
+	pgUser, pgPassword = "trelis", "trelis"
+	neo4jPassword      = "trelis-test"
+	// bootTimeout bounds how long a Trelis process may take to migrate and
+	// start listening.
+	bootTimeout = 30 * time.Second
+)
+
+// deps is what TestMain starts once for the whole package.
+var deps struct {
+	binary string
+	config string
+	pg     hostPort
+	neo4j  hostPort
+}
+
+// hostPort is where a container port is reachable from the host.
+type hostPort struct{ host, port string }
+
+func TestMain(m *testing.M) {
+	code, err := runSuite(m)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "integration:", err)
+		os.Exit(1)
+	}
+	os.Exit(code)
+}
+
+// runSuite builds Trelis and starts the containers, runs the tests, then
+// tears everything down.
+func runSuite(m *testing.M) (int, error) {
+	ctx := context.Background()
+
+	dir, err := os.MkdirTemp("", "trelis-integration-")
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	if deps.binary, err = buildBinary(dir); err != nil {
+		return 0, err
+	}
+	// Every key comes from TRELIS_* env (see trelisEnv), so the config file
+	// is empty and a change to config/trelis.yaml cannot reach the tests.
+	deps.config = filepath.Join(dir, "trelis.yaml")
+	if err := os.WriteFile(deps.config, []byte("# all keys from TRELIS_* env\n"), 0o600); err != nil {
+		return 0, err
+	}
+
+	var (
+		wg              sync.WaitGroup
+		pg              *tcpostgres.PostgresContainer
+		graph           *tcneo4j.Neo4jContainer
+		pgErr, neo4jErr error
+	)
+	wg.Go(func() {
+		pg, pgErr = tcpostgres.Run(ctx, postgresImage,
+			tcpostgres.WithDatabase("trelis"),
+			tcpostgres.WithUsername(pgUser),
+			tcpostgres.WithPassword(pgPassword),
+			tcpostgres.BasicWaitStrategies(),
+		)
+	})
+	wg.Go(func() {
+		graph, neo4jErr = tcneo4j.Run(ctx, neo4jImage, tcneo4j.WithAdminPassword(neo4jPassword))
+	})
+	wg.Wait()
+	defer func() {
+		_ = testcontainers.TerminateContainer(pg)
+		_ = testcontainers.TerminateContainer(graph)
+	}()
+	if pgErr != nil {
+		return 0, fmt.Errorf("start postgres: %w", pgErr)
+	}
+	if neo4jErr != nil {
+		return 0, fmt.Errorf("start neo4j: %w", neo4jErr)
+	}
+
+	if deps.pg, err = endpoint(ctx, pg, "5432/tcp"); err != nil {
+		return 0, err
+	}
+	if deps.neo4j, err = endpoint(ctx, graph, "7687/tcp"); err != nil {
+		return 0, err
+	}
+	return m.Run(), nil
+}
+
+// buildBinary builds the Trelis server into dir, with the same tags as this
+// test binary, and returns its path. Built once per package, not per test.
+//
+// Adapted from Omnisc/WeKnora cli/acceptance/e2e/e2e_test.go,
+// Copyright (C) 2026 Tencent, MIT license; see NOTICE.
+func buildBinary(dir string) (string, error) {
+	out := filepath.Join(dir, "trelis")
+	// Repo layout: this test sits at internal/integration/, so the module
+	// root is two levels up.
+	cmd := exec.Command("go", "build", "-tags", buildTags, "-o", out, "./cmd/server")
+	cmd.Dir = filepath.Join("..", "..")
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("build trelis: %w", err)
+	}
+	return out, nil
+}
+
+// endpoint is where port of c is reachable from the host.
+func endpoint(ctx context.Context, c testcontainers.Container, port string) (hostPort, error) {
+	host, err := c.Host(ctx)
+	if err != nil {
+		return hostPort{}, err
+	}
+	mapped, err := c.MappedPort(ctx, port)
+	if err != nil {
+		return hostPort{}, err
+	}
+	return hostPort{host: host, port: mapped.Port()}, nil
+}
+
+// trelis is one running Trelis process with its own Postgres database and
+// its own fake model provider.
+type trelis struct {
+	// url is the base URL of its HTTP API, e.g. http://127.0.0.1:41234.
+	url string
+	// provider is the fake model provider this Trelis is meant to call. No
+	// model role is configurable yet; when roles land, pass provider.URL()
+	// to trelisEnv and point every role at it.
+	provider *modeltest.FakeProvider
+	// env is the process environment of every command run as this Trelis.
+	env []string
+}
+
+// listening matches the log line Trelis prints once it accepts requests
+// (the default slog text format). The port is only known from it, since
+// Trelis listens on 127.0.0.1:0.
+var listening = regexp.MustCompile(`trelis listening addr=(\S+)`)
+
+// start boots Trelis on a fresh, empty database and stops it when the test
+// ends. Neo4j is shared by every test in the package.
+func start(t *testing.T) *trelis {
+	t.Helper()
+	tr := &trelis{provider: modeltest.NewFakeProvider(t)}
+	tr.env = trelisEnv(freshDatabase(t))
+
+	cmd := exec.Command(deps.binary, "-config", deps.config)
+	cmd.Env = tr.env
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs syncBuffer
+	cmd.Stdout = &logs
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start trelis: %v", err)
+	}
+	exited := make(chan error, 1)
+	addr := make(chan string, 1)
+	go func() {
+		sc := bufio.NewScanner(stderr)
+		for sc.Scan() {
+			line := sc.Text()
+			_, _ = fmt.Fprintln(&logs, line)
+			if m := listening.FindStringSubmatch(line); m != nil {
+				select {
+				case addr <- m[1]:
+				default: // only the first one is read
+				}
+			}
+		}
+		_, _ = io.Copy(io.Discard, stderr)
+		exited <- cmd.Wait()
+	}()
+	t.Cleanup(func() {
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+		select {
+		case err := <-exited:
+			if err != nil {
+				t.Errorf("trelis exited with %v", err)
+			}
+		case <-time.After(15 * time.Second):
+			_ = cmd.Process.Kill()
+			t.Errorf("trelis did not stop on SIGTERM")
+		}
+		if t.Failed() {
+			t.Logf("trelis output:\n%s", logs.String())
+		}
+	})
+
+	select {
+	case a := <-addr:
+		tr.url = "http://" + a
+	case err := <-exited:
+		exited <- err // for the cleanup
+		t.Fatalf("trelis exited before listening: %v\n%s", err, logs.String())
+	case <-time.After(bootTimeout):
+		t.Fatalf("trelis not listening after %v:\n%s", bootTimeout, logs.String())
+	}
+	return tr
+}
+
+// freshDatabase creates an empty database on the shared Postgres, dropped
+// when the test ends, and returns its name.
+func freshDatabase(t *testing.T) string {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, fmt.Sprintf("postgres://%s:%s@%s:%s/trelis?sslmode=disable", pgUser, pgPassword, deps.pg.host, deps.pg.port))
+	if err != nil {
+		t.Fatalf("connect to postgres: %v", err)
+	}
+	name := fmt.Sprintf("trelis_it_%d", time.Now().UnixNano())
+	if _, err := conn.Exec(ctx, "CREATE DATABASE "+name); err != nil {
+		t.Fatalf("create database: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = conn.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
+		_ = conn.Close(ctx)
+	})
+	return name
+}
+
+// trelisEnv configures Trelis for the containers and dbname, as an operator
+// would, through TRELIS_* env. TRELIS_* variables of the developer's shell
+// are dropped, so every key Trelis reads is either set here or its default.
+// Temporal is left unreachable: the client connects lazily and nothing under
+// test uses it yet.
+func trelisEnv(dbname string) []string {
+	var env []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "TRELIS_") {
+			env = append(env, kv)
+		}
+	}
+	return append(env,
+		"TRELIS_SERVER_ADDR=127.0.0.1:0",
+		"TRELIS_SERVER_SHUTDOWN_TIMEOUT=5s",
+		"TRELIS_POSTGRES_HOST="+deps.pg.host,
+		"TRELIS_POSTGRES_PORT="+deps.pg.port,
+		"TRELIS_POSTGRES_DBNAME="+dbname,
+		"TRELIS_POSTGRES_USER="+pgUser,
+		"TRELIS_POSTGRES_PASSWORD="+pgPassword,
+		"TRELIS_POSTGRES_SSLMODE=disable",
+		"TRELIS_NEO4J_HOST="+deps.neo4j.host,
+		"TRELIS_NEO4J_PORT="+deps.neo4j.port,
+		"TRELIS_NEO4J_USER=neo4j",
+		"TRELIS_NEO4J_PASSWORD="+neo4jPassword,
+		"TRELIS_TEMPORAL_HOST=127.0.0.1",
+		"TRELIS_TEMPORAL_PORT=1",
+	)
+}
+
+// admin runs `server admin <args>` against this Trelis's database, as an
+// operator would, and returns its trimmed stdout.
+func (tr *trelis) admin(t *testing.T, args ...string) string {
+	t.Helper()
+	stdout, err := run(deps.binary, tr.env, append([]string{"-config", deps.config, "admin"}, args...)...)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	return strings.TrimSpace(string(stdout))
+}
+
+// run executes the binary and returns its stdout. Errors include stderr +
+// exit code so failures are debuggable without re-running.
+//
+// From Omnisc/WeKnora cli/acceptance/e2e/e2e_test.go,
+// Copyright (C) 2026 Tencent, MIT license; see NOTICE.
+func run(bin string, env []string, args ...string) ([]byte, error) {
+	cmd := exec.Command(bin, args...)
+	cmd.Env = env
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return stdout.Bytes(), fmt.Errorf("%s %s: %v\nstderr:\n%s", filepath.Base(bin), strings.Join(args, " "), err, stderr.String())
+	}
+	return stdout.Bytes(), nil
+}
+
+// get sends GET path with key as the bearer token (none when empty). The
+// body is closed when the test ends.
+func (tr *trelis) get(t *testing.T, path, key string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, tr.url+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	return resp
+}
+
+// syncBuffer is a bytes.Buffer safe for concurrent writers.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
