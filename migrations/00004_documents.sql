@@ -1,26 +1,25 @@
--- Documents, the file bytes they were uploaded as, and their Access Lists.
+-- Documents and their Access Lists. The file itself lives in file storage
+-- (internal/application/service/file); file_path points at it.
 -- +goose Up
 CREATE TABLE documents (
     id           uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
     -- Who uploaded it. The uploader is always on the Access List too.
     owner_id     uuid        NOT NULL REFERENCES principals (id),
-    filename     text        NOT NULL CHECK (filename <> ''),
-    content_type text        NOT NULL,
-    size_bytes   bigint      NOT NULL CHECK (size_bytes > 0),
-    sha256       bytea       NOT NULL,
+    title        text        NOT NULL,
+    file_name    text        NOT NULL CHECK (file_name <> ''),
+    -- Lower-case extension, e.g. "pdf".
+    file_type    text        NOT NULL,
+    file_size    bigint      NOT NULL CHECK (file_size > 0),
+    -- Hex SHA-256 of the content; an owner cannot upload the same bytes twice.
+    file_hash    text        NOT NULL,
+    -- Provider path from file storage, e.g. local://<document id>/<name>.
+    file_path    text        NOT NULL,
     -- pending until ingest has made it searchable.
-    status       text        NOT NULL DEFAULT 'pending'
-                             CHECK (status IN ('pending', 'ready', 'failed')),
-    created_at   timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX documents_owner_id_idx ON documents (owner_id);
-
--- The uploaded bytes, kept apart from the metadata so listing never reads
--- them. Postgres is the source of truth (ADR-0002); ingest reads them by
--- Document ID, since workflows pass IDs only (ADR-0005).
-CREATE TABLE document_files (
-    document_id uuid  PRIMARY KEY REFERENCES documents (id) ON DELETE CASCADE,
-    content     bytea NOT NULL
+    parse_status text        NOT NULL DEFAULT 'pending'
+                             CHECK (parse_status IN ('pending', 'processing', 'completed', 'failed')),
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (owner_id, file_hash)
 );
 
 -- A Document's Access List: the Principals and Groups that may read it.
@@ -59,5 +58,4 @@ $$;
 DROP FUNCTION can_read_document(uuid, uuid);
 DROP TABLE document_groups;
 DROP TABLE document_principals;
-DROP TABLE document_files;
 DROP TABLE documents;

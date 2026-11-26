@@ -7,8 +7,9 @@
 // (run `server admin` for the list); they migrate Postgres and exit without
 // serving. Every HTTP route except /healthz and /readyz needs an API key.
 //
-// On start it applies pending Postgres migrations, then serves. GET /readyz
-// probes Postgres, Neo4j and Temporal; Neo4j and Temporal are connected
+// On start it applies pending Postgres migrations, creates storage.local_dir
+// for uploaded files, then serves. GET /readyz probes Postgres, file
+// storage, Neo4j and Temporal; Neo4j and Temporal are connected
 // lazily, so the service starts even while they are still coming up.
 // SIGINT or SIGTERM stops accepting connections and drains in-flight
 // requests for up to server.shutdown_timeout before exiting.
@@ -29,10 +30,13 @@ import (
 	"go.temporal.io/sdk/client"
 	temporallog "go.temporal.io/sdk/log"
 
+	"github.com/phongnd2802/trelis/internal/application/repository"
+	"github.com/phongnd2802/trelis/internal/application/service"
+	"github.com/phongnd2802/trelis/internal/application/service/file"
 	"github.com/phongnd2802/trelis/internal/auth"
 	"github.com/phongnd2802/trelis/internal/config"
 	"github.com/phongnd2802/trelis/internal/db"
-	"github.com/phongnd2802/trelis/internal/documents"
+	"github.com/phongnd2802/trelis/internal/handler"
 	"github.com/phongnd2802/trelis/internal/router"
 )
 
@@ -96,8 +100,18 @@ func run(configPath string, args []string) error {
 	}
 	defer temporal.Close()
 
+	if err := os.MkdirAll(cfg.Storage.LocalDir, 0o755); err != nil {
+		return fmt.Errorf("storage: %w", err)
+	}
+	files := file.NewLocalFileService(cfg.Storage.LocalDir)
+	docs := handler.NewDocumentHandler(
+		service.NewDocumentService(repository.NewDocumentRepository(pool), files),
+		cfg.Storage.MaxFileSize(),
+	)
+
 	ready := router.Readiness{Timeout: readyTimeout, Checks: []router.Check{
 		{Name: "postgres", Probe: pool.Ping},
+		{Name: "storage", Probe: files.CheckConnectivity},
 		{Name: "neo4j", Probe: graph.VerifyConnectivity},
 		{Name: "temporal", Probe: func(ctx context.Context) error {
 			_, err := temporal.CheckHealth(ctx, &client.CheckHealthRequest{})
@@ -111,7 +125,7 @@ func run(configPath string, args []string) error {
 	}
 	slog.Info("trelis listening", "addr", ln.Addr().String(), "config", configPath)
 
-	if err := router.Serve(ctx, ln, router.New(ready, store, documents.NewStore(pool)), cfg.Server.ShutdownTimeout); err != nil {
+	if err := router.Serve(ctx, ln, router.New(ready, store, docs), cfg.Server.ShutdownTimeout); err != nil {
 		return err
 	}
 	slog.Info("trelis stopped")

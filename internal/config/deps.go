@@ -59,3 +59,17 @@ type Temporal struct {
 func (t Temporal) HostPort() string {
 	return net.JoinHostPort(t.Host, strconv.Itoa(t.Port))
 }
+
+// Storage is where uploaded files are kept (the local FileService) and how
+// large one may be. Omnisc reads the same two settings from
+// LOCAL_STORAGE_BASE_DIR and MAX_FILE_SIZE_MB.
+type Storage struct {
+	// LocalDir is created at start if missing.
+	LocalDir      string `mapstructure:"local_dir"`
+	MaxFileSizeMB int64  `mapstructure:"max_file_size_mb"`
+}
+
+// MaxFileSize is the upload limit in bytes.
+func (s Storage) MaxFileSize() int64 {
+	return s.MaxFileSizeMB << 20
+}

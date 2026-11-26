@@ -26,3 +26,9 @@ temporal:
   host: localhost
   port: 7233
   namespace: default
+
+storage:
+  # Uploaded files, relative to the working directory (compose mounts a
+  # volume at /data/files and sets TRELIS_STORAGE_LOCAL_DIR).
+  local_dir: data/files
+  max_file_size_mb: 50

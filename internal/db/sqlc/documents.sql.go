@@ -11,58 +11,92 @@ import (
 	"github.com/google/uuid"
 )
 
+const countReadableDocuments = `-- name: CountReadableDocuments :one
+SELECT count(*) FROM documents WHERE can_read_document(id, $1::uuid)
+`
+
+func (q *Queries) CountReadableDocuments(ctx context.Context, principalID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countReadableDocuments, principalID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createDocument = `-- name: CreateDocument :one
-INSERT INTO documents (owner_id, filename, content_type, size_bytes, sha256)
-VALUES ($1, $2, $3, $4, $5)
-RETURNING id, owner_id, filename, content_type, size_bytes, sha256, status, created_at
+INSERT INTO documents (id, owner_id, title, file_name, file_type, file_size, file_hash, file_path)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+RETURNING id, owner_id, title, file_name, file_type, file_size, file_hash, file_path, parse_status, created_at, updated_at
 `
 
 type CreateDocumentParams struct {
-	OwnerID     uuid.UUID
-	Filename    string
-	ContentType string
-	SizeBytes   int64
-	Sha256      []byte
+	ID       uuid.UUID
+	OwnerID  uuid.UUID
+	Title    string
+	FileName string
+	FileType string
+	FileSize int64
+	FileHash string
+	FilePath string
 }
 
 func (q *Queries) CreateDocument(ctx context.Context, arg CreateDocumentParams) (Document, error) {
 	row := q.db.QueryRow(ctx, createDocument,
+		arg.ID,
 		arg.OwnerID,
-		arg.Filename,
-		arg.ContentType,
-		arg.SizeBytes,
-		arg.Sha256,
+		arg.Title,
+		arg.FileName,
+		arg.FileType,
+		arg.FileSize,
+		arg.FileHash,
+		arg.FilePath,
 	)
 	var i Document
 	err := row.Scan(
 		&i.ID,
 		&i.OwnerID,
-		&i.Filename,
-		&i.ContentType,
-		&i.SizeBytes,
-		&i.Sha256,
-		&i.Status,
+		&i.Title,
+		&i.FileName,
+		&i.FileType,
+		&i.FileSize,
+		&i.FileHash,
+		&i.FilePath,
+		&i.ParseStatus,
 		&i.CreatedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }
 
-const createDocumentFile = `-- name: CreateDocumentFile :exec
-INSERT INTO document_files (document_id, content) VALUES ($1, $2)
+const getDocumentByOwnerAndHash = `-- name: GetDocumentByOwnerAndHash :one
+SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, file_path, parse_status, created_at, updated_at FROM documents WHERE owner_id = $1 AND file_hash = $2
 `
 
-type CreateDocumentFileParams struct {
-	DocumentID uuid.UUID
-	Content    []byte
+type GetDocumentByOwnerAndHashParams struct {
+	OwnerID  uuid.UUID
+	FileHash string
 }
 
-func (q *Queries) CreateDocumentFile(ctx context.Context, arg CreateDocumentFileParams) error {
-	_, err := q.db.Exec(ctx, createDocumentFile, arg.DocumentID, arg.Content)
-	return err
+func (q *Queries) GetDocumentByOwnerAndHash(ctx context.Context, arg GetDocumentByOwnerAndHashParams) (Document, error) {
+	row := q.db.QueryRow(ctx, getDocumentByOwnerAndHash, arg.OwnerID, arg.FileHash)
+	var i Document
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerID,
+		&i.Title,
+		&i.FileName,
+		&i.FileType,
+		&i.FileSize,
+		&i.FileHash,
+		&i.FilePath,
+		&i.ParseStatus,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const getReadableDocument = `-- name: GetReadableDocument :one
-SELECT id, owner_id, filename, content_type, size_bytes, sha256, status, created_at FROM documents
+SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, file_path, parse_status, created_at, updated_at FROM documents
 WHERE id = $1 AND can_read_document(id, $2::uuid)
 `
 
@@ -79,12 +113,15 @@ func (q *Queries) GetReadableDocument(ctx context.Context, arg GetReadableDocume
 	err := row.Scan(
 		&i.ID,
 		&i.OwnerID,
-		&i.Filename,
-		&i.ContentType,
-		&i.SizeBytes,
-		&i.Sha256,
-		&i.Status,
+		&i.Title,
+		&i.FileName,
+		&i.FileType,
+		&i.FileSize,
+		&i.FileHash,
+		&i.FilePath,
+		&i.ParseStatus,
 		&i.CreatedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }
@@ -176,14 +213,21 @@ func (q *Queries) ListDocumentPrincipals(ctx context.Context, documentID uuid.UU
 }
 
 const listReadableDocuments = `-- name: ListReadableDocuments :many
-SELECT id, owner_id, filename, content_type, size_bytes, sha256, status, created_at FROM documents
+SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, file_path, parse_status, created_at, updated_at FROM documents
 WHERE can_read_document(id, $1::uuid)
 ORDER BY created_at DESC, id
+LIMIT $3 OFFSET $2
 `
 
-// The Documents a Principal can read, newest first.
-func (q *Queries) ListReadableDocuments(ctx context.Context, principalID uuid.UUID) ([]Document, error) {
-	rows, err := q.db.Query(ctx, listReadableDocuments, principalID)
+type ListReadableDocumentsParams struct {
+	PrincipalID uuid.UUID
+	PageOffset  int32
+	PageLimit   int32
+}
+
+// A page of the Documents a Principal can read, newest first.
+func (q *Queries) ListReadableDocuments(ctx context.Context, arg ListReadableDocumentsParams) ([]Document, error) {
+	rows, err := q.db.Query(ctx, listReadableDocuments, arg.PrincipalID, arg.PageOffset, arg.PageLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -194,12 +238,15 @@ func (q *Queries) ListReadableDocuments(ctx context.Context, principalID uuid.UU
 		if err := rows.Scan(
 			&i.ID,
 			&i.OwnerID,
-			&i.Filename,
-			&i.ContentType,
-			&i.SizeBytes,
-			&i.Sha256,
-			&i.Status,
+			&i.Title,
+			&i.FileName,
+			&i.FileType,
+			&i.FileSize,
+			&i.FileHash,
+			&i.FilePath,
+			&i.ParseStatus,
 			&i.CreatedAt,
+			&i.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}

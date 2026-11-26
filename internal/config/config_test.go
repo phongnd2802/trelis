@@ -163,6 +163,9 @@ func TestLoadDependencyDefaults(t *testing.T) {
 	if got, want := cfg.Temporal.HostPort(), "localhost:7233"; got != want {
 		t.Errorf("default Temporal.HostPort() = %q, want %q", got, want)
 	}
+	if cfg.Storage.LocalDir != "data/files" || cfg.Storage.MaxFileSize() != 50<<20 {
+		t.Errorf("default storage = %+v (max %d bytes), want data/files and 50 MB", cfg.Storage, cfg.Storage.MaxFileSize())
+	}
 }
 
 func TestLoadRejectsInvalidDependencies(t *testing.T) {
@@ -183,6 +186,8 @@ func TestLoadRejectsInvalidDependencies(t *testing.T) {
 		{"empty temporal host", map[string]string{"TRELIS_TEMPORAL_HOST": " "}, "temporal.host"},
 		{"temporal port zero", map[string]string{"TRELIS_TEMPORAL_PORT": "0"}, "temporal.port"},
 		{"empty temporal namespace", map[string]string{"TRELIS_TEMPORAL_NAMESPACE": " "}, "temporal.namespace"},
+		{"empty storage dir", map[string]string{"TRELIS_STORAGE_LOCAL_DIR": " "}, "storage.local_dir"},
+		{"storage max size zero", map[string]string{"TRELIS_STORAGE_MAX_FILE_SIZE_MB": "0"}, "storage.max_file_size_mb"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

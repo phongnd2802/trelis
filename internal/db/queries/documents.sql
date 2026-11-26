@@ -1,10 +1,10 @@
 -- name: CreateDocument :one
-INSERT INTO documents (owner_id, filename, content_type, size_bytes, sha256)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO documents (id, owner_id, title, file_name, file_type, file_size, file_hash, file_path)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING *;
 
--- name: CreateDocumentFile :exec
-INSERT INTO document_files (document_id, content) VALUES ($1, $2);
+-- name: GetDocumentByOwnerAndHash :one
+SELECT * FROM documents WHERE owner_id = $1 AND file_hash = $2;
 
 -- name: GrantDocumentToPrincipal :exec
 INSERT INTO document_principals (document_id, principal_id) VALUES ($1, $2)
@@ -14,11 +14,15 @@ ON CONFLICT DO NOTHING;
 INSERT INTO document_groups (document_id, group_id) VALUES ($1, $2)
 ON CONFLICT DO NOTHING;
 
--- The Documents a Principal can read, newest first.
+-- A page of the Documents a Principal can read, newest first.
 -- name: ListReadableDocuments :many
 SELECT * FROM documents
 WHERE can_read_document(id, @principal_id::uuid)
-ORDER BY created_at DESC, id;
+ORDER BY created_at DESC, id
+LIMIT @page_limit OFFSET @page_offset;
+
+-- name: CountReadableDocuments :one
+SELECT count(*) FROM documents WHERE can_read_document(id, @principal_id::uuid);
 
 -- No row when the Document does not exist or the Principal cannot read it,
 -- so callers cannot tell the two apart.

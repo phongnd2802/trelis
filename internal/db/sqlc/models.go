@@ -21,17 +21,15 @@ type ApiKey struct {
 type Document struct {
 	ID          uuid.UUID
 	OwnerID     uuid.UUID
-	Filename    string
-	ContentType string
-	SizeBytes   int64
-	Sha256      []byte
-	Status      string
+	Title       string
+	FileName    string
+	FileType    string
+	FileSize    int64
+	FileHash    string
+	FilePath    string
+	ParseStatus string
 	CreatedAt   time.Time
-}
-
-type DocumentFile struct {
-	DocumentID uuid.UUID
-	Content    []byte
+	UpdatedAt   time.Time
 }
 
 type DocumentGroup struct {

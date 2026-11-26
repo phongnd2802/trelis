@@ -7,15 +7,22 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/phongnd2802/trelis/internal/application/repository"
+	"github.com/phongnd2802/trelis/internal/application/service"
+	"github.com/phongnd2802/trelis/internal/application/service/file"
 	"github.com/phongnd2802/trelis/internal/auth"
 	"github.com/phongnd2802/trelis/internal/db/dbtest"
-	"github.com/phongnd2802/trelis/internal/documents"
+	"github.com/phongnd2802/trelis/internal/handler"
 )
 
-// server is Trelis on a fresh database, with Principals that each hold one
-// API key.
+// testMaxFileSize keeps the over-the-limit test small.
+const testMaxFileSize = 1 << 10
+
+// server is Trelis on a fresh database and file store, with Principals that
+// each hold one API key.
 type server struct {
 	t    *testing.T
 	auth *auth.Store
@@ -38,7 +45,8 @@ func newServer(t *testing.T, principals ...string) *server {
 		}
 		c.keys[name] = key
 	}
-	c.h = New(Readiness{}, c.auth, documents.NewStore(pool))
+	docs := service.NewDocumentService(repository.NewDocumentRepository(pool), file.NewLocalFileService(t.TempDir()))
+	c.h = New(Readiness{}, c.auth, handler.NewDocumentHandler(docs, testMaxFileSize))
 	return c
 }
 
@@ -60,9 +68,11 @@ type form struct {
 	field, filename, value string
 }
 
-func file(name, content string) form   { return form{field: "file", filename: name, value: content} }
-func principalField(name string) form  { return form{field: "principal", value: name} }
-func groupField(name string) form      { return form{field: "group", value: name} }
+func upFile(name, content string) form { return form{field: "file", filename: name, value: content} }
+func principals(names ...string) form {
+	return form{field: "principals", value: strings.Join(names, ",")}
+}
+func groups(names ...string) form      { return form{field: "groups", value: strings.Join(names, ",")} }
 func (c *server) key(as string) string { return "Bearer " + c.keys[as] }
 
 // upload POSTs /documents as the named Principal.
@@ -96,75 +106,116 @@ func (c *server) upload(as string, fields ...form) *httptest.ResponseRecorder {
 	return rec
 }
 
-// uploaded uploads and returns the new Document's ID, failing unless 201.
-func (c *server) uploaded(as string, fields ...form) string {
-	c.t.Helper()
-	rec := c.upload(as, fields...)
-	if rec.Code != http.StatusCreated {
-		c.t.Fatalf("upload as %s = %d %s, want 201", as, rec.Code, rec.Body)
-	}
-	var doc struct{ ID string }
-	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil || doc.ID == "" {
-		c.t.Fatalf("upload body = %s, want a Document with an id", rec.Body)
-	}
-	return doc.ID
-}
-
 type documentBody struct {
 	ID          string `json:"id"`
-	Filename    string `json:"filename"`
-	ContentType string `json:"content_type"`
-	Size        int64  `json:"size_bytes"`
-	Status      string `json:"status"`
+	Title       string `json:"title"`
+	FileName    string `json:"file_name"`
+	FileType    string `json:"file_type"`
+	FileSize    int64  `json:"file_size"`
+	FileHash    string `json:"file_hash"`
+	ParseStatus string `json:"parse_status"`
 	AccessList  *struct {
 		Principals []string `json:"principals"`
 		Groups     []string `json:"groups"`
 	} `json:"access_list"`
 }
 
-func TestAnUploadedDocumentIsPendingAndReadableByItsUploader(t *testing.T) {
-	c := newServer(t, "alice")
-	id := c.uploaded("alice", file("luat-thue.txt", "Điều 1. Phạm vi điều chỉnh"))
-
-	rec := get(t, c.h, "/documents/"+id, c.key("alice"))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /documents/%s = %d %s, want 200", id, rec.Code, rec.Body)
-	}
-	var doc documentBody
-	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
-		t.Fatal(err)
-	}
-	if doc.ID != id || doc.Filename != "luat-thue.txt" || doc.Status != "pending" ||
-		doc.Size != int64(len("Điều 1. Phạm vi điều chỉnh")) || doc.ContentType != "text/plain; charset=utf-8" {
-		t.Errorf("document = %+v, want %s luat-thue.txt, pending, its size and a sniffed text type", doc, id)
-	}
+// envelope is Omnisc's response shape: {"success", "data"} on success,
+// {"success": false, "error": {"code", "message"}} on failure.
+type envelope struct {
+	Success bool            `json:"success"`
+	Data    json.RawMessage `json:"data"`
+	Error   *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+	Total    int64  `json:"total"`
+	Page     int    `json:"page"`
+	PageSize int    `json:"page_size"`
+	Code     string `json:"code"`
 }
 
-// list GETs /documents as the named Principal and returns the filenames.
+func decode(t *testing.T, rec *httptest.ResponseRecorder) envelope {
+	t.Helper()
+	var e envelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatalf("body %s is not a JSON envelope: %v", rec.Body, err)
+	}
+	return e
+}
+
+func decodeDoc(t *testing.T, rec *httptest.ResponseRecorder) documentBody {
+	t.Helper()
+	var d documentBody
+	if err := json.Unmarshal(decode(t, rec).Data, &d); err != nil {
+		t.Fatalf("data in %s is not a Document: %v", rec.Body, err)
+	}
+	return d
+}
+
+// uploaded uploads and returns the new Document's ID, failing unless 200.
+func (c *server) uploaded(as string, fields ...form) string {
+	c.t.Helper()
+	rec := c.upload(as, fields...)
+	if rec.Code != http.StatusOK {
+		c.t.Fatalf("upload as %s = %d %s, want 200", as, rec.Code, rec.Body)
+	}
+	d := decodeDoc(c.t, rec)
+	if d.ID == "" {
+		c.t.Fatalf("upload body = %s, want a Document with an id", rec.Body)
+	}
+	return d.ID
+}
+
+// list GETs /documents as the named Principal and returns the file names.
 func (c *server) list(as string) []string {
 	c.t.Helper()
 	rec := get(c.t, c.h, "/documents", c.key(as))
 	if rec.Code != http.StatusOK {
 		c.t.Fatalf("GET /documents as %s = %d %s, want 200", as, rec.Code, rec.Body)
 	}
-	var body struct{ Documents []documentBody }
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+	var docs []documentBody
+	if err := json.Unmarshal(decode(c.t, rec).Data, &docs); err != nil {
 		c.t.Fatal(err)
 	}
 	names := []string{}
-	for _, d := range body.Documents {
-		names = append(names, d.Filename)
+	for _, d := range docs {
+		names = append(names, d.FileName)
 	}
 	return names
 }
 
+func TestAnUploadedDocumentIsPendingAndReadableByItsUploader(t *testing.T) {
+	c := newServer(t, "alice")
+	id := c.uploaded("alice", upFile("luat-thue.txt", "Điều 1. Phạm vi điều chỉnh"))
+
+	rec := get(t, c.h, "/documents/"+id, c.key("alice"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /documents/%s = %d %s, want 200", id, rec.Code, rec.Body)
+	}
+	if e := decode(t, rec); !e.Success {
+		t.Errorf("success = false in %s", rec.Body)
+	}
+	doc := decodeDoc(t, rec)
+	// sha256sum of the content, computed outside Go.
+	const wantHash = "1546822a3c16355554bf80570b4053096016bcdf49926cf1a5246608fa6f845f"
+	if doc.ID != id || doc.FileName != "luat-thue.txt" || doc.Title != "luat-thue.txt" ||
+		doc.FileType != "txt" || doc.ParseStatus != "pending" ||
+		doc.FileSize != int64(len("Điều 1. Phạm vi điều chỉnh")) || doc.FileHash != wantHash {
+		t.Errorf("document = %+v, want %s luat-thue.txt, txt, pending, its size and SHA-256", doc, id)
+	}
+}
+
 func TestBCannotSeeARestrictedDocumentOfA(t *testing.T) {
 	c := newServer(t, "alice", "bob")
-	id := c.uploaded("alice", file("luong.txt", "Bảng lương 2024"))
+	id := c.uploaded("alice", upFile("luong.txt", "Bảng lương 2024"))
 
 	rec := get(t, c.h, "/documents/"+id, c.key("bob"))
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("bob GET alice's Document = %d %s, want 404", rec.Code, rec.Body)
+	}
+	if e := decode(t, rec); e.Success || e.Error == nil || e.Error.Code != 1003 {
+		t.Errorf("404 body = %s, want the not-found error envelope", rec.Body)
 	}
 	missing := get(t, c.h, "/documents/0190d2a8-0000-7000-8000-00000000dead", c.key("bob"))
 	if rec.Body.String() != missing.Body.String() {
@@ -181,8 +232,8 @@ func TestBCannotSeeARestrictedDocumentOfA(t *testing.T) {
 func TestTheAccessListGrantsPrincipalsAndGroupMembers(t *testing.T) {
 	c := newServer(t, "alice", "bob", "carol", "dave")
 	c.group("tax", "carol")
-	id := c.uploaded("alice", file("nghi-dinh.txt", "Nghị định 65"), principalField("bob"), groupField("tax"))
-	c.uploaded("alice", file("private.txt", "only alice"))
+	id := c.uploaded("alice", upFile("nghi-dinh.txt", "Nghị định 65"), principals("bob"), groups("tax"))
+	c.uploaded("alice", upFile("private.txt", "only alice"))
 
 	for who, want := range map[string]int{"alice": http.StatusOK, "bob": http.StatusOK, "carol": http.StatusOK, "dave": http.StatusNotFound} {
 		if rec := get(t, c.h, "/documents/"+id, c.key(who)); rec.Code != want {
@@ -195,27 +246,21 @@ func TestTheAccessListGrantsPrincipalsAndGroupMembers(t *testing.T) {
 	if got := c.list("alice"); len(got) != 2 {
 		t.Errorf("alice lists %v, want both of her uploads", got)
 	}
-
 }
 
 func TestOnlyTheOwnerSeesTheAccessList(t *testing.T) {
 	c := newServer(t, "alice", "bob", "carol")
 	c.group("tax", "carol")
-	id := c.uploaded("alice", file("nghi-dinh.txt", "Nghị định 65"), principalField("bob"), groupField("tax"))
+	c.group("legal")
+	id := c.uploaded("alice", upFile("nghi-dinh.txt", "Nghị định 65"), principals("bob"), groups(" tax ", "legal", ""))
 
 	doc := func(as string) documentBody {
 		t.Helper()
-		var d documentBody
-		rec := get(t, c.h, "/documents/"+id, c.key(as))
-		if err := json.Unmarshal(rec.Body.Bytes(), &d); err != nil {
-			t.Fatal(err)
-		}
-		return d
+		return decodeDoc(t, get(t, c.h, "/documents/"+id, c.key(as)))
 	}
 	got := doc("alice").AccessList
-	if got == nil || len(got.Principals) != 2 || got.Principals[0] != "alice" ||
-		got.Principals[1] != "bob" || len(got.Groups) != 1 || got.Groups[0] != "tax" {
-		t.Errorf("alice sees access list %+v, want principals [alice bob], groups [tax]", got)
+	if got == nil || strings.Join(got.Principals, ",") != "alice,bob" || strings.Join(got.Groups, ",") != "legal,tax" {
+		t.Errorf("alice sees access list %+v, want principals [alice bob], groups [legal tax]", got)
 	}
 	for _, reader := range []string{"bob", "carol"} {
 		if got := doc(reader).AccessList; got != nil {
@@ -227,7 +272,7 @@ func TestOnlyTheOwnerSeesTheAccessList(t *testing.T) {
 func TestJoiningAGroupGrantsItsDocumentsOnTheNextRequest(t *testing.T) {
 	c := newServer(t, "alice", "bob")
 	c.group("legal")
-	c.uploaded("alice", file("luat.txt", "Luật 04/2007"), groupField("legal"))
+	c.uploaded("alice", upFile("luat.txt", "Luật 04/2007"), groups("legal"))
 	if got := c.list("bob"); len(got) != 0 {
 		t.Fatalf("bob before joining lists %v, want nothing", got)
 	}
@@ -239,11 +284,15 @@ func TestJoiningAGroupGrantsItsDocumentsOnTheNextRequest(t *testing.T) {
 	}
 }
 
-func TestAnUploadNamingAnUnknownReaderStoresNothing(t *testing.T) {
+func TestAnUploadNamingAnUnknownPrincipalOrGroupStoresNothing(t *testing.T) {
 	c := newServer(t, "alice")
-	for _, f := range []form{principalField("ghost"), groupField("nobody")} {
-		if rec := c.upload("alice", file("a.txt", "x"), f); rec.Code != http.StatusBadRequest {
+	for _, f := range []form{principals("ghost"), groups("nobody")} {
+		rec := c.upload("alice", upFile("a.txt", "x"), f)
+		if rec.Code != http.StatusBadRequest {
 			t.Errorf("upload with %s %q = %d %s, want 400", f.field, f.value, rec.Code, rec.Body)
+		}
+		if e := decode(t, rec); e.Error == nil || !strings.Contains(e.Error.Message, f.value) {
+			t.Errorf("error %s does not name %q", rec.Body, f.value)
 		}
 	}
 	if got := c.list("alice"); len(got) != 0 {
@@ -251,17 +300,36 @@ func TestAnUploadNamingAnUnknownReaderStoresNothing(t *testing.T) {
 	}
 }
 
+func TestUploadingTheSameFileTwiceIsAConflict(t *testing.T) {
+	c := newServer(t, "alice", "bob")
+	id := c.uploaded("alice", upFile("luat.txt", "Luật 04/2007"))
+
+	rec := c.upload("alice", upFile("copy.txt", "Luật 04/2007"))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("second upload = %d %s, want 409", rec.Code, rec.Body)
+	}
+	if e := decode(t, rec); e.Code != "duplicate_file" || decodeDoc(t, rec).ID != id {
+		t.Errorf("409 body = %s, want code duplicate_file and the existing Document %s", rec.Body, id)
+	}
+	// Another Principal's identical file is their own Document.
+	c.uploaded("bob", upFile("luat.txt", "Luật 04/2007"))
+}
+
 func TestMalformedUploadsAre400(t *testing.T) {
 	c := newServer(t, "alice")
 	for name, fields := range map[string][]form{
-		"no file":         {principalField("alice")},
-		"empty file":      {file("a.txt", "")},
-		"two files":       {file("a.txt", "x"), file("b.txt", "y")},
-		"unknown field":   {file("a.txt", "x"), {field: "principals", value: "alice"}},
-		"empty principal": {file("a.txt", "x"), principalField("")},
+		"no file":          {principals("alice")},
+		"empty file":       {upFile("a.txt", "")},
+		"unsupported type": {upFile("setup.exe", "MZ")},
+		"no extension":     {upFile("README", "x")},
 	} {
-		if rec := c.upload("alice", fields...); rec.Code != http.StatusBadRequest {
+		rec := c.upload("alice", fields...)
+		if rec.Code != http.StatusBadRequest {
 			t.Errorf("%s: upload = %d %s, want 400", name, rec.Code, rec.Body)
+			continue
+		}
+		if e := decode(t, rec); e.Success || e.Error == nil || e.Error.Code != 1000 {
+			t.Errorf("%s: body = %s, want the bad-request error envelope", name, rec.Body)
 		}
 	}
 
@@ -277,9 +345,37 @@ func TestMalformedUploadsAre400(t *testing.T) {
 
 func TestAFileOverTheLimitIs413(t *testing.T) {
 	c := newServer(t, "alice")
-	rec := c.upload("alice", file("big.bin", string(make([]byte, MaxUploadBytes+1))))
+	rec := c.upload("alice", upFile("big.txt", strings.Repeat("x", testMaxFileSize+1)))
 	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Errorf("upload of %d bytes = %d %s, want 413", MaxUploadBytes+1, rec.Code, rec.Body)
+		t.Errorf("upload of %d bytes = %d %s, want 413", testMaxFileSize+1, rec.Code, rec.Body)
+	}
+	if got := c.list("alice"); len(got) != 0 {
+		t.Errorf("alice lists %v after a rejected upload, want nothing", got)
+	}
+}
+
+func TestListingIsPaged(t *testing.T) {
+	c := newServer(t, "alice")
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		c.uploaded("alice", upFile(name, name))
+	}
+	rec := get(t, c.h, "/documents?page=2&page_size=2", c.key("alice"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET page 2 = %d %s", rec.Code, rec.Body)
+	}
+	e := decode(t, rec)
+	var docs []documentBody
+	if err := json.Unmarshal(e.Data, &docs); err != nil {
+		t.Fatal(err)
+	}
+	// Newest first, so page 2 of size 2 holds the oldest upload.
+	if e.Total != 3 || e.Page != 2 || e.PageSize != 2 || len(docs) != 1 || docs[0].FileName != "a.txt" {
+		t.Errorf("page 2 = total %d page %d size %d %v, want total 3, page 2, size 2, [a.txt]", e.Total, e.Page, e.PageSize, docs)
+	}
+	for _, q := range []string{"page=-1", "page=x", "page_size=1001"} {
+		if rec := get(t, c.h, "/documents?"+q, c.key("alice")); rec.Code != http.StatusBadRequest {
+			t.Errorf("GET /documents?%s = %d, want 400", q, rec.Code)
+		}
 	}
 }
 
