@@ -19,7 +19,7 @@ func newStore(t *testing.T) db.Store {
 }
 
 // exists reports whether a Principal named name is visible through ctx.
-func exists(t *testing.T, s db.Store, ctx context.Context, name string) bool {
+func exists(ctx context.Context, t *testing.T, s db.Store, name string) bool {
 	t.Helper()
 	_, err := s.Querier(ctx).GetPrincipalByName(ctx, name)
 	if errors.Is(err, db.ErrNotFound) {
@@ -40,7 +40,7 @@ func TestExecTxCommitsWhenFnSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExecTx: %v", err)
 	}
-	if !exists(t, s, ctx, "alice") {
+	if !exists(ctx, t, s, "alice") {
 		t.Error("alice is missing after a committed transaction")
 	}
 }
@@ -52,7 +52,7 @@ func TestExecTxRollsBackWhenFnFails(t *testing.T) {
 		if _, err := s.Querier(ctx).CreatePrincipal(ctx, "alice"); err != nil {
 			return err
 		}
-		if !exists(t, s, ctx, "alice") {
+		if !exists(ctx, t, s, "alice") {
 			t.Error("alice not visible inside her own transaction")
 		}
 		return boom
@@ -60,7 +60,7 @@ func TestExecTxRollsBackWhenFnFails(t *testing.T) {
 	if !errors.Is(err, boom) {
 		t.Fatalf("ExecTx = %v, want the fn's error", err)
 	}
-	if exists(t, s, ctx, "alice") {
+	if exists(ctx, t, s, "alice") {
 		t.Error("alice survived a rolled-back transaction")
 	}
 }
@@ -80,7 +80,7 @@ func TestExecTxRollsBackAndRepanicsWhenFnPanics(t *testing.T) {
 			panic("boom")
 		})
 	}()
-	if exists(t, s, ctx, "alice") {
+	if exists(ctx, t, s, "alice") {
 		t.Error("alice survived a transaction whose fn panicked")
 	}
 }
@@ -100,7 +100,7 @@ func TestANestedExecTxJoinsTheOuterTransaction(t *testing.T) {
 	if !errors.Is(err, boom) {
 		t.Fatalf("ExecTx = %v, want the outer error", err)
 	}
-	if exists(t, s, ctx, "alice") {
+	if exists(ctx, t, s, "alice") {
 		t.Error("the inner ExecTx committed on its own; it should have joined the outer transaction")
 	}
 }
@@ -111,7 +111,7 @@ func TestOutsideExecTxTheQuerierDoesNotSeeUncommittedRows(t *testing.T) {
 		if _, err := s.Querier(txCtx).CreatePrincipal(txCtx, "alice"); err != nil {
 			t.Fatal(err)
 		}
-		if exists(t, s, ctx, "alice") {
+		if exists(ctx, t, s, "alice") {
 			t.Error("a context outside the transaction sees its uncommitted row")
 		}
 		return errors.New("roll back")
@@ -134,14 +134,29 @@ func TestIsUniqueViolation(t *testing.T) {
 
 func TestIsForeignKeyViolation(t *testing.T) {
 	s, ctx := newStore(t), context.Background()
-	err := s.Querier(ctx).GrantDocumentToPrincipal(ctx, sqlcGrant())
+	err := s.Querier(ctx).GrantDocumentToPrincipal(ctx, danglingGrant())
 	if !db.IsForeignKeyViolation(err) {
 		t.Errorf("IsForeignKeyViolation(%v) = false for a grant on a missing Document", err)
 	}
 }
 
-// sqlcGrant grants a Document that does not exist to a Principal that does
+// danglingGrant grants a Document that does not exist to a Principal that does
 // not exist either.
-func sqlcGrant() sqlc.GrantDocumentToPrincipalParams {
+func danglingGrant() sqlc.GrantDocumentToPrincipalParams {
 	return sqlc.GrantDocumentToPrincipalParams{DocumentID: uuid.New(), PrincipalID: uuid.New()}
+}
+
+func TestTwoStoresKeepTheirTransactionsApart(t *testing.T) {
+	pool := dbtest.Migrated(t)
+	a, b, ctx := db.NewStore(pool), db.NewStore(pool), context.Background()
+	_ = a.ExecTx(ctx, func(txCtx context.Context) error {
+		if _, err := a.Querier(txCtx).CreatePrincipal(txCtx, "alice"); err != nil {
+			t.Fatal(err)
+		}
+		// b was not asked to run in a's transaction, so it uses the pool.
+		if exists(txCtx, t, b, "alice") {
+			t.Error("another store picked up a's transaction from the context")
+		}
+		return errors.New("roll back")
+	})
 }

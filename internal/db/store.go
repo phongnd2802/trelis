@@ -61,12 +61,11 @@ func (s *pgStore) ExecTx(ctx context.Context, fn func(ctx context.Context) error
 	if err != nil {
 		return fmt.Errorf("db: begin: %w", err)
 	}
+	// Roll back unless the commit went through: on an error, a panic, or a
+	// runtime.Goexit (t.Fatal in a test), which recover does not see.
+	committed := false
 	defer func() {
-		if p := recover(); p != nil {
-			_ = tx.Rollback(context.WithoutCancel(ctx))
-			panic(p)
-		}
-		if err != nil {
+		if !committed {
 			_ = tx.Rollback(context.WithoutCancel(ctx))
 		}
 	}()
@@ -76,6 +75,7 @@ func (s *pgStore) ExecTx(ctx context.Context, fn func(ctx context.Context) error
 	if err = tx.Commit(ctx); err != nil {
 		return fmt.Errorf("db: commit: %w", err)
 	}
+	committed = true
 	return nil
 }
 
