@@ -37,10 +37,13 @@ build-lite:
 
 # Runs the service from the repo root, so the default -config path
 # (config/trelis.yaml) resolves. Builds the anydoc archive first if missing.
+# Exports .local/models.env (gitignored) when it exists, so model roles and
+# their keys (TRELIS_MODELS_*) stay out of the tracked config file.
 ANYDOC_ARCHIVE := third_party/anydoc-go/lib/linux_amd64_gnu/libanydoc_go.a
 
 dev:
 	@test -f $(ANYDOC_ARCHIVE) || $(MAKE) anydoc-lib
+	@if [ -f .local/models.env ]; then set -a; . ./.local/models.env; set +a; fi; \
 	CGO_ENABLED=1 go run -tags anydoc ./cmd/server $(ARGS)
 
 test:

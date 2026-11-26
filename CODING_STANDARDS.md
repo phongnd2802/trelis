@@ -41,6 +41,15 @@ Log through `logger.Ctx(ctx)` (ADR-0008).
 - A decision that is hard to reverse, surprising without context, and the result of a real trade-off gets an ADR in `docs/adr/`.
 - Code copied near-verbatim from WeKnora or Omnisc keeps the Tencent copyright header and a NOTICE entry; code rewritten from their ideas carries neither.
 
+## Temporal
+
+ADR-0005: background work runs as workflows that pass IDs and do their I/O in activities.
+
+- **One model request per activity.** A model-calling activity sends one request (one embeddings batch, one extraction, one caption) and runs on `temporal.model_task_queue`, so `TaskQueueActivitiesPerSecond` limits model calls rather than activity starts, and a retry repeats one request. A Document's work fans out as one activity per batch or per Chunk.
+- **Idempotent over the input.** An activity that is retried, or runs again after a crash, skips what an earlier attempt already committed (for example, it selects only the Chunks with no embedding yet) instead of redoing the whole Document.
+- **Status follows the data.** A status that claims derived data is complete (`completed`, ready) is set in the same transaction that checks it: no Chunk without its embedding, no Chunk without its Extractions. An update that hits no row is an error, never a silent skip.
+- **Versioned changes.** A change to the commands a registered workflow schedules carries `workflow.GetVersion`, or a comment saying why no run in flight can replay against it.
+
 ## Tests
 
 - Behaviour is tested at the highest seam that covers it: the router with `httptest` for HTTP behaviour, `internal/integration` when real Postgres, S3 or Neo4j matter, and unit tests for pure logic (chunker, config, retry).
