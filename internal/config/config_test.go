@@ -163,8 +163,11 @@ func TestLoadDependencyDefaults(t *testing.T) {
 	if got, want := cfg.Temporal.HostPort(), "localhost:7233"; got != want {
 		t.Errorf("default Temporal.HostPort() = %q, want %q", got, want)
 	}
-	if cfg.Storage.LocalDir != "data/files" || cfg.Storage.MaxFileSize() != 50<<20 {
-		t.Errorf("default storage = %+v (max %d bytes), want data/files and 50 MB", cfg.Storage, cfg.Storage.MaxFileSize())
+	if cfg.Storage.MaxFileSize() != 50<<20 {
+		t.Errorf("default max file size = %d bytes, want 50 MB", cfg.Storage.MaxFileSize())
+	}
+	if s := cfg.Storage.S3; s.Bucket != "trelis" || s.Region != "us-east-1" || !s.CreateBucket || s.Endpoint != "" {
+		t.Errorf("default storage.s3 = %+v, want bucket trelis in us-east-1, created on start, AWS endpoint", s)
 	}
 }
 
@@ -279,7 +282,10 @@ func TestLoadRejectsInvalidDependencies(t *testing.T) {
 		{"empty temporal host", map[string]string{"TRELIS_TEMPORAL_HOST": " "}, "temporal.host"},
 		{"temporal port zero", map[string]string{"TRELIS_TEMPORAL_PORT": "0"}, "temporal.port"},
 		{"empty temporal namespace", map[string]string{"TRELIS_TEMPORAL_NAMESPACE": " "}, "temporal.namespace"},
-		{"empty storage dir", map[string]string{"TRELIS_STORAGE_LOCAL_DIR": " "}, "storage.local_dir"},
+		{"empty bucket", map[string]string{"TRELIS_STORAGE_S3_BUCKET": " "}, "storage.s3.bucket"},
+		{"empty region", map[string]string{"TRELIS_STORAGE_S3_REGION": " "}, "storage.s3.region"},
+		{"endpoint not a URL", map[string]string{"TRELIS_STORAGE_S3_ENDPOINT": "localhost:9000"}, "storage.s3.endpoint"},
+		{"access key without secret", map[string]string{"TRELIS_STORAGE_S3_ACCESS_KEY_ID": "trelis"}, "storage.s3.secret_access_key"},
 		{"storage max size zero", map[string]string{"TRELIS_STORAGE_MAX_FILE_SIZE_MB": "0"}, "storage.max_file_size_mb"},
 	}
 	for _, tc := range cases {
@@ -295,5 +301,26 @@ func TestLoadRejectsInvalidDependencies(t *testing.T) {
 				t.Errorf("error %q does not mention %q", err, tc.wantMsg)
 			}
 		})
+	}
+}
+
+func TestS3StorageIsReadFromEnv(t *testing.T) {
+	for k, v := range map[string]string{
+		"TRELIS_STORAGE_S3_ENDPOINT":          "http://silo:9000",
+		"TRELIS_STORAGE_S3_BUCKET":            "docs",
+		"TRELIS_STORAGE_S3_ACCESS_KEY_ID":     "trelis",
+		"TRELIS_STORAGE_S3_SECRET_ACCESS_KEY": "s3cr3t-dev",
+		"TRELIS_STORAGE_S3_FORCE_PATH_STYLE":  "true",
+		"TRELIS_STORAGE_S3_CREATE_BUCKET":     "false",
+	} {
+		t.Setenv(k, v)
+	}
+	cfg, err := Load(writeConfig(t, depsYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := S3{Endpoint: "http://silo:9000", Region: "us-east-1", Bucket: "docs", AccessKeyID: "trelis", SecretAccessKey: "s3cr3t-dev", ForcePathStyle: true}
+	if cfg.Storage.S3 != want {
+		t.Errorf("storage.s3 = %+v, want %+v", cfg.Storage.S3, want)
 	}
 }

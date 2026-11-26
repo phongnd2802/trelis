@@ -12,7 +12,7 @@ import (
 
 	"github.com/phongnd2802/trelis/internal/application/repository"
 	"github.com/phongnd2802/trelis/internal/application/service"
-	"github.com/phongnd2802/trelis/internal/application/service/file"
+	"github.com/phongnd2802/trelis/internal/application/service/file/filetest"
 	"github.com/phongnd2802/trelis/internal/auth"
 	"github.com/phongnd2802/trelis/internal/db/dbtest"
 	"github.com/phongnd2802/trelis/internal/handler"
@@ -27,8 +27,10 @@ type server struct {
 	t    *testing.T
 	auth *auth.Store
 	h    http.Handler
-	keys map[string]string // Principal name → API key
-	ctx  context.Context
+	// files is the object store the server writes Source Files to.
+	files *filetest.Memory
+	keys  map[string]string // Principal name → API key
+	ctx   context.Context
 }
 
 func newServer(t *testing.T, principals ...string) *server {
@@ -45,7 +47,8 @@ func newServer(t *testing.T, principals ...string) *server {
 		}
 		c.keys[name] = key
 	}
-	docs := service.NewDocumentService(repository.NewDocumentRepository(pool), file.NewLocalFileService(t.TempDir()))
+	c.files = filetest.NewMemory()
+	docs := service.NewDocumentService(repository.NewDocumentRepository(pool), c.files)
 	c.h = New(Readiness{}, c.auth, handler.NewDocumentHandler(docs, testMaxFileSize))
 	return c
 }

@@ -9,9 +9,6 @@ coverage*.html
 go.work
 go.work.sum
 
-# Uploaded files from `make dev` (storage.local_dir)
-/data/
-
 # Local config / secrets
 .env
 .env.*

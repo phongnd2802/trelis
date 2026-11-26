@@ -11,6 +11,9 @@ package handler
 import (
 	stderrors "errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -131,6 +134,40 @@ func (h *DocumentHandler) GetDocument(w http.ResponseWriter, r *http.Request) {
 
 // ListDocuments answers GET /documents?page=&page_size= with a page of the
 // Documents the caller can read, newest first, without Access Lists.
+// DownloadDocumentFile streams a Document's Source File to a caller who can
+// read it, like Omnisc's DownloadKnowledgeFile. It is always an attachment,
+// never rendered in the API's origin (ADR-0006).
+func (h *DocumentHandler) DownloadDocumentFile(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, r, errors.NewNotFoundError("Document not found"))
+		return
+	}
+	doc, body, err := h.service.GetDocumentFile(r.Context(), id)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	defer func() { _ = body.Close() }()
+
+	contentType := mime.TypeByExtension("." + doc.FileType)
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	hdr := w.Header()
+	hdr.Set("Content-Type", contentType)
+	hdr.Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": doc.FileName}))
+	hdr.Set("Content-Length", strconv.FormatInt(doc.FileSize, 10))
+	hdr.Set("X-Content-Type-Options", "nosniff")
+	hdr.Set("Content-Security-Policy", "sandbox")
+	hdr.Set("Cache-Control", "private, no-store")
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.Copy(w, body); err != nil {
+		// The status is already sent; the client sees a short body.
+		slog.ErrorContext(r.Context(), "stream source file", "document", doc.ID, "err", err)
+	}
+}
+
 func (h *DocumentHandler) ListDocuments(w http.ResponseWriter, r *http.Request) {
 	page, err := parsePagination(r)
 	if err != nil {

@@ -2,6 +2,7 @@ package interfaces
 
 import (
 	"context"
+	"io"
 	"mime/multipart"
 
 	"github.com/google/uuid"
@@ -20,6 +21,10 @@ type DocumentService interface {
 	// GetDocumentByID returns a Document the caller can read; one that does
 	// not exist and one they cannot read are the same not-found error.
 	GetDocumentByID(ctx context.Context, id uuid.UUID) (*types.Document, error)
+	// GetDocumentFile opens the Source File of a Document the caller can
+	// read, with the same not-found error as GetDocumentByID. The caller
+	// closes the reader.
+	GetDocumentFile(ctx context.Context, id uuid.UUID) (*types.Document, io.ReadCloser, error)
 	// ListPagedDocuments returns a page of the Documents the caller can read,
 	// newest first.
 	ListPagedDocuments(ctx context.Context, page *types.Pagination) (*types.PageResult, error)

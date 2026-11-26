@@ -7,9 +7,9 @@
 // (run `server admin` for the list); they migrate Postgres and exit without
 // serving. Every HTTP route except /healthz and /readyz needs an API key.
 //
-// On start it applies pending Postgres migrations, creates storage.local_dir
-// for uploaded files, then serves. GET /readyz probes Postgres, file
-// storage, Neo4j and Temporal; Neo4j and Temporal are connected
+// On start it applies pending Postgres migrations, creates the S3 bucket
+// Source Files go to when storage.s3.create_bucket is set, then serves.
+// GET /readyz probes Postgres, object storage, Neo4j and Temporal; Neo4j and Temporal are connected
 // lazily, so the service starts even while they are still coming up.
 // SIGINT or SIGTERM stops accepting connections and drains in-flight
 // requests for up to server.shutdown_timeout before exiting.
@@ -100,10 +100,23 @@ func run(configPath string, args []string) error {
 	}
 	defer temporal.Close()
 
-	if err := os.MkdirAll(cfg.Storage.LocalDir, 0o755); err != nil {
+	s3 := cfg.Storage.S3
+	files, err := file.NewS3FileService(file.S3Options{
+		Endpoint:        s3.Endpoint,
+		Region:          s3.Region,
+		Bucket:          s3.Bucket,
+		AccessKeyID:     s3.AccessKeyID,
+		SecretAccessKey: s3.SecretAccessKey,
+		ForcePathStyle:  s3.ForcePathStyle,
+	})
+	if err != nil {
 		return fmt.Errorf("storage: %w", err)
 	}
-	files := file.NewLocalFileService(cfg.Storage.LocalDir)
+	if s3.CreateBucket {
+		if err := files.EnsureBucket(ctx); err != nil {
+			return fmt.Errorf("storage: %w", err)
+		}
+	}
 	docs := handler.NewDocumentHandler(
 		service.NewDocumentService(repository.NewDocumentRepository(pool), files),
 		cfg.Storage.MaxFileSize(),

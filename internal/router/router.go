@@ -36,6 +36,7 @@ func New(ready Readiness, authn Authenticator, docs *handler.DocumentHandler) ht
 		r.Post("/documents", docs.CreateDocumentFromFile)
 		r.Get("/documents", docs.ListDocuments)
 		r.Get("/documents/{id}", docs.GetDocument)
+		r.Get("/documents/{id}/file", docs.DownloadDocumentFile)
 	})
 	return r
 }

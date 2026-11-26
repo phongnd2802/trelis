@@ -23,20 +23,21 @@ func (q *Queries) CountReadableDocuments(ctx context.Context, principalID uuid.U
 }
 
 const createDocument = `-- name: CreateDocument :one
-INSERT INTO documents (id, owner_id, title, file_name, file_type, file_size, file_hash, file_path)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING id, owner_id, title, file_name, file_type, file_size, file_hash, file_path, parse_status, created_at, updated_at
+INSERT INTO documents (id, owner_id, title, file_name, file_type, file_size, file_hash, upload_id, object_key)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+RETURNING id, owner_id, title, file_name, file_type, file_size, file_hash, object_key, parse_status, created_at, updated_at, upload_id
 `
 
 type CreateDocumentParams struct {
-	ID       uuid.UUID
-	OwnerID  uuid.UUID
-	Title    string
-	FileName string
-	FileType string
-	FileSize int64
-	FileHash string
-	FilePath string
+	ID        uuid.UUID
+	OwnerID   uuid.UUID
+	Title     string
+	FileName  string
+	FileType  string
+	FileSize  int64
+	FileHash  string
+	UploadID  uuid.UUID
+	ObjectKey string
 }
 
 func (q *Queries) CreateDocument(ctx context.Context, arg CreateDocumentParams) (Document, error) {
@@ -48,7 +49,8 @@ func (q *Queries) CreateDocument(ctx context.Context, arg CreateDocumentParams) 
 		arg.FileType,
 		arg.FileSize,
 		arg.FileHash,
-		arg.FilePath,
+		arg.UploadID,
+		arg.ObjectKey,
 	)
 	var i Document
 	err := row.Scan(
@@ -59,16 +61,17 @@ func (q *Queries) CreateDocument(ctx context.Context, arg CreateDocumentParams) 
 		&i.FileType,
 		&i.FileSize,
 		&i.FileHash,
-		&i.FilePath,
+		&i.ObjectKey,
 		&i.ParseStatus,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UploadID,
 	)
 	return i, err
 }
 
 const getDocumentByOwnerAndHash = `-- name: GetDocumentByOwnerAndHash :one
-SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, file_path, parse_status, created_at, updated_at FROM documents WHERE owner_id = $1 AND file_hash = $2
+SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, object_key, parse_status, created_at, updated_at, upload_id FROM documents WHERE owner_id = $1 AND file_hash = $2
 `
 
 type GetDocumentByOwnerAndHashParams struct {
@@ -87,16 +90,17 @@ func (q *Queries) GetDocumentByOwnerAndHash(ctx context.Context, arg GetDocument
 		&i.FileType,
 		&i.FileSize,
 		&i.FileHash,
-		&i.FilePath,
+		&i.ObjectKey,
 		&i.ParseStatus,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UploadID,
 	)
 	return i, err
 }
 
 const getReadableDocument = `-- name: GetReadableDocument :one
-SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, file_path, parse_status, created_at, updated_at FROM documents
+SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, object_key, parse_status, created_at, updated_at, upload_id FROM documents
 WHERE id = $1 AND can_read_document(id, $2::uuid)
 `
 
@@ -118,10 +122,11 @@ func (q *Queries) GetReadableDocument(ctx context.Context, arg GetReadableDocume
 		&i.FileType,
 		&i.FileSize,
 		&i.FileHash,
-		&i.FilePath,
+		&i.ObjectKey,
 		&i.ParseStatus,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.UploadID,
 	)
 	return i, err
 }
@@ -213,7 +218,7 @@ func (q *Queries) ListDocumentPrincipals(ctx context.Context, documentID uuid.UU
 }
 
 const listReadableDocuments = `-- name: ListReadableDocuments :many
-SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, file_path, parse_status, created_at, updated_at FROM documents
+SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, object_key, parse_status, created_at, updated_at, upload_id FROM documents
 WHERE can_read_document(id, $1::uuid)
 ORDER BY created_at DESC, id
 LIMIT $3 OFFSET $2
@@ -243,10 +248,11 @@ func (q *Queries) ListReadableDocuments(ctx context.Context, arg ListReadableDoc
 			&i.FileType,
 			&i.FileSize,
 			&i.FileHash,
-			&i.FilePath,
+			&i.ObjectKey,
 			&i.ParseStatus,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.UploadID,
 		); err != nil {
 			return nil, err
 		}

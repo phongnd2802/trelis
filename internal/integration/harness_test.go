@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/testcontainers/testcontainers-go"
+	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
 	tcneo4j "github.com/testcontainers/testcontainers-go/modules/neo4j"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
@@ -31,11 +33,14 @@ import (
 const (
 	postgresImage = "paradedb/paradedb:0.27.1-pg18"
 	neo4jImage    = "neo4j:5.26.34-community"
+	// silo is an S3-compatible fork of MinIO, so the MinIO module runs it.
+	siloImage = "docker.io/pgsty/silo:RELEASE.2026-11-12T00-00-00Z"
 )
 
 const (
 	pgUser, pgPassword = "trelis", "trelis"
 	neo4jPassword      = "trelis-test"
+	s3User, s3Password = "trelis", "trelis-test-secret"
 	// bootTimeout bounds how long a Trelis process may take to migrate and
 	// start listening.
 	bootTimeout = 30 * time.Second
@@ -47,6 +52,8 @@ var deps struct {
 	config string
 	pg     hostPort
 	neo4j  hostPort
+	// s3 is the base URL of the shared silo server, e.g. http://127.0.0.1:41234.
+	s3 string
 }
 
 // hostPort is where a container port is reachable from the host.
@@ -82,10 +89,11 @@ func runSuite(m *testing.M) (int, error) {
 	}
 
 	var (
-		wg              sync.WaitGroup
-		pg              *tcpostgres.PostgresContainer
-		graph           *tcneo4j.Neo4jContainer
-		pgErr, neo4jErr error
+		wg                     sync.WaitGroup
+		pg                     *tcpostgres.PostgresContainer
+		graph                  *tcneo4j.Neo4jContainer
+		silo                   *tcminio.MinioContainer
+		pgErr, neo4jErr, s3Err error
 	)
 	wg.Go(func() {
 		pg, pgErr = tcpostgres.Run(ctx, postgresImage,
@@ -98,16 +106,23 @@ func runSuite(m *testing.M) (int, error) {
 	wg.Go(func() {
 		graph, neo4jErr = tcneo4j.Run(ctx, neo4jImage, tcneo4j.WithAdminPassword(neo4jPassword))
 	})
+	wg.Go(func() {
+		silo, s3Err = tcminio.Run(ctx, siloImage, tcminio.WithUsername(s3User), tcminio.WithPassword(s3Password))
+	})
 	wg.Wait()
 	defer func() {
 		_ = testcontainers.TerminateContainer(pg)
 		_ = testcontainers.TerminateContainer(graph)
+		_ = testcontainers.TerminateContainer(silo)
 	}()
 	if pgErr != nil {
 		return 0, fmt.Errorf("start postgres: %w", pgErr)
 	}
 	if neo4jErr != nil {
 		return 0, fmt.Errorf("start neo4j: %w", neo4jErr)
+	}
+	if s3Err != nil {
+		return 0, fmt.Errorf("start silo: %w", s3Err)
 	}
 
 	if deps.pg, err = endpoint(ctx, pg, "5432/tcp"); err != nil {
@@ -116,6 +131,11 @@ func runSuite(m *testing.M) (int, error) {
 	if deps.neo4j, err = endpoint(ctx, graph, "7687/tcp"); err != nil {
 		return 0, err
 	}
+	s3, err := endpoint(ctx, silo, "9000/tcp")
+	if err != nil {
+		return 0, err
+	}
+	deps.s3 = "http://" + net.JoinHostPort(s3.host, s3.port)
 	return m.Run(), nil
 }
 
@@ -162,6 +182,8 @@ type trelis struct {
 	provider *modeltest.FakeProvider
 	// env is the process environment of every command run as this Trelis.
 	env []string
+	// bucket is this Trelis's own bucket on the shared silo server.
+	bucket string
 }
 
 // listening matches the log line Trelis prints once it accepts requests
@@ -170,11 +192,21 @@ type trelis struct {
 var listening = regexp.MustCompile(`trelis listening addr=(\S+)`)
 
 // start boots Trelis on a fresh, empty database and stops it when the test
-// ends. Neo4j is shared by every test in the package.
+// ends, with its own bucket that Trelis creates on start. Neo4j and the
+// silo server are shared by every test in the package.
 func start(t *testing.T) *trelis {
 	t.Helper()
+	return startWith(t)
+}
+
+// startWith is start with extra TRELIS_* env, later entries overriding the
+// harness's own.
+func startWith(t *testing.T, extraEnv ...string) *trelis {
+	t.Helper()
 	tr := &trelis{provider: modeltest.NewFakeProvider(t)}
-	tr.env = trelisEnv(freshDatabase(t))
+	dbname := freshDatabase(t)
+	tr.bucket = strings.ReplaceAll(dbname, "_", "-")
+	tr.env = append(trelisEnv(dbname, tr.bucket), extraEnv...)
 
 	cmd := exec.Command(deps.binary, "-config", deps.config)
 	cmd.Env = tr.env
@@ -252,12 +284,12 @@ func freshDatabase(t *testing.T) string {
 	return name
 }
 
-// trelisEnv configures Trelis for the containers and dbname, as an operator
+// trelisEnv configures Trelis for the containers, dbname and bucket, as an operator
 // would, through TRELIS_* env. TRELIS_* variables of the developer's shell
 // are dropped, so every key Trelis reads is either set here or its default.
 // Temporal is left unreachable: the client connects lazily and nothing under
 // test uses it yet.
-func trelisEnv(dbname string) []string {
+func trelisEnv(dbname, bucket string) []string {
 	var env []string
 	for _, kv := range os.Environ() {
 		if !strings.HasPrefix(kv, "TRELIS_") {
@@ -279,6 +311,11 @@ func trelisEnv(dbname string) []string {
 		"TRELIS_NEO4J_PASSWORD="+neo4jPassword,
 		"TRELIS_TEMPORAL_HOST=127.0.0.1",
 		"TRELIS_TEMPORAL_PORT=1",
+		"TRELIS_STORAGE_S3_ENDPOINT="+deps.s3,
+		"TRELIS_STORAGE_S3_BUCKET="+bucket,
+		"TRELIS_STORAGE_S3_ACCESS_KEY_ID="+s3User,
+		"TRELIS_STORAGE_S3_SECRET_ACCESS_KEY="+s3Password,
+		"TRELIS_STORAGE_S3_CREATE_BUCKET=true",
 	)
 }
 

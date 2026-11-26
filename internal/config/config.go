@@ -63,8 +63,14 @@ var defaults = map[string]any{
 	"temporal.port":      7233,
 	"temporal.namespace": "default",
 
-	"storage.local_dir":        "data/files",
-	"storage.max_file_size_mb": 50,
+	"storage.max_file_size_mb":     50,
+	"storage.s3.endpoint":          "",
+	"storage.s3.region":            "us-east-1",
+	"storage.s3.bucket":            "trelis",
+	"storage.s3.access_key_id":     "",
+	"storage.s3.secret_access_key": "",
+	"storage.s3.force_path_style":  false,
+	"storage.s3.create_bucket":     true,
 }
 
 var sslModes = []string{"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
@@ -156,10 +162,10 @@ func (c *Config) validate() error {
 	port("temporal.port", c.Temporal.Port)
 	required("temporal.namespace", c.Temporal.Namespace)
 
-	required("storage.local_dir", c.Storage.LocalDir)
 	if c.Storage.MaxFileSizeMB < 1 {
 		errs = append(errs, fmt.Errorf("storage.max_file_size_mb must be at least 1, got %d", c.Storage.MaxFileSizeMB))
 	}
+	errs = append(errs, c.Storage.S3.validate()...)
 	errs = append(errs, c.Models.validate()...)
 
 	return errors.Join(errs...)
