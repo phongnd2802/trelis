@@ -266,8 +266,11 @@ func TestChatAndStream_FailedCallReturnsHTTPError(t *testing.T) {
 			t.Errorf("%s err = %v, want *api.HTTPError with 429", name, err)
 			continue
 		}
-		if !strings.Contains(err.Error(), "rate limited") {
-			t.Errorf("%s err = %v, want the provider's message", name, err)
+		if strings.Contains(err.Error(), "rate limited") {
+			t.Errorf("%s err = %v, want the body kept out of the message", name, err)
+		}
+		if !strings.Contains(httpErr.Body, "rate limited") {
+			t.Errorf("%s body = %q, want the provider's message", name, httpErr.Body)
 		}
 	}
 }

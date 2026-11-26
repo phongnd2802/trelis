@@ -3,18 +3,27 @@ version: "2"
 linters:
   default: standard # errcheck, govet, ineffassign, staticcheck, unused
   enable:
+    - depguard
     - forbidigo
   settings:
+    depguard:
+      rules:
+        main:
+          deny:
+            - pkg: log/slog
+              desc: library code logs through internal/logger (zap)
+            - pkg: log
+              desc: library code logs through internal/logger (zap)
     forbidigo:
       forbid:
         - pattern: ^fmt\.Print(f|ln)?$
-          msg: library code logs through log/slog; only cmd/ prints to stdout
+          msg: library code logs through internal/logger (zap); only cmd/ prints to stdout
   exclusions:
     rules:
       - path: ^cmd/
         linters: [forbidigo]
       - path: _test\.go$
-        linters: [forbidigo]
+        linters: [forbidigo, depguard]
 
 formatters:
   enable:

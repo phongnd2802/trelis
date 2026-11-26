@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/phongnd2802/trelis/internal/config"
 	"github.com/phongnd2802/trelis/internal/models/api"
@@ -294,5 +299,42 @@ func TestRerankRetriesAReplyThatStopsHalfway(t *testing.T) {
 	}
 	if n := calls.Load(); n != 2 {
 		t.Errorf("server saw %d requests, want the request sent again", n)
+	}
+}
+
+func TestRerankLogsOneModelCallAndCountsRetries(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	previous := zap.L()
+	zap.ReplaceGlobals(zap.New(core))
+	t.Cleanup(func() { zap.ReplaceGlobals(previous) })
+
+	p := modeltest.NewFakeProvider(t)
+	p.FailNext(modeltest.Rerank, http.StatusInternalServerError, 1)
+	r := reranker(t, p)
+
+	if _, err := r.Rerank(context.Background(), "secret query", []string{"secret document"}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries := logs.FilterMessage("model call").All()
+	if len(entries) != 1 {
+		t.Fatalf("logger saw %d model call lines, want 1", len(entries))
+	}
+	entry := entries[0]
+	fields := entry.ContextMap()
+	want := map[string]any{
+		"role":     "rerank",
+		"model":    model,
+		"protocol": "rerank",
+		"status":   "ok",
+		"attempts": int64(2),
+	}
+	for k, v := range want {
+		if fields[k] != v {
+			t.Errorf("%s = %v, want %v", k, fields[k], v)
+		}
+	}
+	if s := fmt.Sprint(entry); strings.Contains(s, "secret query") || strings.Contains(s, "secret document") {
+		t.Errorf("the model call log carries the query or a document: %s", s)
 	}
 }

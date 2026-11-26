@@ -186,10 +186,10 @@ type trelis struct {
 	bucket string
 }
 
-// listening matches the log line Trelis prints once it accepts requests
-// (the default slog text format). The port is only known from it, since
-// Trelis listens on 127.0.0.1:0.
-var listening = regexp.MustCompile(`trelis listening addr=(\S+)`)
+// listening matches the log line Trelis prints once it accepts requests (the
+// development console format, whose fields are JSON). The port is only known
+// from it, since Trelis listens on 127.0.0.1:0.
+var listening = regexp.MustCompile(`trelis listening.*"addr": ?"([^"]+)"`)
 
 // start boots Trelis on a fresh, empty database and stops it when the test
 // ends, with its own bucket that Trelis creates on start. Neo4j and the
@@ -210,19 +210,27 @@ func startWith(t *testing.T, extraEnv ...string) *trelis {
 
 	cmd := exec.Command(deps.binary, "-config", deps.config)
 	cmd.Env = tr.env
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	var logs syncBuffer
-	cmd.Stdout = &logs
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start trelis: %v", err)
 	}
 	exited := make(chan error, 1)
 	addr := make(chan string, 1)
+	var readers sync.WaitGroup
+	readers.Add(2)
+	// Logs go to stdout; stderr carries only startup failures (config and
+	// logger errors), which the same buffer keeps for the failure message.
 	go func() {
-		sc := bufio.NewScanner(stderr)
+		defer readers.Done()
+		sc := bufio.NewScanner(stdout)
 		for sc.Scan() {
 			line := sc.Text()
 			_, _ = fmt.Fprintln(&logs, line)
@@ -233,7 +241,14 @@ func startWith(t *testing.T, extraEnv ...string) *trelis {
 				}
 			}
 		}
-		_, _ = io.Copy(io.Discard, stderr)
+	}()
+	go func() {
+		defer readers.Done()
+		_, _ = io.Copy(&logs, stderr)
+	}()
+	go func() {
+		// Wait reads the pipes to EOF first; calling it before that is unsafe.
+		readers.Wait()
 		exited <- cmd.Wait()
 	}()
 	t.Cleanup(func() {
@@ -299,6 +314,9 @@ func trelisEnv(dbname, bucket string) []string {
 	return append(env,
 		"TRELIS_SERVER_ADDR=127.0.0.1:0",
 		"TRELIS_SERVER_SHUTDOWN_TIMEOUT=5s",
+		// The harness reads stdout; a file would land in the test's working
+		// directory and outlive it.
+		"TRELIS_LOG_FILE_ENABLED=false",
 		"TRELIS_POSTGRES_HOST="+deps.pg.host,
 		"TRELIS_POSTGRES_PORT="+deps.pg.port,
 		"TRELIS_POSTGRES_DBNAME="+dbname,
@@ -320,7 +338,8 @@ func trelisEnv(dbname, bucket string) []string {
 }
 
 // admin runs `server admin <args>` against this Trelis's database, as an
-// operator would, and returns its trimmed stdout.
+// operator would, and returns its trimmed stdout. Admin logs go to stderr, so
+// stdout carries only the command's own output.
 func (tr *trelis) admin(t *testing.T, args ...string) string {
 	t.Helper()
 	stdout, err := run(deps.binary, tr.env, append([]string{"-config", deps.config, "admin"}, args...)...)

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/phongnd2802/trelis/internal/config"
+	"github.com/phongnd2802/trelis/internal/logger"
 	"github.com/phongnd2802/trelis/internal/models/api"
 )
 
@@ -142,11 +143,21 @@ func (c *client) Embed(ctx context.Context, texts []string) ([][]float32, error)
 // the provider gave. dims is the vector length an earlier batch of the same
 // Embed call established, or 0 when this is the first.
 func (c *client) embedBatch(ctx context.Context, batch []string, dims int) ([][]float32, error) {
+	start := time.Now()
 	var vectors [][]float32
-	err := c.retry.Do(ctx, func(ctx context.Context) error {
+	attempts, err := c.retry.DoWithAttempts(ctx, func(ctx context.Context) error {
 		var err error
 		vectors, err = c.send(ctx, batch, dims)
 		return err
+	})
+	logger.LogModelCall(ctx, logger.ModelCall{
+		Role:       "embedding",
+		Model:      c.endpoint.Model,
+		Protocol:   "embeddings",
+		Duration:   time.Since(start),
+		Attempts:   attempts,
+		Failed:     err != nil,
+		HTTPStatus: api.HTTPStatusCode(err),
 	})
 	if err != nil {
 		return nil, err

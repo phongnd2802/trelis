@@ -7,9 +7,13 @@ package api
 
 import (
 	"context"
-	"log/slog"
 	"sort"
 
+	"go.uber.org/zap"
+
+	// logctx is logger.Ctx as a leaf: internal/logger imports config, which
+	// imports this package, so importing internal/logger here would cycle.
+	logctx "github.com/phongnd2802/trelis/internal/logger/ctx"
 	"github.com/phongnd2802/trelis/internal/types"
 )
 
@@ -206,7 +210,8 @@ func (a *StreamAssembler) End(ch chan<- types.StreamResponse) {
 // incomplete instead of reaching the caller as a clean stop.
 func (a *StreamAssembler) EndAtEOF(ch chan<- types.StreamResponse) {
 	if a.LastFinishReason == "" {
-		slog.WarnContext(a.ctx, "stream ended without a finish reason; marking the response incomplete", "model", a.model)
+		logctx.Ctx(a.ctx).Warn("stream ended without a finish reason; marking the response incomplete",
+			zap.String("model", a.model))
 		a.LastFinishReason = types.FinishReasonIncomplete
 	}
 	a.End(ch)
@@ -214,7 +219,6 @@ func (a *StreamAssembler) EndAtEOF(ch chan<- types.StreamResponse) {
 
 // Fail emits the error chunk for a broken stream.
 func (a *StreamAssembler) Fail(ch chan<- types.StreamResponse, err error) {
-	slog.ErrorContext(a.ctx, "stream read error", "model", a.model, "err", err, "tool_calls_assembled", len(a.toolCallMap))
 	a.Finish(ch)
 	a.emit(ch, types.StreamResponse{
 		ResponseType: types.ResponseTypeError,

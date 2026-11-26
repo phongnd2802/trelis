@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/phongnd2802/trelis/internal/config"
+	"github.com/phongnd2802/trelis/internal/logger"
 	"github.com/phongnd2802/trelis/internal/models/api"
 )
 
@@ -84,11 +85,21 @@ func (c *client) Rerank(ctx context.Context, query string, documents []string) (
 	if len(documents) == 0 {
 		return nil, nil
 	}
+	start := time.Now()
 	var scores []float64
-	err := c.retry.Do(ctx, func(ctx context.Context) error {
+	attempts, err := c.retry.DoWithAttempts(ctx, func(ctx context.Context) error {
 		var err error
 		scores, err = c.send(ctx, query, documents)
 		return err
+	})
+	logger.LogModelCall(ctx, logger.ModelCall{
+		Role:       "rerank",
+		Model:      c.endpoint.Model,
+		Protocol:   "rerank",
+		Duration:   time.Since(start),
+		Attempts:   attempts,
+		Failed:     err != nil,
+		HTTPStatus: api.HTTPStatusCode(err),
 	})
 	if err != nil {
 		return nil, err

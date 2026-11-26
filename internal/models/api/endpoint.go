@@ -73,8 +73,9 @@ func (e Endpoint) NewRequest(ctx context.Context, url string, body any, stream b
 	return req, data, nil
 }
 
-// Do sends the request and returns the response. Non-2xx responses are
-// turned into an error carrying the body so callers surface vendor messages.
+// Do sends the request and returns the response. Non-2xx responses become an
+// HTTPError whose Body keeps the vendor's wording for callers that inspect it;
+// Error() leaves the body out because error strings reach logs.
 func (e Endpoint) Do(req *http.Request) (*http.Response, error) {
 	resp, err := e.httpClient().Do(req)
 	if err != nil {
@@ -148,5 +149,19 @@ type HTTPError struct {
 }
 
 func (e *HTTPError) Error() string {
-	return fmt.Sprintf("API request failed with status %d: %s", e.StatusCode, e.Body)
+	// Body is deliberately absent: vendors echo request content in error
+	// bodies, and this message reaches logs. Callers that need the vendor's
+	// wording inspect Body themselves.
+	return fmt.Sprintf("API request failed with status %d", e.StatusCode)
+}
+
+// HTTPStatusCode is the vendor status in err when it is an *HTTPError, or 0.
+// Callers log it as http_status without putting the body-bearing error text
+// in the log.
+func HTTPStatusCode(err error) int {
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode
+	}
+	return 0
 }

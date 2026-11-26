@@ -3,10 +3,12 @@ package parser
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"path/filepath"
 	"strings"
 
+	"go.uber.org/zap"
+
+	"github.com/phongnd2802/trelis/internal/logger"
 	"github.com/phongnd2802/trelis/internal/parser/anydoc"
 	"github.com/phongnd2802/trelis/internal/types"
 )
@@ -43,7 +45,9 @@ func (r *AnydocParser) Parse(ctx context.Context, req *types.ParseRequest) (*typ
 	}
 
 	if converted.AssetsError != nil {
-		slog.WarnContext(ctx, "anydoc parsed text but dropped images", "file", req.FileName, "err", converted.AssetsError)
+		// ParseRequest carries no Document ID, and a file name is never
+		// logged; the error is the only safe detail here.
+		logger.Ctx(ctx).Warn("anydoc parsed text but dropped images", zap.Error(converted.AssetsError))
 	}
 	return &types.ParseResult{
 		MarkdownContent: converted.Markdown,

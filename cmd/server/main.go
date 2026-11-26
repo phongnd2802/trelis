@@ -21,7 +21,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log/slog"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -30,7 +30,8 @@ import (
 
 	"github.com/neo4j/neo4j-go-driver/v6/neo4j"
 	"go.temporal.io/sdk/client"
-	temporallog "go.temporal.io/sdk/log"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/phongnd2802/trelis/internal/application/repository"
 	"github.com/phongnd2802/trelis/internal/application/service"
@@ -38,6 +39,7 @@ import (
 	"github.com/phongnd2802/trelis/internal/config"
 	"github.com/phongnd2802/trelis/internal/db"
 	"github.com/phongnd2802/trelis/internal/handler"
+	"github.com/phongnd2802/trelis/internal/logger"
 	"github.com/phongnd2802/trelis/internal/router"
 )
 
@@ -53,7 +55,7 @@ func ensureBucket(ctx context.Context, files *file.S3FileService) {
 	if err == nil {
 		return
 	}
-	slog.Warn("storage: bucket not ready, retrying in the background", "err", err)
+	logger.Ctx(ctx).Warn("storage: bucket not ready, retrying in the background", zap.Error(err))
 	go func() {
 		t := time.NewTicker(bucketRetry)
 		defer t.Stop()
@@ -64,10 +66,10 @@ func ensureBucket(ctx context.Context, files *file.S3FileService) {
 			case <-t.C:
 			}
 			if err := files.EnsureBucket(ctx); err != nil {
-				slog.Debug("storage: bucket still not ready", "err", err)
+				logger.Ctx(ctx).Debug("storage: bucket still not ready", zap.Error(err))
 				continue
 			}
-			slog.Info("storage: bucket ready")
+			logger.Ctx(ctx).Info("storage: bucket ready")
 			return
 		}
 	}()
@@ -86,7 +88,30 @@ func main() {
 	}
 }
 
-func run(configPath string, args []string) error {
+// logOutput is where the logger's stdout core writes. An admin command logs to
+// stderr so the command's result on stdout stays machine-readable; the server
+// logs to stdout.
+func logOutput(admin bool) io.Writer {
+	if admin {
+		return os.Stderr
+	}
+	return os.Stdout
+}
+
+// logExit records a failed server run once, before main prints it to stderr.
+// Admin errors are operator mistakes that main already prints, so they are not
+// logged here. The stacktrace is suppressed because at this point it would
+// only show this defer, not the failure.
+func logExit(ctx context.Context, admin bool, err error) {
+	if admin || err == nil {
+		return
+	}
+	logger.Ctx(ctx).
+		WithOptions(zap.AddStacktrace(zapcore.FatalLevel)).
+		Error("trelis exited with an error", zap.Error(err))
+}
+
+func run(configPath string, args []string) (err error) {
 	if len(args) > 0 && args[0] != "admin" {
 		return fmt.Errorf("unknown command %q (want none, or admin)", args[0])
 	}
@@ -95,8 +120,18 @@ func run(configPath string, args []string) error {
 		return err
 	}
 
+	l, closeLog, err := logger.NewWithWriter(cfg.Log, logOutput(len(args) > 0))
+	if err != nil {
+		return err
+	}
+	zap.ReplaceGlobals(l)
+	defer func() { _ = closeLog() }()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Log the returned error once it can reach the file as well as main's
+	// stderr. Registered after closeLog so it runs before the file closes.
+	defer func() { logExit(ctx, len(args) > 0, err) }()
 	// After the first signal, restore default handling so a second one
 	// force-quits instead of waiting out the drain.
 	go func() { <-ctx.Done(); stop() }()
@@ -110,7 +145,7 @@ func run(configPath string, args []string) error {
 	if err != nil {
 		return err
 	}
-	slog.Info("postgres migrated", "applied", applied)
+	logger.Ctx(ctx).Info("postgres migrated", zap.Int("applied", applied))
 	dbStore := db.NewStore(pool)
 	principalRepo, keyRepo := repository.NewPrincipalRepository(dbStore), repository.NewAPIKeyRepository(dbStore)
 	principals := service.NewPrincipalService(dbStore, principalRepo, keyRepo)
@@ -128,7 +163,7 @@ func run(configPath string, args []string) error {
 	temporal, err := client.NewLazyClient(client.Options{
 		HostPort:  cfg.Temporal.HostPort(),
 		Namespace: cfg.Temporal.Namespace,
-		Logger:    temporallog.NewStructuredLogger(slog.Default()),
+		Logger:    logger.NewTemporal(l),
 	})
 	if err != nil {
 		return fmt.Errorf("temporal: %w", err)
@@ -170,12 +205,12 @@ func run(configPath string, args []string) error {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.Server.Addr, err)
 	}
-	slog.Info("trelis listening", "addr", ln.Addr().String(), "config", configPath)
+	logger.Ctx(ctx).Info("trelis listening", zap.String("addr", ln.Addr().String()), zap.String("config", configPath))
 
 	if err := router.Serve(ctx, ln, router.New(ready, service.NewAuthService(principalRepo, keyRepo),
 		handler.NewPrincipalHandler(principals), docs, cfg.Server.Swagger), cfg.Server.ShutdownTimeout); err != nil {
 		return err
 	}
-	slog.Info("trelis stopped")
+	logger.Ctx(ctx).Info("trelis stopped")
 	return nil
 }

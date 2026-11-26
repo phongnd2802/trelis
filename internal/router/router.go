@@ -7,7 +7,6 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
 	httpSwagger "github.com/swaggo/http-swagger/v2"
 
 	_ "github.com/phongnd2802/trelis/internal/apidocs"
@@ -36,7 +35,11 @@ func New(ready Readiness, authn interfaces.AuthService,
 	principals *handler.PrincipalHandler, docs *handler.DocumentHandler, swagger bool,
 ) http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.Recoverer)
+	// Outermost first: every response gets an ID and a log line, and a panic
+	// still reaches the access log as a 500.
+	r.Use(requestID)
+	r.Use(accessLog)
+	r.Use(recoverer)
 	if swagger {
 		r.Get("/swagger/*", httpSwagger.Handler(httpSwagger.PersistAuthorization(true)))
 	}

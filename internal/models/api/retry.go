@@ -41,6 +41,14 @@ func DefaultRetry() Retry {
 // the provider's answer. A Retry built in code needs no clamping: at least
 // one attempt is sent, and negative durations mean none.
 func (r Retry) Do(ctx context.Context, send func(context.Context) error) error {
+	_, err := r.DoWithAttempts(ctx, send)
+	return err
+}
+
+// DoWithAttempts is Do, also reporting how many attempts send ran: at least
+// one, and never more than MaxAttempts. One model call logs its retries from
+// this count instead of inferring them.
+func (r Retry) DoWithAttempts(ctx context.Context, send func(context.Context) error) (int, error) {
 	r = r.clamped()
 	var last error
 	for attempt := 1; attempt <= r.MaxAttempts; attempt++ {
@@ -49,27 +57,27 @@ func (r Retry) Do(ctx context.Context, send func(context.Context) error) error {
 			if !ok {
 				// The provider asked for a wait this policy will not serve; its
 				// own answer goes back to the caller.
-				return last
+				return attempt - 1, last
 			}
 			if err := wait(ctx, d); err != nil {
-				return err
+				return attempt - 1, err
 			}
 		}
 		err := send(ctx)
 		if err == nil {
-			return nil
+			return attempt, nil
 		}
 		last = err
 		if !retryable(err) {
-			return err
+			return attempt, err
 		}
 		// The caller went away: waiting out a backoff for a retry nobody will
 		// read is worse than reporting the cancellation.
 		if err := ctx.Err(); err != nil {
-			return err
+			return attempt, err
 		}
 	}
-	return last
+	return r.MaxAttempts, last
 }
 
 // clamped is a Retry every field of which means what this policy expects: at

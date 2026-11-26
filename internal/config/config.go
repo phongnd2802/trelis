@@ -25,12 +25,15 @@ const minShutdownTimeout = time.Second
 
 // Config is the whole service configuration.
 type Config struct {
+	// Env is development or production; it picks the log defaults.
+	Env      string   `mapstructure:"env"`
 	Server   Server   `mapstructure:"server"`
 	Postgres Postgres `mapstructure:"postgres"`
 	Neo4j    Neo4j    `mapstructure:"neo4j"`
 	Temporal Temporal `mapstructure:"temporal"`
 	Storage  Storage  `mapstructure:"storage"`
 	Models   Models   `mapstructure:"models"`
+	Log      Log      `mapstructure:"log"`
 }
 
 // Server configures the HTTP listener.
@@ -50,6 +53,8 @@ type Server struct {
 // defaults also registers every key with viper, which is what lets an env
 // variable override a key the YAML file leaves out.
 var defaults = map[string]any{
+	"env": EnvDevelopment,
+
 	"server.addr":             ":8080",
 	"server.shutdown_timeout": 10 * time.Second,
 	"server.swagger":          false,
@@ -78,6 +83,16 @@ var defaults = map[string]any{
 	"storage.s3.secret_access_key": "",
 	"storage.s3.force_path_style":  false,
 	"storage.s3.create_bucket":     false,
+
+	// The empty values mean "follow env"; the int keys keep their value in
+	// both environments, and the booleans have no default at all so IsSet
+	// can tell "not set" from "set to false".
+	"log.level":             "",
+	"log.format":            "",
+	"log.file.path":         "",
+	"log.file.max_size_mb":  100,
+	"log.file.max_backups":  7,
+	"log.file.max_age_days": 28,
 }
 
 var sslModes = []string{"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
@@ -94,6 +109,15 @@ func Load(path string) (*Config, error) {
 	v.SetEnvPrefix(envPrefix)
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
+	// The log block's booleans have no registered default, so without an
+	// explicit binding an env-only value would not reach IsSet or Unmarshal.
+	// Binding every log key also keeps the environment as the one place an
+	// operator sets them.
+	for _, key := range logKeys {
+		if err := v.BindEnv(key); err != nil {
+			return nil, fmt.Errorf("config: bind %s: %w", envName(key), err)
+		}
+	}
 
 	if err := v.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
@@ -102,6 +126,7 @@ func Load(path string) (*Config, error) {
 	var cfg Config
 	err := v.UnmarshalExact(&cfg)
 	if err == nil {
+		cfg.Log = resolveLog(v, cfg.Env)
 		err = cfg.validate()
 	}
 	if err != nil {
@@ -124,15 +149,25 @@ func sources(path string) string {
 			set = append(set, envName(key))
 		}
 	}
+	for _, key := range logKeys {
+		if os.Getenv(envName(key)) != "" {
+			set = append(set, envName(key))
+		}
+	}
 	if len(set) == 0 {
 		return path
 	}
 	slices.Sort(set)
+	// Some log keys are registered defaults as well as bound env keys.
+	set = slices.Compact(set)
 	return fmt.Sprintf("%s with env overrides %s", path, strings.Join(set, ", "))
 }
 
 func (c *Config) validate() error {
 	var errs []error
+	if !slices.Contains(envs, c.Env) {
+		errs = append(errs, fmt.Errorf("env must be one of %s, got %q", strings.Join(envs, ", "), c.Env))
+	}
 	if c.Server.Addr == "" {
 		errs = append(errs, errors.New("server.addr is required"))
 	} else if _, _, err := net.SplitHostPort(c.Server.Addr); err != nil {
@@ -174,6 +209,7 @@ func (c *Config) validate() error {
 	}
 	errs = append(errs, c.Storage.S3.validate()...)
 	errs = append(errs, c.Models.validate()...)
+	errs = append(errs, c.Log.validate()...)
 
 	return errors.Join(errs...)
 }

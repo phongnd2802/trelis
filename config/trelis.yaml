@@ -3,6 +3,28 @@
 #   server.addr        -> TRELIS_SERVER_ADDR
 #   postgres.password  -> TRELIS_POSTGRES_PASSWORD
 # Defaults target the ports compose.yaml publishes on localhost.
+
+# development or production, overridden by TRELIS_ENV. It picks the logging
+# defaults below; production sets it through the environment, not this file.
+env: development
+
+# Logging (ADR-0008). Every record goes to stdout and to a JSON file rotated
+# by lumberjack. A key left out, or an empty level/format/path, follows env:
+#   development: level debug, format console, add_source true, logs/trelis.log
+#   production:  level info,  format json,    add_source false, /var/log/trelis/trelis.log
+# The rotation settings are the same in both environments.
+# log:
+#   level: debug        # debug, info, warn or error
+#   format: console     # console or json, for stdout only
+#   add_source: true    # caller file and line
+#   file:
+#     enabled: true
+#     path: logs/trelis.log
+#     max_size_mb: 100
+#     max_backups: 7
+#     max_age_days: 28
+#     compress: true
+
 server:
   addr: ":8080"
   # How long SIGTERM waits for in-flight requests before giving up.

@@ -3,11 +3,16 @@ package chat
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/phongnd2802/trelis/internal/config"
 	"github.com/phongnd2802/trelis/internal/models/api"
@@ -50,11 +55,11 @@ func TestNewChat_EachRoleCallsItsOwnProvider(t *testing.T) {
 	chatSrv := provider(t, "from chat", &chatSeen)
 	judgeSrv := provider(t, "from judge", &judgeSeen)
 
-	chatRole, err := NewChat(role(chatSrv.URL, "gen-model", "key-chat"))
+	chatRole, err := NewChat("chat", role(chatSrv.URL, "gen-model", "key-chat"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	judgeRole, err := NewChat(role(judgeSrv.URL, "judge-model", "key-judge"))
+	judgeRole, err := NewChat("judge", role(judgeSrv.URL, "judge-model", "key-judge"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +91,7 @@ func TestNewChat_SwitchesProtocolWithTheRoleConfig(t *testing.T) {
 	ask := func(protocol api.API) string {
 		r := role(p.URL(), "m", "k")
 		r.Protocol = protocol
-		c, err := NewChat(r)
+		c, err := NewChat("chat", r)
 		if err != nil {
 			t.Fatalf("NewChat(%s): %v", protocol, err)
 		}
@@ -135,7 +140,7 @@ func TestNewChat_RejectsIncompleteRole(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			c, err := NewChat(tc.role)
+			c, err := NewChat("chat", tc.role)
 			if err == nil {
 				t.Fatalf("NewChat(%+v) = %v, want an error", tc.role, c)
 			}
@@ -145,5 +150,117 @@ func TestNewChat_RejectsIncompleteRole(t *testing.T) {
 				t.Errorf("NewChat err = %q, want it to contain %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestChatLogsOneModelCallWithoutTheMessage(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	previous := zap.L()
+	zap.ReplaceGlobals(zap.New(core))
+	t.Cleanup(func() { zap.ReplaceGlobals(previous) })
+
+	p := modeltest.NewFakeProvider(t)
+	p.Reply(modeltest.Any(), modeltest.Reply{
+		Text:  "secret answer",
+		Usage: modeltest.Usage{Input: 12, Output: 7},
+	})
+	c, err := NewChat("chat", role(p.URL(), "m", "k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "secret prompt"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	entries := logs.FilterMessage("model call").All()
+	if len(entries) != 1 {
+		t.Fatalf("logger saw %d model call lines, want 1", len(entries))
+	}
+	entry := entries[0]
+	fields := entry.ContextMap()
+	want := map[string]any{
+		"role":          "chat",
+		"model":         "m",
+		"protocol":      string(api.APIOpenAICompletions),
+		"status":        "ok",
+		"attempts":      int64(1),
+		"input_tokens":  int64(12),
+		"output_tokens": int64(7),
+	}
+	for k, v := range want {
+		if fields[k] != v {
+			t.Errorf("%s = %v, want %v", k, fields[k], v)
+		}
+	}
+	if s := fmt.Sprint(entry); strings.Contains(s, "secret prompt") || strings.Contains(s, "secret answer") {
+		t.Errorf("the model call log carries message content: %s", s)
+	}
+}
+
+func TestFailedChatLogsOneInfoLine(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	previous := zap.L()
+	zap.ReplaceGlobals(zap.New(core))
+	t.Cleanup(func() { zap.ReplaceGlobals(previous) })
+
+	p := modeltest.NewFakeProvider(t)
+	p.FailNext(modeltest.ChatCompletions, http.StatusInternalServerError, 1)
+	c, err := NewChat("chat", role(p.URL(), "m", "k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "secret prompt"}}, nil); err == nil {
+		t.Fatal("Chat succeeded, want the provider's error")
+	}
+
+	entries := logs.FilterMessage("model call").All()
+	if len(entries) != 1 {
+		t.Fatalf("logger saw %d model call lines, want 1", len(entries))
+	}
+	entry := entries[0]
+	if entry.Level != zapcore.InfoLevel {
+		t.Errorf("level = %v, want INFO", entry.Level)
+	}
+	fields := entry.ContextMap()
+	if fields["status"] != "error" || fields["http_status"] != int64(http.StatusInternalServerError) {
+		t.Errorf("fields = %v, want status error and http_status 500", fields)
+	}
+	if _, ok := fields["error"]; ok {
+		t.Errorf("fields = %v, want no error text in the model-call line", fields)
+	}
+	if s := fmt.Sprint(entry); strings.Contains(s, "secret prompt") {
+		t.Errorf("the model call log carries the prompt: %s", s)
+	}
+}
+
+func TestChatStreamLogsWhenTheStreamFinishes(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	previous := zap.L()
+	zap.ReplaceGlobals(zap.New(core))
+	t.Cleanup(func() { zap.ReplaceGlobals(previous) })
+
+	p := modeltest.NewFakeProvider(t)
+	p.Reply(modeltest.Any(), modeltest.Text("secret answer"))
+	c, err := NewChat("chat", role(p.URL(), "m", "k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := c.ChatStream(context.Background(), []Message{{Role: "user", Content: "secret prompt"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range ch {
+	}
+
+	entries := logs.FilterMessage("model call").All()
+	if len(entries) != 1 {
+		t.Fatalf("logger saw %d model call lines, want 1", len(entries))
+	}
+	entry := entries[0]
+	if got := entry.ContextMap()["status"]; got != "ok" {
+		t.Errorf("status = %v, want ok", got)
+	}
+	if s := fmt.Sprint(entry); strings.Contains(s, "secret prompt") || strings.Contains(s, "secret answer") {
+		t.Errorf("the model call log carries message content: %s", s)
 	}
 }
