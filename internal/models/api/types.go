@@ -23,8 +23,3 @@ const (
 )
 
 type ThinkingLevelMap map[ReasoningEffort]*string
-
-type Message struct {
-	Role    string
-	Content string
-}
