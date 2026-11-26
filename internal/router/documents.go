@@ -50,9 +50,12 @@ func (a documentsAPI) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	doc, err := a.docs.Upload(r.Context(), p.ID, u)
+	unknown, isUnknown := errors.AsType[*documents.UnknownNameError](err)
 	switch {
-	case errors.Is(err, documents.ErrUnknownReader), errors.Is(err, documents.ErrInvalid):
-		writeError(w, http.StatusBadRequest, err.Error())
+	case isUnknown:
+		writeError(w, http.StatusBadRequest, "access list: "+unknown.Error())
+	case errors.Is(err, documents.ErrEmpty):
+		writeError(w, http.StatusBadRequest, "the file is empty or has no name")
 	case err != nil:
 		slog.ErrorContext(r.Context(), "upload document", "err", err)
 		writeError(w, http.StatusInternalServerError, "could not store the document")
@@ -87,15 +90,13 @@ func readUpload(r *http.Request) (documents.Upload, int, error) {
 			if u, err = readFile(part, u); err != nil {
 				return u, bodyErrStatus(err), err
 			}
-		case "principal", "group":
-			name, err := readField(part)
-			if err != nil {
+		case "principal":
+			if u.AccessList.Principals, err = appendField(u.AccessList.Principals, part); err != nil {
 				return u, bodyErrStatus(err), err
 			}
-			if part.FormName() == "principal" {
-				u.Readers.Principals = append(u.Readers.Principals, name)
-			} else {
-				u.Readers.Groups = append(u.Readers.Groups, name)
+		case "group":
+			if u.AccessList.Groups, err = appendField(u.AccessList.Groups, part); err != nil {
+				return u, bodyErrStatus(err), err
 			}
 		default:
 			return u, http.StatusBadRequest, fmt.Errorf("unknown form field %q (want file, principal, group)", part.FormName())
@@ -127,18 +128,19 @@ func readFile(part *multipart.Part, u documents.Upload) (documents.Upload, error
 	return u, nil
 }
 
-func readField(part *multipart.Part) (string, error) {
+// appendField reads a Principal or Group name and appends it to names.
+func appendField(names []string, part *multipart.Part) ([]string, error) {
 	b, err := io.ReadAll(io.LimitReader(part, maxFieldBytes+1))
 	if err != nil {
-		return "", fmt.Errorf("read %s: %w", part.FormName(), err)
+		return names, fmt.Errorf("read %s: %w", part.FormName(), err)
 	}
 	if len(b) > maxFieldBytes {
-		return "", fmt.Errorf("%s is longer than %d bytes", part.FormName(), maxFieldBytes)
+		return names, fmt.Errorf("%s is longer than %d bytes", part.FormName(), maxFieldBytes)
 	}
 	if len(b) == 0 {
-		return "", fmt.Errorf("%s is empty", part.FormName())
+		return names, fmt.Errorf("%s is empty", part.FormName())
 	}
-	return string(b), nil
+	return append(names, string(b)), nil
 }
 
 // bodyErrStatus is 413 when the body went over its limit, else 400.
@@ -163,7 +165,8 @@ func (a documentsAPI) list(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string][]documents.Document{"documents": docs})
 }
 
-// get answers GET /documents/{id} with the Document and its Access List, or
+// get answers GET /documents/{id} with the Document (and, for its owner, its
+// Access List), or
 // 404 when it does not exist or the caller cannot read it, so a Restricted
 // Document's existence is not revealed.
 func (a documentsAPI) get(w http.ResponseWriter, r *http.Request) {

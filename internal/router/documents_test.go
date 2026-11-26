@@ -14,9 +14,9 @@ import (
 	"github.com/phongnd2802/trelis/internal/documents"
 )
 
-// corpus is Trelis on a fresh database, with Principals that each hold one
+// server is Trelis on a fresh database, with Principals that each hold one
 // API key.
-type corpus struct {
+type server struct {
 	t    *testing.T
 	auth *auth.Store
 	h    http.Handler
@@ -24,10 +24,10 @@ type corpus struct {
 	ctx  context.Context
 }
 
-func newCorpus(t *testing.T, principals ...string) *corpus {
+func newServer(t *testing.T, principals ...string) *server {
 	t.Helper()
 	pool := dbtest.Migrated(t)
-	c := &corpus{t: t, auth: auth.NewStore(pool), keys: map[string]string{}, ctx: context.Background()}
+	c := &server{t: t, auth: auth.NewStore(pool), keys: map[string]string{}, ctx: context.Background()}
 	for _, name := range principals {
 		if _, err := c.auth.CreatePrincipal(c.ctx, name); err != nil {
 			t.Fatal(err)
@@ -43,7 +43,7 @@ func newCorpus(t *testing.T, principals ...string) *corpus {
 }
 
 // group creates a Group with the given members.
-func (c *corpus) group(name string, members ...string) {
+func (c *server) group(name string, members ...string) {
 	c.t.Helper()
 	if _, err := c.auth.CreateGroup(c.ctx, name); err != nil {
 		c.t.Fatal(err)
@@ -61,12 +61,12 @@ type form struct {
 }
 
 func file(name, content string) form   { return form{field: "file", filename: name, value: content} }
-func readerP(name string) form         { return form{field: "principal", value: name} }
-func readerG(name string) form         { return form{field: "group", value: name} }
-func (c *corpus) key(as string) string { return "Bearer " + c.keys[as] }
+func principalField(name string) form  { return form{field: "principal", value: name} }
+func groupField(name string) form      { return form{field: "group", value: name} }
+func (c *server) key(as string) string { return "Bearer " + c.keys[as] }
 
 // upload POSTs /documents as the named Principal.
-func (c *corpus) upload(as string, fields ...form) *httptest.ResponseRecorder {
+func (c *server) upload(as string, fields ...form) *httptest.ResponseRecorder {
 	c.t.Helper()
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
@@ -97,7 +97,7 @@ func (c *corpus) upload(as string, fields ...form) *httptest.ResponseRecorder {
 }
 
 // uploaded uploads and returns the new Document's ID, failing unless 201.
-func (c *corpus) uploaded(as string, fields ...form) string {
+func (c *server) uploaded(as string, fields ...form) string {
 	c.t.Helper()
 	rec := c.upload(as, fields...)
 	if rec.Code != http.StatusCreated {
@@ -123,7 +123,7 @@ type documentBody struct {
 }
 
 func TestAnUploadedDocumentIsPendingAndReadableByItsUploader(t *testing.T) {
-	c := newCorpus(t, "alice")
+	c := newServer(t, "alice")
 	id := c.uploaded("alice", file("luat-thue.txt", "Điều 1. Phạm vi điều chỉnh"))
 
 	rec := get(t, c.h, "/documents/"+id, c.key("alice"))
@@ -141,7 +141,7 @@ func TestAnUploadedDocumentIsPendingAndReadableByItsUploader(t *testing.T) {
 }
 
 // list GETs /documents as the named Principal and returns the filenames.
-func (c *corpus) list(as string) []string {
+func (c *server) list(as string) []string {
 	c.t.Helper()
 	rec := get(c.t, c.h, "/documents", c.key(as))
 	if rec.Code != http.StatusOK {
@@ -159,7 +159,7 @@ func (c *corpus) list(as string) []string {
 }
 
 func TestBCannotSeeARestrictedDocumentOfA(t *testing.T) {
-	c := newCorpus(t, "alice", "bob")
+	c := newServer(t, "alice", "bob")
 	id := c.uploaded("alice", file("luong.txt", "Bảng lương 2024"))
 
 	rec := get(t, c.h, "/documents/"+id, c.key("bob"))
@@ -179,9 +179,9 @@ func TestBCannotSeeARestrictedDocumentOfA(t *testing.T) {
 }
 
 func TestTheAccessListGrantsPrincipalsAndGroupMembers(t *testing.T) {
-	c := newCorpus(t, "alice", "bob", "carol", "dave")
+	c := newServer(t, "alice", "bob", "carol", "dave")
 	c.group("tax", "carol")
-	id := c.uploaded("alice", file("nghi-dinh.txt", "Nghị định 65"), readerP("bob"), readerG("tax"))
+	id := c.uploaded("alice", file("nghi-dinh.txt", "Nghị định 65"), principalField("bob"), groupField("tax"))
 	c.uploaded("alice", file("private.txt", "only alice"))
 
 	for who, want := range map[string]int{"alice": http.StatusOK, "bob": http.StatusOK, "carol": http.StatusOK, "dave": http.StatusNotFound} {
@@ -196,21 +196,38 @@ func TestTheAccessListGrantsPrincipalsAndGroupMembers(t *testing.T) {
 		t.Errorf("alice lists %v, want both of her uploads", got)
 	}
 
-	var doc documentBody
-	rec := get(t, c.h, "/documents/"+id, c.key("carol"))
-	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
-		t.Fatal(err)
+}
+
+func TestOnlyTheOwnerSeesTheAccessList(t *testing.T) {
+	c := newServer(t, "alice", "bob", "carol")
+	c.group("tax", "carol")
+	id := c.uploaded("alice", file("nghi-dinh.txt", "Nghị định 65"), principalField("bob"), groupField("tax"))
+
+	doc := func(as string) documentBody {
+		t.Helper()
+		var d documentBody
+		rec := get(t, c.h, "/documents/"+id, c.key(as))
+		if err := json.Unmarshal(rec.Body.Bytes(), &d); err != nil {
+			t.Fatal(err)
+		}
+		return d
 	}
-	if doc.AccessList == nil || len(doc.AccessList.Principals) != 2 || doc.AccessList.Principals[0] != "alice" ||
-		doc.AccessList.Principals[1] != "bob" || len(doc.AccessList.Groups) != 1 || doc.AccessList.Groups[0] != "tax" {
-		t.Errorf("access list = %+v, want principals [alice bob], groups [tax]", doc.AccessList)
+	got := doc("alice").AccessList
+	if got == nil || len(got.Principals) != 2 || got.Principals[0] != "alice" ||
+		got.Principals[1] != "bob" || len(got.Groups) != 1 || got.Groups[0] != "tax" {
+		t.Errorf("alice sees access list %+v, want principals [alice bob], groups [tax]", got)
+	}
+	for _, reader := range []string{"bob", "carol"} {
+		if got := doc(reader).AccessList; got != nil {
+			t.Errorf("%s sees access list %+v, want none", reader, got)
+		}
 	}
 }
 
 func TestJoiningAGroupGrantsItsDocumentsOnTheNextRequest(t *testing.T) {
-	c := newCorpus(t, "alice", "bob")
+	c := newServer(t, "alice", "bob")
 	c.group("legal")
-	c.uploaded("alice", file("luat.txt", "Luật 04/2007"), readerG("legal"))
+	c.uploaded("alice", file("luat.txt", "Luật 04/2007"), groupField("legal"))
 	if got := c.list("bob"); len(got) != 0 {
 		t.Fatalf("bob before joining lists %v, want nothing", got)
 	}
@@ -223,8 +240,8 @@ func TestJoiningAGroupGrantsItsDocumentsOnTheNextRequest(t *testing.T) {
 }
 
 func TestAnUploadNamingAnUnknownReaderStoresNothing(t *testing.T) {
-	c := newCorpus(t, "alice")
-	for _, f := range []form{readerP("ghost"), readerG("nobody")} {
+	c := newServer(t, "alice")
+	for _, f := range []form{principalField("ghost"), groupField("nobody")} {
 		if rec := c.upload("alice", file("a.txt", "x"), f); rec.Code != http.StatusBadRequest {
 			t.Errorf("upload with %s %q = %d %s, want 400", f.field, f.value, rec.Code, rec.Body)
 		}
@@ -235,13 +252,13 @@ func TestAnUploadNamingAnUnknownReaderStoresNothing(t *testing.T) {
 }
 
 func TestMalformedUploadsAre400(t *testing.T) {
-	c := newCorpus(t, "alice")
+	c := newServer(t, "alice")
 	for name, fields := range map[string][]form{
-		"no file":       {readerP("alice")},
-		"empty file":    {file("a.txt", "")},
-		"two files":     {file("a.txt", "x"), file("b.txt", "y")},
-		"unknown field": {file("a.txt", "x"), {field: "principals", value: "alice"}},
-		"empty reader":  {file("a.txt", "x"), readerP("")},
+		"no file":         {principalField("alice")},
+		"empty file":      {file("a.txt", "")},
+		"two files":       {file("a.txt", "x"), file("b.txt", "y")},
+		"unknown field":   {file("a.txt", "x"), {field: "principals", value: "alice"}},
+		"empty principal": {file("a.txt", "x"), principalField("")},
 	} {
 		if rec := c.upload("alice", fields...); rec.Code != http.StatusBadRequest {
 			t.Errorf("%s: upload = %d %s, want 400", name, rec.Code, rec.Body)
@@ -259,7 +276,7 @@ func TestMalformedUploadsAre400(t *testing.T) {
 }
 
 func TestAFileOverTheLimitIs413(t *testing.T) {
-	c := newCorpus(t, "alice")
+	c := newServer(t, "alice")
 	rec := c.upload("alice", file("big.bin", string(make([]byte, MaxUploadBytes+1))))
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("upload of %d bytes = %d %s, want 413", MaxUploadBytes+1, rec.Code, rec.Body)
@@ -267,14 +284,14 @@ func TestAFileOverTheLimitIs413(t *testing.T) {
 }
 
 func TestAMalformedDocumentIDIs404(t *testing.T) {
-	c := newCorpus(t, "alice")
+	c := newServer(t, "alice")
 	if rec := get(t, c.h, "/documents/not-a-uuid", c.key("alice")); rec.Code != http.StatusNotFound {
 		t.Errorf("GET /documents/not-a-uuid = %d, want 404", rec.Code)
 	}
 }
 
 func TestDocumentsNeedAKey(t *testing.T) {
-	c := newCorpus(t)
+	c := newServer(t)
 	if rec := get(t, c.h, "/documents", ""); rec.Code != http.StatusUnauthorized {
 		t.Errorf("GET /documents without a key = %d, want 401", rec.Code)
 	}

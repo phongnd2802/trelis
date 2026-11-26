@@ -7,7 +7,6 @@ package sqlc
 
 import (
 	"context"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -15,7 +14,7 @@ import (
 const createDocument = `-- name: CreateDocument :one
 INSERT INTO documents (owner_id, filename, content_type, size_bytes, sha256)
 VALUES ($1, $2, $3, $4, $5)
-RETURNING id, filename, content_type, size_bytes, status, created_at
+RETURNING id, owner_id, filename, content_type, size_bytes, sha256, status, created_at
 `
 
 type CreateDocumentParams struct {
@@ -26,16 +25,7 @@ type CreateDocumentParams struct {
 	Sha256      []byte
 }
 
-type CreateDocumentRow struct {
-	ID          uuid.UUID
-	Filename    string
-	ContentType string
-	SizeBytes   int64
-	Status      string
-	CreatedAt   time.Time
-}
-
-func (q *Queries) CreateDocument(ctx context.Context, arg CreateDocumentParams) (CreateDocumentRow, error) {
+func (q *Queries) CreateDocument(ctx context.Context, arg CreateDocumentParams) (Document, error) {
 	row := q.db.QueryRow(ctx, createDocument,
 		arg.OwnerID,
 		arg.Filename,
@@ -43,12 +33,14 @@ func (q *Queries) CreateDocument(ctx context.Context, arg CreateDocumentParams) 
 		arg.SizeBytes,
 		arg.Sha256,
 	)
-	var i CreateDocumentRow
+	var i Document
 	err := row.Scan(
 		&i.ID,
+		&i.OwnerID,
 		&i.Filename,
 		&i.ContentType,
 		&i.SizeBytes,
+		&i.Sha256,
 		&i.Status,
 		&i.CreatedAt,
 	)
@@ -70,16 +62,8 @@ func (q *Queries) CreateDocumentFile(ctx context.Context, arg CreateDocumentFile
 }
 
 const getReadableDocument = `-- name: GetReadableDocument :one
-SELECT d.id, d.filename, d.content_type, d.size_bytes, d.status, d.created_at
-FROM documents d
-WHERE d.id = $1
-  AND (EXISTS (
-        SELECT 1 FROM document_principals dp
-        WHERE dp.document_id = d.id AND dp.principal_id = $2)
-    OR EXISTS (
-        SELECT 1 FROM document_groups dg
-        JOIN group_members m ON m.group_id = dg.group_id
-        WHERE dg.document_id = d.id AND m.principal_id = $2))
+SELECT id, owner_id, filename, content_type, size_bytes, sha256, status, created_at FROM documents
+WHERE id = $1 AND can_read_document(id, $2::uuid)
 `
 
 type GetReadableDocumentParams struct {
@@ -87,25 +71,18 @@ type GetReadableDocumentParams struct {
 	PrincipalID uuid.UUID
 }
 
-type GetReadableDocumentRow struct {
-	ID          uuid.UUID
-	Filename    string
-	ContentType string
-	SizeBytes   int64
-	Status      string
-	CreatedAt   time.Time
-}
-
 // No row when the Document does not exist or the Principal cannot read it,
 // so callers cannot tell the two apart.
-func (q *Queries) GetReadableDocument(ctx context.Context, arg GetReadableDocumentParams) (GetReadableDocumentRow, error) {
+func (q *Queries) GetReadableDocument(ctx context.Context, arg GetReadableDocumentParams) (Document, error) {
 	row := q.db.QueryRow(ctx, getReadableDocument, arg.ID, arg.PrincipalID)
-	var i GetReadableDocumentRow
+	var i Document
 	err := row.Scan(
 		&i.ID,
+		&i.OwnerID,
 		&i.Filename,
 		&i.ContentType,
 		&i.SizeBytes,
+		&i.Sha256,
 		&i.Status,
 		&i.CreatedAt,
 	)
@@ -199,44 +176,28 @@ func (q *Queries) ListDocumentPrincipals(ctx context.Context, documentID uuid.UU
 }
 
 const listReadableDocuments = `-- name: ListReadableDocuments :many
-SELECT d.id, d.filename, d.content_type, d.size_bytes, d.status, d.created_at
-FROM documents d
-WHERE EXISTS (
-        SELECT 1 FROM document_principals dp
-        WHERE dp.document_id = d.id AND dp.principal_id = $1)
-   OR EXISTS (
-        SELECT 1 FROM document_groups dg
-        JOIN group_members m ON m.group_id = dg.group_id
-        WHERE dg.document_id = d.id AND m.principal_id = $1)
-ORDER BY d.created_at DESC, d.id
+SELECT id, owner_id, filename, content_type, size_bytes, sha256, status, created_at FROM documents
+WHERE can_read_document(id, $1::uuid)
+ORDER BY created_at DESC, id
 `
 
-type ListReadableDocumentsRow struct {
-	ID          uuid.UUID
-	Filename    string
-	ContentType string
-	SizeBytes   int64
-	Status      string
-	CreatedAt   time.Time
-}
-
-// The Documents a Principal can read: those whose Access List names them or
-// a Group they are in. Membership is read on every call, so a change to a
-// Group takes effect on the next request. Newest first.
-func (q *Queries) ListReadableDocuments(ctx context.Context, principalID uuid.UUID) ([]ListReadableDocumentsRow, error) {
+// The Documents a Principal can read, newest first.
+func (q *Queries) ListReadableDocuments(ctx context.Context, principalID uuid.UUID) ([]Document, error) {
 	rows, err := q.db.Query(ctx, listReadableDocuments, principalID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []ListReadableDocumentsRow
+	var items []Document
 	for rows.Next() {
-		var i ListReadableDocumentsRow
+		var i Document
 		if err := rows.Scan(
 			&i.ID,
+			&i.OwnerID,
 			&i.Filename,
 			&i.ContentType,
 			&i.SizeBytes,
+			&i.Sha256,
 			&i.Status,
 			&i.CreatedAt,
 		); err != nil {

@@ -2,7 +2,9 @@
 // answers which Documents a Principal can read.
 //
 // The uploaded bytes are kept in Postgres next to the Document (ADR-0002),
-// so ingest needs only the Document ID to find them (ADR-0005).
+// so ingest needs only the Document ID to find them (ADR-0005). Whether a
+// Principal can read a Document is decided in one place, the
+// can_read_document SQL function.
 package documents
 
 import (
@@ -23,15 +25,20 @@ var (
 	// ErrNotFound means no Document has that ID or the caller cannot read
 	// it; the two are deliberately the same, so existence is not revealed.
 	ErrNotFound = errors.New("documents: not found")
-	// ErrUnknownReader means an Access List names a Principal or Group that
-	// does not exist.
-	ErrUnknownReader = errors.New("documents: unknown principal or group")
-	// ErrInvalid means an upload is missing its filename or content.
-	ErrInvalid = errors.New("documents: invalid upload")
+	// ErrEmpty means an upload has no filename or no content.
+	ErrEmpty = errors.New("documents: the file has no name or no content")
 )
 
-// StatusPending is a Document's status from upload until ingest finishes.
-const StatusPending = "pending"
+// UnknownNameError means an Access List names a Principal or Group that does
+// not exist. Its message is fit to show the uploader.
+type UnknownNameError struct {
+	Kind string // "principal" or "group"
+	Name string
+}
+
+func (e *UnknownNameError) Error() string {
+	return fmt.Sprintf("unknown %s %q", e.Kind, e.Name)
+}
 
 // Document describes one uploaded file, never its content.
 type Document struct {
@@ -39,9 +46,10 @@ type Document struct {
 	Filename    string    `json:"filename"`
 	ContentType string    `json:"content_type"`
 	SizeBytes   int64     `json:"size_bytes"`
-	Status      string    `json:"status"`
-	CreatedAt   time.Time `json:"created_at"`
-	// AccessList is set by Get and Upload; List leaves it out.
+	// Status is "pending" from upload until ingest finishes.
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+	// AccessList is shown only to the Document's owner, by Upload and Get.
 	AccessList *AccessList `json:"access_list,omitempty"`
 }
 
@@ -56,8 +64,8 @@ type Upload struct {
 	Filename    string
 	ContentType string
 	Content     []byte
-	// Readers is the Access List. The uploader is always added to it.
-	Readers AccessList
+	// AccessList is who may read it. The uploader is always added to it.
+	AccessList AccessList
 }
 
 // Store keeps Documents in Postgres.
@@ -71,11 +79,11 @@ func NewStore(pool *pgxpool.Pool) *Store {
 }
 
 // Upload stores the file as a pending Document owned by owner, readable by
-// owner and by everyone on u.Readers. Nothing is stored if any name on the
-// Access List is unknown (ErrUnknownReader).
+// owner and by everyone on u.AccessList. Nothing is stored if a name on the
+// Access List is unknown (*UnknownNameError).
 func (s *Store) Upload(ctx context.Context, owner uuid.UUID, u Upload) (Document, error) {
 	if u.Filename == "" || len(u.Content) == 0 {
-		return Document{}, fmt.Errorf("%w: a file needs a name and content", ErrInvalid)
+		return Document{}, ErrEmpty
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -98,11 +106,11 @@ func (s *Store) Upload(ctx context.Context, owner uuid.UUID, u Upload) (Document
 	if err := q.CreateDocumentFile(ctx, sqlc.CreateDocumentFileParams{DocumentID: row.ID, Content: u.Content}); err != nil {
 		return Document{}, fmt.Errorf("documents: store %q: %w", u.Filename, err)
 	}
-	if err := grant(ctx, q, row.ID, owner, u.Readers); err != nil {
+	if err := grant(ctx, q, row.ID, owner, u.AccessList); err != nil {
 		return Document{}, err
 	}
-	doc := fromRow(sqlc.GetReadableDocumentRow(row))
-	if doc.AccessList, err = accessList(ctx, q, row.ID); err != nil {
+	doc, err := withAccessList(ctx, q, row, owner)
+	if err != nil {
 		return Document{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -111,24 +119,24 @@ func (s *Store) Upload(ctx context.Context, owner uuid.UUID, u Upload) (Document
 	return doc, nil
 }
 
-// grant puts owner and everyone on readers on the Document's Access List.
-func grant(ctx context.Context, q *sqlc.Queries, doc, owner uuid.UUID, readers AccessList) error {
+// grant puts owner and everyone on list on the Document's Access List.
+func grant(ctx context.Context, q *sqlc.Queries, doc, owner uuid.UUID, list AccessList) error {
 	if err := q.GrantDocumentToPrincipal(ctx, sqlc.GrantDocumentToPrincipalParams{DocumentID: doc, PrincipalID: owner}); err != nil {
 		return fmt.Errorf("documents: grant owner: %w", err)
 	}
-	for _, name := range readers.Principals {
+	for _, name := range list.Principals {
 		p, err := q.GetPrincipalByName(ctx, name)
 		if err != nil {
-			return readerErr("principal", name, err)
+			return lookupErr("principal", name, err)
 		}
 		if err := q.GrantDocumentToPrincipal(ctx, sqlc.GrantDocumentToPrincipalParams{DocumentID: doc, PrincipalID: p.ID}); err != nil {
 			return fmt.Errorf("documents: grant principal %q: %w", name, err)
 		}
 	}
-	for _, name := range readers.Groups {
+	for _, name := range list.Groups {
 		g, err := q.GetGroupByName(ctx, name)
 		if err != nil {
-			return readerErr("group", name, err)
+			return lookupErr("group", name, err)
 		}
 		if err := q.GrantDocumentToGroup(ctx, sqlc.GrantDocumentToGroupParams{DocumentID: doc, GroupID: g.ID}); err != nil {
 			return fmt.Errorf("documents: grant group %q: %w", name, err)
@@ -137,14 +145,15 @@ func grant(ctx context.Context, q *sqlc.Queries, doc, owner uuid.UUID, readers A
 	return nil
 }
 
-func readerErr(kind, name string, err error) error {
+func lookupErr(kind, name string, err error) error {
 	if errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("%w: %s %q", ErrUnknownReader, kind, name)
+		return &UnknownNameError{Kind: kind, Name: name}
 	}
 	return fmt.Errorf("documents: %s %q: %w", kind, name, err)
 }
 
-// List returns the Documents principal can read, newest first.
+// List returns the Documents principal can read, newest first, without
+// their Access Lists.
 func (s *Store) List(ctx context.Context, principal uuid.UUID) ([]Document, error) {
 	rows, err := sqlc.New(s.pool).ListReadableDocuments(ctx, principal)
 	if err != nil {
@@ -152,13 +161,13 @@ func (s *Store) List(ctx context.Context, principal uuid.UUID) ([]Document, erro
 	}
 	docs := make([]Document, 0, len(rows))
 	for _, r := range rows {
-		docs = append(docs, fromRow(sqlc.GetReadableDocumentRow(r)))
+		docs = append(docs, fromRow(r))
 	}
 	return docs, nil
 }
 
-// Get returns the Document with that ID and its Access List, or ErrNotFound
-// if there is none or principal cannot read it.
+// Get returns the Document with that ID, or ErrNotFound if there is none or
+// principal cannot read it. Its Access List is included for its owner.
 func (s *Store) Get(ctx context.Context, principal, id uuid.UUID) (Document, error) {
 	q := sqlc.New(s.pool)
 	row, err := q.GetReadableDocument(ctx, sqlc.GetReadableDocumentParams{ID: id, PrincipalID: principal})
@@ -168,30 +177,37 @@ func (s *Store) Get(ctx context.Context, principal, id uuid.UUID) (Document, err
 	if err != nil {
 		return Document{}, fmt.Errorf("documents: get %s: %w", id, err)
 	}
+	return withAccessList(ctx, q, row, principal)
+}
+
+// withAccessList converts row, adding its Access List when caller owns it.
+// Other readers do not learn who else can read the Document.
+func withAccessList(ctx context.Context, q *sqlc.Queries, row sqlc.Document, caller uuid.UUID) (Document, error) {
 	doc := fromRow(row)
-	if doc.AccessList, err = accessList(ctx, q, id); err != nil {
-		return Document{}, err
+	if row.OwnerID != caller {
+		return doc, nil
 	}
+	principals, err := q.ListDocumentPrincipals(ctx, row.ID)
+	if err != nil {
+		return Document{}, fmt.Errorf("documents: access list of %s: %w", row.ID, err)
+	}
+	groups, err := q.ListDocumentGroups(ctx, row.ID)
+	if err != nil {
+		return Document{}, fmt.Errorf("documents: access list of %s: %w", row.ID, err)
+	}
+	doc.AccessList = &AccessList{Principals: nonNil(principals), Groups: nonNil(groups)}
 	return doc, nil
 }
 
-func accessList(ctx context.Context, q *sqlc.Queries, doc uuid.UUID) (*AccessList, error) {
-	principals, err := q.ListDocumentPrincipals(ctx, doc)
-	if err != nil {
-		return nil, fmt.Errorf("documents: access list of %s: %w", doc, err)
+// nonNil makes an empty list encode as [] rather than null.
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
 	}
-	groups, err := q.ListDocumentGroups(ctx, doc)
-	if err != nil {
-		return nil, fmt.Errorf("documents: access list of %s: %w", doc, err)
-	}
-	if groups == nil {
-		groups = []string{}
-	}
-	return &AccessList{Principals: principals, Groups: groups}, nil
+	return s
 }
 
-// fromRow converts any of the document queries' rows, which share one shape.
-func fromRow(r sqlc.GetReadableDocumentRow) Document {
+func fromRow(r sqlc.Document) Document {
 	return Document{
 		ID:          r.ID,
 		Filename:    r.Filename,

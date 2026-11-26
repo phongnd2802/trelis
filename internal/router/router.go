@@ -14,7 +14,8 @@ import (
 // dependencies; GET /readyz probes every dependency in ready. Both are open
 // so orchestrators can probe them; everything else, unknown paths and
 // methods included, needs an API key that authn accepts, so a caller
-// without one cannot map the routes.
+// without one cannot map the routes. docs serves /documents and may be nil
+// only where those routes are never called.
 func New(ready Readiness, authn Authenticator, docs Documents) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)

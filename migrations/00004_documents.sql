@@ -38,7 +38,25 @@ CREATE TABLE document_groups (
 );
 CREATE INDEX document_groups_group_id_idx ON document_groups (group_id);
 
+-- The one place that decides whether a Principal can read a Document: its
+-- Access List names them or a Group they are in. Membership is read on every
+-- call, so a change takes effect on the next request. A plain SQL function,
+-- so the planner inlines it into the queries that use it.
+-- +goose StatementBegin
+CREATE FUNCTION can_read_document(doc uuid, principal uuid) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (
+               SELECT 1 FROM document_principals dp
+               WHERE dp.document_id = doc AND dp.principal_id = principal)
+        OR EXISTS (
+               SELECT 1 FROM document_groups dg
+               JOIN group_members m ON m.group_id = dg.group_id
+               WHERE dg.document_id = doc AND m.principal_id = principal)
+$$;
+-- +goose StatementEnd
+
 -- +goose Down
+DROP FUNCTION can_read_document(uuid, uuid);
 DROP TABLE document_groups;
 DROP TABLE document_principals;
 DROP TABLE document_files;
