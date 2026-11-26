@@ -10,6 +10,14 @@ Trelis answers questions over a document collection and shows, with numbers, whi
 One ingested file, the unit that access is granted on.
 _Avoid_: Knowledge, file (when meaning the ingested unit)
 
+**Source File**:
+The bytes a Principal uploaded for a Document, kept exactly as uploaded.
+_Avoid_: Original, raw file, attachment
+
+**Figure**:
+An image inside a Document (a photo, chart or scanned table), taken out when the Document is parsed; readable only by a Principal who can read that Document.
+_Avoid_: Media, image (in prose), picture, asset
+
 **Chunk**:
 A contiguous piece of a Document's text that is retrieved and cited on its own.
 _Avoid_: Passage, segment
