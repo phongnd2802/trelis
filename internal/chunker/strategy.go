@@ -62,7 +62,7 @@ func resolveChain(cfg SplitterConfig) []StrategyTier {
 	case StrategyRecursive, "":
 	case StrategyAuto:
 	default:
-		zap.L().Warn("chunker: unknown strategy, using recursive", zap.String("strategy", string(cfg.Strategy)))
+		zap.L().Warn("chunker: unknown strategy, using recursive", zap.String("strategy", string(cfg.Strategy))) //nolint:forbidigo // the chunker has no ctx until #31 moves this log to the ingest activity
 	}
 	return []StrategyTier{TierRecursive}
 }
@@ -81,7 +81,7 @@ func runChain(text string, cfg SplitterConfig, chain []StrategyTier) ([]Chunk, *
 			return out, diag
 		}
 		diag.Rejected = append(diag.Rejected, TierRejection{Tier: tier, Reason: v.Reason})
-		zap.L().Debug("chunker: tier rejected", zap.String("tier", string(tier)), zap.String("reason", v.Reason))
+		zap.L().Debug("chunker: tier rejected", zap.String("tier", string(tier)), zap.String("reason", v.Reason)) //nolint:forbidigo // the chunker has no ctx until #31 moves this log to the ingest activity
 	}
 	return out, diag
 }

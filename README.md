@@ -16,7 +16,8 @@ Run `make help` for every target.
 
 With `server.swagger: true` (the default in `config/trelis.yaml`), the
 Swagger UI at http://localhost:8080/swagger/index.html calls every route from
-the browser: create a key with `server admin key create <principal>` and paste
+the browser: create a key with `go run ./cmd/server admin key create <principal>` (the
+`trelis` binary: `trelis admin key create <principal>`) and paste
 `Bearer <key>` into Authorize.
 
 ## Tests

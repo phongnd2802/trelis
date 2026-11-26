@@ -13,8 +13,8 @@ import (
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
 
-// adminUsage is printed for `server admin` with bad arguments.
-const adminUsage = `usage: server [-config file] admin <command>
+// adminUsage is printed for `trelis admin` with bad arguments.
+const adminUsage = `usage: trelis [-config file] admin <command>
 
   principal create <name>            create a Principal, print its ID
   group create <name>                create a Group, print its ID

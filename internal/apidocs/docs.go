@@ -625,7 +625,7 @@ const docTemplate = `{
     },
     "securityDefinitions": {
         "bearerAuth": {
-            "description": "Paste \"Bearer \u003ckey\u003e\", with a key from ` + "`" + `admin key create \u003cprincipal\u003e` + "`" + ` (` + "`" + `go run ./cmd/server admin key create \u003cprincipal\u003e` + "`" + ` in dev).",
+            "description": "Paste \"Bearer \u003ckey\u003e\", with a key from ` + "`" + `trelis admin key create \u003cprincipal\u003e` + "`" + ` (` + "`" + `go run ./cmd/server admin key create \u003cprincipal\u003e` + "`" + ` in dev).",
             "type": "apiKey",
             "name": "Authorization",
             "in": "header"

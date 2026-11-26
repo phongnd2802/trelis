@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -13,7 +14,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -186,10 +186,21 @@ type trelis struct {
 	bucket string
 }
 
-// listening matches the log line Trelis prints once it accepts requests (the
-// development console format, whose fields are JSON). The port is only known
-// from it, since Trelis listens on 127.0.0.1:0.
-var listening = regexp.MustCompile(`trelis listening.*"addr": ?"([^"]+)"`)
+// listeningAddr returns the addr field of the JSON record Trelis logs once it
+// accepts requests ("trelis listening", cmd/server/main.go), or "" for any
+// other line. The port is only known from it, since Trelis listens on
+// 127.0.0.1:0; the harness runs Trelis with TRELIS_LOG_FORMAT=json so this
+// reads fields instead of matching console text.
+func listeningAddr(line string) string {
+	var rec struct {
+		Msg  string `json:"msg"`
+		Addr string `json:"addr"`
+	}
+	if json.Unmarshal([]byte(line), &rec) != nil || rec.Msg != "trelis listening" {
+		return ""
+	}
+	return rec.Addr
+}
 
 // start boots Trelis on a fresh, empty database and stops it when the test
 // ends, with its own bucket that Trelis creates on start. Neo4j and the
@@ -234,9 +245,9 @@ func startWith(t *testing.T, extraEnv ...string) *trelis {
 		for sc.Scan() {
 			line := sc.Text()
 			_, _ = fmt.Fprintln(&logs, line)
-			if m := listening.FindStringSubmatch(line); m != nil {
+			if a := listeningAddr(line); a != "" {
 				select {
-				case addr <- m[1]:
+				case addr <- a:
 				default: // only the first one is read
 				}
 			}
@@ -317,6 +328,8 @@ func trelisEnv(dbname, bucket string) []string {
 		// The harness reads stdout; a file would land in the test's working
 		// directory and outlive it.
 		"TRELIS_LOG_FILE_ENABLED=false",
+		// listeningAddr parses the JSON record, not console text.
+		"TRELIS_LOG_FORMAT=json",
 		"TRELIS_POSTGRES_HOST="+deps.pg.host,
 		"TRELIS_POSTGRES_PORT="+deps.pg.port,
 		"TRELIS_POSTGRES_DBNAME="+dbname,
@@ -337,7 +350,7 @@ func trelisEnv(dbname, bucket string) []string {
 	)
 }
 
-// admin runs `server admin <args>` against this Trelis's database, as an
+// admin runs `trelis admin <args>` against this Trelis's database, as an
 // operator would, and returns its trimmed stdout. Admin logs go to stderr, so
 // stdout carries only the command's own output.
 func (tr *trelis) admin(t *testing.T, args ...string) string {

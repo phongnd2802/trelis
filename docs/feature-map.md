@@ -6,7 +6,7 @@ Status: **done** (built, tested, reachable), **partial** (code exists but nothin
 
 ## System at a glance
 
-- **One Go process**, `cmd/server`, serves the HTTP API and runs the admin CLI (`server admin ...`). Background work will run as Temporal workflows (ADR-0005); no worker exists yet.
+- **One Go process**, `cmd/server`, serves the HTTP API and runs the admin CLI (`trelis admin ...`). The binary is `trelis` (`bin/trelis` from `make build`, `/trelis` in the image); in development `go run ./cmd/server` runs it. Background work will run as Temporal workflows (ADR-0005); no worker exists yet.
 - **Stores** (`compose.yaml`, `compose.dev.yaml`):
   - Postgres (ParadeDB image, `pgvector` and `pg_search`): the source of truth (ADR-0002). Schema in `migrations/`, applied by goose on every start.
   - S3-compatible object storage (silo in dev): Source Files, later Figures (ADR-0006).
@@ -19,8 +19,8 @@ Status: **done** (built, tested, reachable), **partial** (code exists but nothin
 
 | Feature | Status | Where | Entry points | Tests | Decisions / issues |
 |---|---|---|---|---|---|
-| Principals, Groups, membership | done | `internal/application/service/principal.go`, `internal/application/repository/principal.go`, `migrations/00002_principals.sql` | `server admin principal create`, `group create`, `group add-member`; `GET /me` | `internal/application/service/principal_test.go`, `internal/application/repository/principal_test.go`, `internal/router/me_test.go` | #14, #110 |
-| API keys (issue, list, revoke; stored hashed) | done | `internal/application/service/auth.go`, `internal/application/repository/apikey.go`, `internal/utils/apikey.go`, `migrations/00003_api_key_revocation.sql` | `server admin key create/list/revoke`; `Authorization: Bearer <key>` | `internal/utils/apikey_test.go`, `internal/application/repository/apikey_test.go`, `internal/router/revoke_test.go`, `cmd/server/admin_test.go` | #14, #99 |
+| Principals, Groups, membership | done | `internal/application/service/principal.go`, `internal/application/repository/principal.go`, `migrations/00002_principals.sql` | `trelis admin principal create`, `group create`, `group add-member`; `GET /me` | `internal/application/service/principal_test.go`, `internal/application/repository/principal_test.go`, `internal/router/me_test.go` | #14, #110 |
+| API keys (issue, list, revoke; stored hashed) | done | `internal/application/service/auth.go`, `internal/application/repository/apikey.go`, `internal/utils/apikey.go`, `migrations/00003_api_key_revocation.sql` | `trelis admin key create/list/revoke`; `Authorization: Bearer <key>` | `internal/utils/apikey_test.go`, `internal/application/repository/apikey_test.go`, `internal/router/revoke_test.go`, `cmd/server/admin_test.go` | #14, #99 |
 | Authentication middleware (every route but the probes and Swagger needs a key, unknown paths included) | done | `internal/router/authn.go`, `internal/router/router.go` | — | `internal/router/router_test.go` | #14 |
 | Upload a Document with an Access List | done | `internal/handler/document.go`, `internal/application/service/document.go`, `internal/application/repository/document.go`, `migrations/00004_documents.sql` | `POST /documents` (multipart: `file`, `principals`, `groups`); `storage.max_file_size_mb` | `internal/router/documents_test.go`, `internal/integration/documents_test.go` | ADR-0004, #20 |
 | Read Documents (get, list; 404 for anything the caller cannot read) | done | same as upload; the caller comes from `internal/application/service/caller.go` | `GET /documents`, `GET /documents/{id}` | `internal/router/documents_test.go` | ADR-0004 |

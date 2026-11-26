@@ -422,7 +422,7 @@ paths:
       - system
 securityDefinitions:
   bearerAuth:
-    description: Paste "Bearer <key>", with a key from `admin key create <principal>`
+    description: Paste "Bearer <key>", with a key from `trelis admin key create <principal>`
       (`go run ./cmd/server admin key create <principal>` in dev).
     in: header
     name: Authorization
