@@ -308,8 +308,8 @@ func TestUploadingTheSameFileTwiceIsAConflict(t *testing.T) {
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("second upload = %d %s, want 409", rec.Code, rec.Body)
 	}
-	if e := decode(t, rec); e.Code != "duplicate_file" || decodeDoc(t, rec).ID != id {
-		t.Errorf("409 body = %s, want code duplicate_file and the existing Document %s", rec.Body, id)
+	if e := decode(t, rec); e.Code != "duplicate_document" || decodeDoc(t, rec).ID != id {
+		t.Errorf("409 body = %s, want code duplicate_document and the existing Document %s", rec.Body, id)
 	}
 	// Another Principal's identical file is their own Document.
 	c.uploaded("bob", upFile("luat.txt", "Luật 04/2007"))
@@ -372,7 +372,7 @@ func TestListingIsPaged(t *testing.T) {
 	if e.Total != 3 || e.Page != 2 || e.PageSize != 2 || len(docs) != 1 || docs[0].FileName != "a.txt" {
 		t.Errorf("page 2 = total %d page %d size %d %v, want total 3, page 2, size 2, [a.txt]", e.Total, e.Page, e.PageSize, docs)
 	}
-	for _, q := range []string{"page=-1", "page=x", "page_size=1001"} {
+	for _, q := range []string{"page=-1", "page=x", "page=99999999999", "page_size=1001"} {
 		if rec := get(t, c.h, "/documents?"+q, c.key("alice")); rec.Code != http.StatusBadRequest {
 			t.Errorf("GET /documents?%s = %d, want 400", q, rec.Code)
 		}

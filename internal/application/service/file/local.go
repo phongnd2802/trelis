@@ -83,12 +83,13 @@ func (s *localFileService) SaveFile(ctx context.Context,
 		return "", fmt.Errorf("failed to create file: %w", err)
 	}
 
-	// Copy content from source to destination
-	if _, err := io.Copy(dst, src); err != nil {
-		_ = dst.Close()
-		return "", fmt.Errorf("failed to save file: %w", err)
+	// Copy content from source to destination; a partial file is removed.
+	_, err = io.Copy(dst, src)
+	if closeErr := dst.Close(); err == nil {
+		err = closeErr
 	}
-	if err := dst.Close(); err != nil {
+	if err != nil {
+		_ = os.Remove(filePath)
 		return "", fmt.Errorf("failed to save file: %w", err)
 	}
 
@@ -122,6 +123,11 @@ func (s *localFileService) DeleteFile(ctx context.Context, filePath string) erro
 	}
 	if err := os.Remove(resolved); err != nil {
 		return fmt.Errorf("failed to delete file: %w", err)
+	}
+	// Drop the Document's directory once it is empty; os.Remove refuses a
+	// directory that still holds files.
+	if dir := filepath.Dir(resolved); dir != filepath.Clean(s.baseDir) {
+		_ = os.Remove(dir)
 	}
 	return nil
 }

@@ -55,8 +55,9 @@ func (s *documentService) CreateDocumentFromFile(ctx context.Context,
 		return nil, err
 	}
 	fileName := file.Filename
+	fileType := getFileType(fileName)
 
-	if err := validateImportFileType(getFileType(fileName)); err != nil {
+	if err := validateImportFileType(fileType); err != nil {
 		return nil, err
 	}
 	if file.Size == 0 {
@@ -70,7 +71,7 @@ func (s *documentService) CreateDocumentFromFile(ctx context.Context,
 	}
 	existing, err := s.repo.GetDocumentByOwnerAndHash(ctx, owner.ID, hash)
 	if err == nil {
-		return existing, types.NewDuplicateFileError(existing)
+		return existing, types.NewDuplicateDocumentError(existing)
 	}
 	if !errors.Is(err, repository.ErrDocumentNotFound) {
 		return nil, err
@@ -86,7 +87,7 @@ func (s *documentService) CreateDocumentFromFile(ctx context.Context,
 		OwnerID:     owner.ID,
 		Title:       safeFilename,
 		FileName:    safeFilename,
-		FileType:    getFileType(safeFilename),
+		FileType:    fileType,
 		FileSize:    file.Size,
 		FileHash:    hash,
 		ParseStatus: types.ParseStatusPending,
@@ -123,7 +124,7 @@ func (s *documentService) createErr(ctx context.Context, owner uuid.UUID, hash s
 		if getErr != nil {
 			return getErr
 		}
-		return types.NewDuplicateFileError(existing)
+		return types.NewDuplicateDocumentError(existing)
 	default:
 		return err
 	}

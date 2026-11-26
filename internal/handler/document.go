@@ -1,3 +1,11 @@
+// Copyright (C) 2026 Tencent. All rights reserved.
+// handleDuplicateDocumentError, parseCommaSeparated, isRequestBodyTooLarge
+// and uploadEnvelopeSlack are adapted from WeKnora
+// (https://github.com/Tencent/WeKnora), MIT License, by way of Omnisc
+// (internal/handler/knowledge.go and upload_limit.go). Modified for Trelis:
+// net/http instead of gin, Documents instead of Knowledge, and no per-step
+// logging (Trelis logs only failures, through slog). See NOTICE.
+
 package handler
 
 import (
@@ -78,7 +86,7 @@ func (h *DocumentHandler) CreateDocumentFromFile(w http.ResponseWriter, r *http.
 	}
 	doc, err := h.service.CreateDocumentFromFile(r.Context(), file, accessList)
 	if err != nil {
-		if h.handleDuplicateDocumentError(w, err, doc) {
+		if h.handleDuplicateDocumentError(w, err) {
 			return
 		}
 		writeError(w, r, err)
@@ -89,7 +97,8 @@ func (h *DocumentHandler) CreateDocumentFromFile(w http.ResponseWriter, r *http.
 
 // handleDuplicateDocumentError answers 409 with the existing Document, in
 // Omnisc's duplicate envelope. It reports whether err was a duplicate.
-func (h *DocumentHandler) handleDuplicateDocumentError(w http.ResponseWriter, err error, doc *types.Document) bool {
+// Omnisc's code is "duplicate_file"; GLOSSARY.md names the unit a Document.
+func (h *DocumentHandler) handleDuplicateDocumentError(w http.ResponseWriter, err error) bool {
 	dupErr, ok := stderrors.AsType[*types.DuplicateDocumentError](err)
 	if !ok {
 		return false
@@ -97,8 +106,8 @@ func (h *DocumentHandler) handleDuplicateDocumentError(w http.ResponseWriter, er
 	writeJSON(w, http.StatusConflict, map[string]any{
 		"success": false,
 		"message": dupErr.Error(),
-		"data":    doc, // doc is the existing Document
-		"code":    "duplicate_file",
+		"data":    dupErr.Document, // the existing Document
+		"code":    "duplicate_document",
 	})
 	return true
 }

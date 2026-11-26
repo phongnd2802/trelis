@@ -37,7 +37,8 @@ func fileHeader(t *testing.T, name, content string) *multipart.FileHeader {
 
 func TestLocalSavesReadsAndDeletesAFile(t *testing.T) {
 	ctx := context.Background()
-	svc := NewLocalFileService(t.TempDir())
+	base := t.TempDir()
+	svc := NewLocalFileService(base)
 	if err := svc.CheckConnectivity(ctx); err != nil {
 		t.Fatalf("CheckConnectivity: %v", err)
 	}
@@ -63,6 +64,9 @@ func TestLocalSavesReadsAndDeletesAFile(t *testing.T) {
 	}
 	if _, err := svc.GetFile(ctx, path); err == nil {
 		t.Error("GetFile after DeleteFile succeeded, want an error")
+	}
+	if left, _ := os.ReadDir(base); len(left) != 0 {
+		t.Errorf("DeleteFile left %d entries in the base directory, want the Document's directory gone", len(left))
 	}
 }
 

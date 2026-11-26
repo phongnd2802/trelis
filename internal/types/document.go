@@ -1,3 +1,9 @@
+// Copyright (C) 2026 Tencent. All rights reserved.
+// DuplicateDocumentError and NewDuplicateDocumentError are adapted from
+// WeKnora (https://github.com/Tencent/WeKnora), MIT License, by way of Omnisc
+// (internal/types/errors.go, DuplicateKnowledgeError). Modified for Trelis:
+// renamed for Documents per GLOSSARY.md. See NOTICE.
+
 package types
 
 import (
@@ -64,10 +70,10 @@ func (e *DuplicateDocumentError) Error() string {
 	return e.Message
 }
 
-// NewDuplicateFileError creates a duplicate file error
-func NewDuplicateFileError(doc *Document) *DuplicateDocumentError {
+// NewDuplicateDocumentError creates a duplicate Document error
+func NewDuplicateDocumentError(doc *Document) *DuplicateDocumentError {
 	return &DuplicateDocumentError{
-		Message:  fmt.Sprintf("File already exists: %s", doc.FileName),
+		Message:  fmt.Sprintf("Document already exists: %s", doc.FileName),
 		Document: doc,
 	}
 }

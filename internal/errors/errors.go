@@ -1,7 +1,9 @@
 // Copyright (C) 2026 Tencent. All rights reserved.
 // Originally part of WeKnora (https://github.com/Tencent/WeKnora), MIT
-// License, by way of Omnisc. Modified for Trelis: trimmed to the codes Trelis
-// uses, plus ErrRequestEntityTooLarge. See NOTICE.
+// License, by way of Omnisc. Modified for Trelis: the common code table is
+// kept whole so codes stay stable, the domain codes (tenants, agents, ...)
+// and the constructors Trelis does not call are dropped,
+// ErrRequestEntityTooLarge is added, and IsAppError unwraps. See NOTICE.
 
 // Package errors is the application error a handler answers with: a stable
 // numeric code, a message fit for the client, and the HTTP status.
@@ -69,15 +71,6 @@ func NewNotFoundError(message string) *AppError {
 		Code:     ErrNotFound,
 		Message:  message,
 		HTTPCode: http.StatusNotFound,
-	}
-}
-
-// NewConflictError creates a conflict error
-func NewConflictError(message string) *AppError {
-	return &AppError{
-		Code:     ErrConflict,
-		Message:  message,
-		HTTPCode: http.StatusConflict,
 	}
 }
 

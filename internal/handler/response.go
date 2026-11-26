@@ -3,7 +3,9 @@
 // License, by way of Omnisc (internal/middleware/error_handler.go and
 // internal/handler/swagger_response.go). Modified for Trelis: written for
 // net/http instead of gin, so a handler calls writeError where Omnisc calls
-// c.Error and lets middleware render. See NOTICE.
+// c.Error and lets middleware render; a non-AppError 500 says only "Internal
+// server error" (Omnisc's handlers often wrap err.Error() into it) and the
+// cause goes to slog. See NOTICE.
 
 // Package handler turns HTTP requests into service calls and service
 // results into Omnisc's response envelope:
@@ -40,7 +42,7 @@ type PageResponse struct {
 type errorBody struct {
 	Code    errors.ErrorCode `json:"code"`
 	Message string           `json:"message"`
-	Details any              `json:"details,omitempty"`
+	Details any              `json:"details"`
 }
 
 type errorResponse struct {

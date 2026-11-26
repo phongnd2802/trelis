@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Tencent. All rights reserved.
 // Originally part of WeKnora (https://github.com/Tencent/WeKnora), MIT
 // License, by way of Omnisc (internal/types/search.go). Modified for Trelis:
-// gin binding tags dropped, Validate added. See NOTICE.
+// gin binding tags replaced by Validate. See NOTICE.
 
 package types
 
@@ -9,6 +9,9 @@ import "fmt"
 
 // maxPageSize is the largest page a list request may ask for.
 const maxPageSize = 1000
+
+// maxPage keeps Offset within the int32 the queries take.
+const maxPage = 1_000_000
 
 // Pagination represents pagination parameters
 type Pagination struct {
@@ -18,11 +21,13 @@ type Pagination struct {
 	PageSize int `json:"page_size"`
 }
 
-// Validate rejects what Omnisc's binding tags reject: a page below 1 and a
-// page size outside 1..1000. Zero means "not given" and takes the default.
+// Validate rejects what Omnisc's binding tags (omitempty,min=1) reject: a
+// negative page, or a page size above 1000. Zero means "not given" and takes
+// the default, as omitempty does. Trelis also caps page, so the offset fits
+// the query.
 func (p *Pagination) Validate() error {
-	if p.Page < 0 {
-		return fmt.Errorf("page must be at least 1")
+	if p.Page < 0 || p.Page > maxPage {
+		return fmt.Errorf("page must be between 1 and %d", maxPage)
 	}
 	if p.PageSize < 0 || p.PageSize > maxPageSize {
 		return fmt.Errorf("page_size must be between 1 and %d", maxPageSize)

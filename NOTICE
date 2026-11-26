@@ -43,3 +43,6 @@ what was changed):
   internal/utils/import_filetypes.go             internal/utils/import_filetypes.go
   internal/handler/response.go                   internal/middleware/error_handler.go,
                                                  internal/handler/swagger_response.go
+  internal/handler/document.go (helpers)         internal/handler/knowledge.go,
+                                                 internal/handler/upload_limit.go
+  internal/types/document.go (duplicate error)   internal/types/errors.go

@@ -54,7 +54,7 @@ func TestAnAppErrorIsAnsweredWithItsEnvelope(t *testing.T) {
 		},
 	})
 	rec := serve(h, "/documents/"+uuid.NewString())
-	want := `{"success":false,"error":{"code":1003,"message":"Document not found"}}` + "\n"
+	want := `{"success":false,"error":{"code":1003,"message":"Document not found","details":null}}` + "\n"
 	if rec.Code != http.StatusNotFound || rec.Body.String() != want {
 		t.Errorf("GET = %d %s, want 404 %s", rec.Code, rec.Body, want)
 	}
