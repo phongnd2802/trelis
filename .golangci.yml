@@ -14,6 +14,16 @@ linters:
               desc: library code logs through internal/logger (zap)
             - pkg: log
               desc: library code logs through internal/logger (zap)
+        # ADR-0007 / CODING_STANDARDS Layers: services and handlers reach the
+        # model clients through contracts in internal/types/interfaces;
+        # cmd/server wires the concrete client in.
+        layers:
+          files:
+            - "**/internal/application/**"
+            - "**/internal/handler/**"
+          deny:
+            - pkg: github.com/phongnd2802/trelis/internal/models
+              desc: depend on the contract in internal/types/interfaces; cmd/server wires the model client
     forbidigo:
       forbid:
         - pattern: ^fmt\.Print(f|ln)?$

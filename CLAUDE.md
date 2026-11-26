@@ -21,7 +21,7 @@ When running `/implement` (`mattpocock-skills:implement`), follow that skill's s
 
 ### Issue tracker
 
-Issues are tracked in GitHub Issues on phongnd2802/trelis (via `gh`). See `docs/agents/issue-tracker.md`.
+Issues are tracked in GitHub Issues on phongnd2802/trelis (via `gh`). Blockers are GitHub's native issue dependencies: `scripts/frontier.sh` lists the unblocked tickets (`--all` adds blocker counts). See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
