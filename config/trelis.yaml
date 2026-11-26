@@ -55,3 +55,7 @@ storage:
 #   judge:                         # should differ from the chat model
 #     base_url: https://api.openai.com/v1
 #     model: gpt-4.1
+#   embedding:                     # POST {base_url}/embeddings
+#     base_url: https://api.openai.com/v1
+#     model: text-embedding-3-small
+#     batch_size: 64               # texts per request, at least 1
