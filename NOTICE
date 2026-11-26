@@ -2,20 +2,29 @@ Trelis
 =======
 
 Parts of Trelis are copied near-verbatim from, or derived from, WeKnora
-(https://github.com/Tencent/WeKnora), reached through the Omnisc fork. Each
-such file starts with a header naming its WeKnora source.
+(https://github.com/Tencent/WeKnora), reached through the Omnisc fork, under
+the MIT terms of its license, reproduced below. Each such file or part says
+so in a header or comment where it appears.
 
 WeKnora
 -------
 Copyright (C) 2026 Tencent.  All rights reserved.
 
-Files (paths in this repository):
+Files and parts (paths in this repository):
 
   Copied near-verbatim:
     internal/models/api/sse.go
     internal/models/api/sse_test.go
     internal/models/api/sse_framing_test.go
     internal/models/api/stream_assembler_test.go
+    internal/integration/harness_test.go
+      run, buildBinary
+      from cli/acceptance/e2e/e2e_test.go (run, buildBinary)
+    internal/models/modeltest/fake_provider.go
+      the "Build tag is intentionally absent" paragraph of the package doc
+      from cli/internal/testutil/xdg.go; the scripted replay (Script) and its
+      "unexpected extra call" failure, from scriptedTemplateChatModel in
+      internal/application/service/wiki_page_rewrite_continuation_test.go
 
   Derived (trimmed to the parts Trelis uses):
     internal/types/chat.go
