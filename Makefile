@@ -1,4 +1,4 @@
-.PHONY: help tools sqlc anydoc-lib build build-lite dev test test-linked vet vet-lite vet-linked lint lint-linked stack-up dev-up dev-down clean
+.PHONY: help tools sqlc anydoc-lib build build-lite dev test test-linked test-integration vet vet-lite vet-linked lint lint-linked stack-up dev-up dev-down clean
 
 BIN_DIR := bin
 BINARY  := $(BIN_DIR)/trelis
@@ -14,6 +14,7 @@ help:
 	@echo "  dev          go run ./cmd/server with anydoc linked (ARGS=... passes flags)"
 	@echo "  test         unit tests that need no archive"
 	@echo "  test-linked  full tests against the linked anydoc archive"
+	@echo "  test-integration  HTTP API tests against Postgres and Neo4j in testcontainers (needs Docker)"
 	@echo "  vet          go vet both build variants (vet-lite / vet-linked for one)"
 	@echo "  lint         golangci-lint incl. gofmt, no archive (lint-linked: -tags anydoc)"
 	@echo "  dev-up       start only the dependencies (compose.dev.yaml) for \`make dev\`, and wait"
@@ -46,13 +47,20 @@ test:
 test-linked:
 	CGO_ENABLED=1 go test -tags anydoc ./...
 
+# Behind the integration build tag so `make test` needs no Docker; see
+# internal/integration. -count=1 because the cache cannot see the containers.
+test-integration:
+	go test -tags integration -count=1 ./internal/integration/...
+
 vet: vet-lite vet-linked
 
+# The integration tag only adds test files, so vetting and linting with it
+# also covers the plain build.
 vet-lite:
-	go vet ./...
+	go vet -tags integration ./...
 
 vet-linked:
-	CGO_ENABLED=1 go vet -tags anydoc ./...
+	CGO_ENABLED=1 go vet -tags anydoc,integration ./...
 
 # Config in .golangci.yml. Resolved from GOPATH/bin so it works without
 # GOPATH/bin on PATH; `make tools` installs the pinned version there.
@@ -69,10 +77,10 @@ sqlc:
 	go run github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION) generate
 
 lint:
-	$(GOLANGCI_LINT) run ./...
+	$(GOLANGCI_LINT) run --build-tags integration ./...
 
 lint-linked:
-	CGO_ENABLED=1 $(GOLANGCI_LINT) run --build-tags anydoc ./...
+	CGO_ENABLED=1 $(GOLANGCI_LINT) run --build-tags anydoc,integration ./...
 
 stack-up:
 	./scripts/stack-up.sh
