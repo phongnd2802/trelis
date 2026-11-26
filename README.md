@@ -14,6 +14,11 @@ make dev      # Trelis on the host, with the anydoc engine linked
 `make stack-up` runs the whole stack, Trelis included, in Docker instead.
 Run `make help` for every target.
 
+With `server.swagger: true` (the default in `config/trelis.yaml`), the
+Swagger UI at http://localhost:8080/swagger/index.html calls every route from
+the browser: create a key with `server admin key create <principal>` and paste
+`Bearer <key>` into Authorize.
+
 ## Tests
 
 ```sh

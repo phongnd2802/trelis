@@ -43,11 +43,16 @@ var alice = types.Principal{
 	},
 }
 
-// newRouter is the router on authn. GET /me reads only the request context,
-// so its PrincipalService needs no repositories.
+// newRouter is the router on authn, without Swagger. GET /me reads only the
+// request context, so its PrincipalService needs no repositories.
 func newRouter(authn interfaces.AuthService) http.Handler {
+	return newRouterWith(authn, false)
+}
+
+// newRouterWith is the router on authn, with Swagger mounted when swagger is true.
+func newRouterWith(authn interfaces.AuthService, swagger bool) http.Handler {
 	me := handler.NewPrincipalHandler(service.NewPrincipalService(nil, nil, nil))
-	return New(Readiness{}, authn, me, nil)
+	return New(Readiness{}, authn, me, nil, swagger)
 }
 
 func get(t *testing.T, h http.Handler, path, authorization string) *httptest.ResponseRecorder {

@@ -7,6 +7,9 @@ server:
   addr: ":8080"
   # How long SIGTERM waits for in-flight requests before giving up.
   shutdown_timeout: 10s
+  # Serve the open Swagger UI at /swagger/index.html for manual API testing.
+  # Production should set TRELIS_SERVER_SWAGGER=false.
+  swagger: true
 
 postgres:
   host: localhost

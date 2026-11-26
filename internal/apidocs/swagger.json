@@ -1,0 +1,627 @@
+{
+    "swagger": "2.0",
+    "info": {
+        "description": "HTTP API for uploading and reading Documents. Every route except the probes needs an API key.",
+        "title": "Trelis API",
+        "contact": {},
+        "version": "0.1.0"
+    },
+    "basePath": "/",
+    "paths": {
+        "/documents": {
+            "get": {
+                "security": [
+                    {
+                        "bearerAuth": []
+                    }
+                ],
+                "description": "Returns one page of the Documents the caller can read, newest first, without Access Lists. A page or page_size of 0, or either left out, takes the default: page 1 and page_size 20.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "documents"
+                ],
+                "summary": "List readable Documents",
+                "parameters": [
+                    {
+                        "maximum": 1000000,
+                        "minimum": 0,
+                        "type": "integer",
+                        "default": 1,
+                        "description": "Page number, 1-based; 0 or absent means the default of 1",
+                        "name": "page",
+                        "in": "query"
+                    },
+                    {
+                        "maximum": 1000,
+                        "minimum": 0,
+                        "type": "integer",
+                        "default": 20,
+                        "description": "Page size; 0 or absent means the default of 20",
+                        "name": "page_size",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/handler.PageResponse"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "type": "array",
+                                            "items": {
+                                                "$ref": "#/definitions/types.Document"
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid page or page_size",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Missing or invalid API key",
+                        "schema": {
+                            "$ref": "#/definitions/router.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error; a failed API key check answers the router's error body instead",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "security": [
+                    {
+                        "bearerAuth": []
+                    }
+                ],
+                "description": "Uploads one file as a new Document. \"principals\" and \"groups\" each name a comma-separated list added to the Access List; the uploader is always on it. Answers 409 when the caller already uploaded the same content.",
+                "consumes": [
+                    "multipart/form-data"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "documents"
+                ],
+                "summary": "Upload a Document",
+                "parameters": [
+                    {
+                        "type": "file",
+                        "description": "The file to upload",
+                        "name": "file",
+                        "in": "formData",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Comma-separated Principal names for the Access List",
+                        "name": "principals",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Comma-separated Group names for the Access List",
+                        "name": "groups",
+                        "in": "formData"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/handler.DataResponse"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/types.Document"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "400": {
+                        "description": "Malformed upload, unknown Principal or Group, or unsupported file type",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Missing or invalid API key",
+                        "schema": {
+                            "$ref": "#/definitions/router.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "The caller already uploaded this content",
+                        "schema": {
+                            "$ref": "#/definitions/handler.DuplicateDocumentResponse"
+                        }
+                    },
+                    "413": {
+                        "description": "File larger than storage.max_file_size_mb",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error; a failed API key check answers the router's error body instead",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/documents/{id}": {
+            "get": {
+                "security": [
+                    {
+                        "bearerAuth": []
+                    }
+                ],
+                "description": "Returns the Document, or 404 when it does not exist or the caller cannot read it, so a Restricted Document's existence is not revealed. Only the owner sees its Access List.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "documents"
+                ],
+                "summary": "Get a Document",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Document ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/handler.DataResponse"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/types.Document"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "401": {
+                        "description": "Missing or invalid API key",
+                        "schema": {
+                            "$ref": "#/definitions/router.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "No readable Document with that ID",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error; a failed API key check answers the router's error body instead",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/documents/{id}/file": {
+            "get": {
+                "security": [
+                    {
+                        "bearerAuth": []
+                    }
+                ],
+                "description": "Streams the file as an attachment, never rendered in the API's origin. The Content-Disposition header names it and Content-Length gives its size.",
+                "produces": [
+                    "application/octet-stream"
+                ],
+                "tags": [
+                    "documents"
+                ],
+                "summary": "Download a Document's Source File",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Document ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "The Source File",
+                        "schema": {
+                            "type": "file"
+                        }
+                    },
+                    "401": {
+                        "description": "Missing or invalid API key",
+                        "schema": {
+                            "$ref": "#/definitions/router.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "No readable Document with that ID",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error; a failed API key check answers the router's error body instead",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/healthz": {
+            "get": {
+                "description": "Answers 200 while the process is serving requests, whatever its dependencies are.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "system"
+                ],
+                "summary": "Liveness probe",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/router.HealthStatus"
+                        }
+                    }
+                }
+            }
+        },
+        "/me": {
+            "get": {
+                "security": [
+                    {
+                        "bearerAuth": []
+                    }
+                ],
+                "description": "Returns the Principal the API key belongs to, with its Groups, as the bare Principal rather than the response envelope.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "principals"
+                ],
+                "summary": "Get the calling Principal",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/types.Principal"
+                        }
+                    },
+                    "401": {
+                        "description": "Missing or invalid API key",
+                        "schema": {
+                            "$ref": "#/definitions/router.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error; a failed API key check answers the router's error body instead",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/readyz": {
+            "get": {
+                "description": "Probes Postgres, object storage, Neo4j and Temporal concurrently. Answers 200 when all are up, 503 when any is down.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "system"
+                ],
+                "summary": "Readiness probe",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/router.ReadyStatus"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/router.ReadyStatus"
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "errors.ErrorCode": {
+            "type": "integer",
+            "enum": [
+                1000,
+                1001,
+                1002,
+                1003,
+                1004,
+                1005,
+                1006,
+                1007,
+                1008,
+                1009,
+                1010,
+                1011
+            ],
+            "x-enum-varnames": [
+                "ErrBadRequest",
+                "ErrUnauthorized",
+                "ErrForbidden",
+                "ErrNotFound",
+                "ErrMethodNotAllowed",
+                "ErrConflict",
+                "ErrTooManyRequests",
+                "ErrInternalServer",
+                "ErrServiceUnavailable",
+                "ErrTimeout",
+                "ErrValidation",
+                "ErrRequestEntityTooLarge"
+            ]
+        },
+        "handler.DataResponse": {
+            "type": "object",
+            "properties": {
+                "data": {},
+                "success": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "handler.DuplicateDocumentResponse": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "enum": [
+                        "duplicate_document"
+                    ]
+                },
+                "data": {
+                    "$ref": "#/definitions/types.Document"
+                },
+                "message": {
+                    "type": "string"
+                },
+                "success": {
+                    "type": "boolean",
+                    "example": false
+                }
+            }
+        },
+        "handler.ErrorBody": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "$ref": "#/definitions/errors.ErrorCode"
+                },
+                "details": {},
+                "message": {
+                    "type": "string"
+                }
+            }
+        },
+        "handler.ErrorResponse": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "$ref": "#/definitions/handler.ErrorBody"
+                },
+                "success": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "handler.PageResponse": {
+            "type": "object",
+            "properties": {
+                "data": {},
+                "page": {
+                    "type": "integer"
+                },
+                "page_size": {
+                    "type": "integer"
+                },
+                "success": {
+                    "type": "boolean"
+                },
+                "total": {
+                    "type": "integer"
+                }
+            }
+        },
+        "router.CheckStatus": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "router.ErrorResponse": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string"
+                }
+            }
+        },
+        "router.HealthStatus": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "router.ReadyStatus": {
+            "type": "object",
+            "properties": {
+                "checks": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "$ref": "#/definitions/router.CheckStatus"
+                    }
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "types.AccessList": {
+            "type": "object",
+            "properties": {
+                "groups": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "principals": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "types.Document": {
+            "type": "object",
+            "properties": {
+                "access_list": {
+                    "description": "AccessList is filled in only for the owner, so other readers do not\nlearn who else can read the Document.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/types.AccessList"
+                        }
+                    ]
+                },
+                "created_at": {
+                    "description": "Creation time of the Document",
+                    "type": "string"
+                },
+                "file_hash": {
+                    "description": "File hash of the Document: hex SHA-256 of its content",
+                    "type": "string"
+                },
+                "file_name": {
+                    "description": "File name of the Document",
+                    "type": "string"
+                },
+                "file_size": {
+                    "description": "File size of the Document in bytes",
+                    "type": "integer"
+                },
+                "file_type": {
+                    "description": "File type of the Document: its lower-case extension",
+                    "type": "string"
+                },
+                "id": {
+                    "description": "Unique identifier of the Document",
+                    "type": "string"
+                },
+                "parse_status": {
+                    "description": "Parse status of the Document",
+                    "type": "string"
+                },
+                "title": {
+                    "description": "Title of the Document; the file name at upload",
+                    "type": "string"
+                },
+                "updated_at": {
+                    "description": "Last updated time of the Document",
+                    "type": "string"
+                }
+            }
+        },
+        "types.Group": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                }
+            }
+        },
+        "types.Principal": {
+            "type": "object",
+            "properties": {
+                "groups": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/types.Group"
+                    }
+                },
+                "id": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                }
+            }
+        }
+    },
+    "securityDefinitions": {
+        "bearerAuth": {
+            "description": "Paste \"Bearer \u003ckey\u003e\", with a key from `admin key create \u003cprincipal\u003e` (`go run ./cmd/server admin key create \u003cprincipal\u003e` in dev).",
+            "type": "apiKey",
+            "name": "Authorization",
+            "in": "header"
+        }
+    }
+}

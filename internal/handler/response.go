@@ -39,15 +39,18 @@ type PageResponse struct {
 	PageSize int   `json:"page_size"`
 }
 
-type errorBody struct {
+// ErrorBody is the error inside ErrorResponse.
+type ErrorBody struct {
 	Code    errors.ErrorCode `json:"code"`
 	Message string           `json:"message"`
 	Details any              `json:"details"`
 }
 
-type errorResponse struct {
+// ErrorResponse is the envelope of a failed request:
+// {"success": false, "error": {"code", "message", "details"}}.
+type ErrorResponse struct {
 	Success bool      `json:"success"`
-	Error   errorBody `json:"error"`
+	Error   ErrorBody `json:"error"`
 }
 
 func writeData(w http.ResponseWriter, status int, data any) {
@@ -68,7 +71,7 @@ func writePage(w http.ResponseWriter, page *types.PageResult) {
 // and answered as a generic 500, so internal detail never reaches the client.
 func writeError(w http.ResponseWriter, r *http.Request, err error) {
 	if appErr, ok := errors.IsAppError(err); ok {
-		writeJSON(w, appErr.HTTPCode, errorResponse{Error: errorBody{
+		writeJSON(w, appErr.HTTPCode, ErrorResponse{Error: ErrorBody{
 			Code:    appErr.Code,
 			Message: appErr.Message,
 			Details: appErr.Details,
@@ -76,7 +79,7 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 		return
 	}
 	slog.ErrorContext(r.Context(), "request failed", "method", r.Method, "path", r.URL.Path, "err", err)
-	writeJSON(w, http.StatusInternalServerError, errorResponse{Error: errorBody{
+	writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: ErrorBody{
 		Code:    errors.ErrInternalServer,
 		Message: "Internal server error",
 	}})
