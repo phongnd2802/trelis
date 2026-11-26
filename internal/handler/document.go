@@ -4,7 +4,7 @@
 // (https://github.com/Tencent/WeKnora), MIT License, by way of Omnisc
 // (internal/handler/knowledge.go and upload_limit.go). Modified for Trelis:
 // net/http instead of gin, Documents instead of Knowledge, and no per-step
-// logging (Trelis logs only failures, through slog). See NOTICE.
+// logging (Trelis logs only failures, through internal/logger). See NOTICE.
 
 package handler
 
@@ -12,7 +12,6 @@ import (
 	stderrors "errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"mime"
 	"net/http"
 	"strconv"
@@ -20,8 +19,10 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"github.com/phongnd2802/trelis/internal/errors"
+	"github.com/phongnd2802/trelis/internal/logger"
 	"github.com/phongnd2802/trelis/internal/types"
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
@@ -215,7 +216,7 @@ func (h *DocumentHandler) DownloadDocumentFile(w http.ResponseWriter, r *http.Re
 	w.WriteHeader(http.StatusOK)
 	if _, err := io.Copy(w, body); err != nil {
 		// The status is already sent; the client sees a short body.
-		slog.ErrorContext(r.Context(), "stream source file", "document", doc.ID, "err", err)
+		logger.Ctx(r.Context()).Error("stream source file", zap.Stringer("document", doc.ID), zap.Error(err))
 	}
 }
 

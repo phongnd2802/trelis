@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/phongnd2802/trelis/internal/config"
+	"github.com/phongnd2802/trelis/internal/logger"
 	"github.com/phongnd2802/trelis/internal/models/api"
 )
 
@@ -142,26 +143,53 @@ func (c *client) Embed(ctx context.Context, texts []string) ([][]float32, error)
 // the provider gave. dims is the vector length an earlier batch of the same
 // Embed call established, or 0 when this is the first.
 func (c *client) embedBatch(ctx context.Context, batch []string, dims int) ([][]float32, error) {
-	var vectors [][]float32
-	err := c.retry.Do(ctx, func(ctx context.Context) error {
-		var err error
-		vectors, err = c.send(ctx, batch, dims)
-		return err
+	start := time.Now()
+	var (
+		vectors [][]float32
+		used    *usage
+	)
+	attempts, err := c.retry.DoWithAttempts(ctx, func(ctx context.Context) error {
+		got, gotUsage, err := c.send(ctx, batch, dims)
+		if err != nil {
+			return err
+		}
+		// Keep only the successful attempt's accounting: a retried attempt's
+		// usage was not billed as part of this line.
+		vectors, used = got, gotUsage
+		return nil
 	})
+	call := logger.ModelCall{
+		Role:       "embedding",
+		Model:      c.endpoint.Model,
+		Protocol:   "embeddings",
+		Duration:   time.Since(start),
+		Attempts:   attempts,
+		Failed:     err != nil,
+		HTTPStatus: api.HTTPStatusCode(err),
+	}
+	if used != nil {
+		call.HasUsage = true
+		call.InputTokens = used.PromptTokens
+		if call.InputTokens == 0 {
+			call.InputTokens = used.TotalTokens
+		}
+	}
+	logger.LogModelCall(ctx, call)
 	if err != nil {
 		return nil, err
 	}
 	return vectors, nil
 }
 
-// send posts one batch and returns its vectors in the batch's order. dims is
-// the vector length an earlier batch of the same Embed call established, or 0
-// to accept whatever this reply carries.
-func (c *client) send(ctx context.Context, batch []string, dims int) ([][]float32, error) {
+// send posts one batch and returns its vectors in the batch's order and the
+// vendor's token accounting, when the reply carries it. dims is the vector
+// length an earlier batch of the same Embed call established, or 0 to accept
+// whatever this reply carries.
+func (c *client) send(ctx context.Context, batch []string, dims int) ([][]float32, *usage, error) {
 	body := requestBody{Model: c.endpoint.Model, Input: batch}
 	raw, err := c.endpoint.PostJSON(ctx, defaultPath, body, c.timeout)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	return vectorsOf(raw, len(batch), dims)
 }
@@ -174,12 +202,20 @@ type requestBody struct {
 	Input []string `json:"input"`
 }
 
+// usage is the vendor's token accounting for one embeddings request. A nil
+// *usage means the reply carried none.
+type usage struct {
+	PromptTokens int `json:"prompt_tokens"`
+	TotalTokens  int `json:"total_tokens"`
+}
+
 // responseBody is the OpenAI embeddings reply.
 type responseBody struct {
 	Data []struct {
 		Index     int       `json:"index"`
 		Embedding []float32 `json:"embedding"`
 	} `json:"data"`
+	Usage *usage `json:"usage"`
 	// Error carries the vendor's message when a gateway answers 200 with an
 	// error instead of a status code.
 	Error *struct {
@@ -190,26 +226,27 @@ type responseBody struct {
 // vectorsOf reads a reply to a batch of want texts and puts its vectors in the
 // batch's order: a provider numbers each vector with the index of the text it
 // belongs to and may answer in any order. dims is the vector length the caller
-// expects, or 0 to adopt whatever this reply carries.
-func vectorsOf(raw []byte, want, dims int) ([][]float32, error) {
+// expects, or 0 to adopt whatever this reply carries. The usage pointer is nil
+// when the reply carries no usage object.
+func vectorsOf(raw []byte, want, dims int) ([][]float32, *usage, error) {
 	var body responseBody
 	if err := json.Unmarshal(raw, &body); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+		return nil, nil, fmt.Errorf("decode response: %w", err)
 	}
 	if body.Error != nil && body.Error.Message != "" {
-		return nil, fmt.Errorf("API error: %s", body.Error.Message)
+		return nil, nil, fmt.Errorf("API error: %s", body.Error.Message)
 	}
 	// A reply that does not carry one vector per text is not an answer to this
 	// batch. It would come back the same way every time, so sending the batch
 	// again cannot help.
 	if len(body.Data) != want {
-		return nil, fmt.Errorf("response carries %d vectors, want %d", len(body.Data), want)
+		return nil, nil, fmt.Errorf("response carries %d vectors, want %d", len(body.Data), want)
 	}
 	vectors := make([][]float32, want)
 	seen := make([]bool, want)
 	for _, data := range body.Data {
 		if data.Index < 0 || data.Index >= want || seen[data.Index] {
-			return nil, fmt.Errorf("response index %d is not one of 0..%d, or comes twice", data.Index, want-1)
+			return nil, nil, fmt.Errorf("response index %d is not one of 0..%d, or comes twice", data.Index, want-1)
 		}
 		seen[data.Index] = true
 		vectors[data.Index] = data.Embedding
@@ -220,15 +257,15 @@ func vectorsOf(raw []byte, want, dims int) ([][]float32, error) {
 	// retryable leaves alone. The index named is the text's place in the batch.
 	for i, v := range vectors {
 		if len(v) == 0 {
-			return nil, fmt.Errorf("vector %d is empty", i)
+			return nil, nil, fmt.Errorf("vector %d is empty", i)
 		}
 		if dims == 0 {
 			dims = len(v)
 			continue
 		}
 		if len(v) != dims {
-			return nil, fmt.Errorf("vector %d has %d dimensions, want %d", i, len(v), dims)
+			return nil, nil, fmt.Errorf("vector %d has %d dimensions, want %d", i, len(v), dims)
 		}
 	}
-	return vectors, nil
+	return vectors, body.Usage, nil
 }

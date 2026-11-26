@@ -19,6 +19,16 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
+// unsetLoggingEnv removes the logging variables a developer's shell might
+// carry, so a test sees the defaults it expects.
+func unsetLoggingEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv(envName("env"), "")
+	for _, key := range logKeys {
+		t.Setenv(envName(key), "")
+	}
+}
+
 const validYAML = `
 server:
   addr: ":9090"
@@ -448,5 +458,123 @@ func TestS3StorageIsReadFromEnv(t *testing.T) {
 	want := S3{Endpoint: "http://silo:9000", Region: "us-east-1", Bucket: "docs", AccessKeyID: "trelis", SecretAccessKey: "s3cr3t-dev", ForcePathStyle: true, CreateBucket: true}
 	if cfg.Storage.S3 != want {
 		t.Errorf("storage.s3 = %+v, want %+v", cfg.Storage.S3, want)
+	}
+}
+
+func TestLogDefaultsFollowEnv(t *testing.T) {
+	devFile := LogFile{Enabled: true, Path: "logs/trelis.log", MaxSizeMB: 100, MaxBackups: 7, MaxAgeDays: 28, Compress: true}
+	prodFile := LogFile{Enabled: true, Path: "/var/log/trelis/trelis.log", MaxSizeMB: 100, MaxBackups: 7, MaxAgeDays: 28, Compress: true}
+	cases := []struct {
+		name string
+		env  string
+		want Log
+	}{
+		{"development", EnvDevelopment, Log{Level: "debug", Format: "console", AddSource: true, File: devFile}},
+		{"production", EnvProduction, Log{Level: "info", Format: "json", AddSource: false, File: prodFile}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			unsetLoggingEnv(t)
+			t.Setenv("TRELIS_ENV", tc.env)
+
+			cfg, err := Load(writeConfig(t, validYAML))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.Log != tc.want {
+				t.Errorf("Log = %+v,\nwant   %+v", cfg.Log, tc.want)
+			}
+		})
+	}
+}
+
+func TestExplicitLogKeysWinOverEnvDefaults(t *testing.T) {
+	unsetLoggingEnv(t)
+	t.Setenv("TRELIS_ENV", EnvProduction)
+	t.Setenv("TRELIS_LOG_FORMAT", "console")
+	t.Setenv("TRELIS_LOG_FILE_ENABLED", "false")
+
+	cfg, err := Load(writeConfig(t, validYAML+`
+log:
+  level: debug
+  add_source: true
+  file:
+    compress: false
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Log.Level != "debug" {
+		t.Errorf("Log.Level = %q, want the YAML debug over the production default", cfg.Log.Level)
+	}
+	if cfg.Log.Format != "console" {
+		t.Errorf("Log.Format = %q, want the env console over the production default", cfg.Log.Format)
+	}
+	if !cfg.Log.AddSource {
+		t.Error("Log.AddSource = false, want the YAML true")
+	}
+	if cfg.Log.File.Enabled {
+		t.Error("Log.File.Enabled = true, want the env false")
+	}
+	if cfg.Log.File.Compress {
+		t.Error("Log.File.Compress = true, want the YAML false")
+	}
+}
+
+func TestLogFileCanBeDisabledInDevelopment(t *testing.T) {
+	unsetLoggingEnv(t)
+
+	cfg, err := Load(writeConfig(t, validYAML+"log:\n  file:\n    enabled: false\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Log.File.Enabled {
+		t.Error("Log.File.Enabled = true, want the explicit false to beat the development default")
+	}
+}
+
+func TestLoadRejectsInvalidLogging(t *testing.T) {
+	cases := []struct {
+		name    string
+		yaml    string
+		env     map[string]string
+		wantMsg string
+	}{
+		{"unknown env", validYAML, map[string]string{"TRELIS_ENV": "staging"}, "env"},
+		{"unknown level", validYAML + "log:\n  level: trace\n", nil, "log.level"},
+		{"unknown level from env", validYAML, map[string]string{"TRELIS_LOG_LEVEL": "trace"}, "TRELIS_LOG_LEVEL"},
+		{"unknown format", validYAML + "log:\n  format: xml\n", nil, "log.format"},
+		{"unknown format from env", validYAML, map[string]string{"TRELIS_LOG_FORMAT": "xml"}, "TRELIS_LOG_FORMAT"},
+		{"zero max size", validYAML + "log:\n  file:\n    max_size_mb: 0\n", nil, "log.file.max_size_mb"},
+		{"negative backups", validYAML + "log:\n  file:\n    max_backups: -1\n", nil, "log.file.max_backups"},
+		{"negative max age", validYAML + "log:\n  file:\n    max_age_days: -1\n", nil, "log.file.max_age_days"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			unsetLoggingEnv(t)
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			_, err := Load(writeConfig(t, tc.yaml))
+			if err == nil {
+				t.Fatal("Load succeeded, want an error")
+			}
+			if !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Errorf("error %q does not mention %q", err, tc.wantMsg)
+			}
+		})
+	}
+}
+
+func TestConfigErrorNamesAnEnvOverrideOnce(t *testing.T) {
+	unsetLoggingEnv(t)
+	t.Setenv("TRELIS_LOG_LEVEL", "trace")
+
+	_, err := Load(writeConfig(t, validYAML))
+	if err == nil {
+		t.Fatal("Load succeeded, want an error")
+	}
+	if n := strings.Count(err.Error(), "TRELIS_LOG_LEVEL"); n != 1 {
+		t.Errorf("error names TRELIS_LOG_LEVEL %d times, want once: %v", n, err)
 	}
 }

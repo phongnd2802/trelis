@@ -14,6 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
+
 	"github.com/phongnd2802/trelis/internal/config"
 	"github.com/phongnd2802/trelis/internal/models/api"
 	"github.com/phongnd2802/trelis/internal/models/modeltest"
@@ -514,5 +518,121 @@ func TestEmbedRespectsTheCallersOwnDeadline(t *testing.T) {
 	defer cancel()
 	if _, err := e.Embed(ctx, []string{"x"}); !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Embed err = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestEmbedLogsOneModelCallPerBatchAndCountsRetries(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	previous := zap.L()
+	zap.ReplaceGlobals(zap.New(core))
+	t.Cleanup(func() { zap.ReplaceGlobals(previous) })
+
+	p := modeltest.NewFakeProvider(t)
+	p.FailNext(modeltest.Embeddings, http.StatusInternalServerError, 1)
+	e := embedder(t, p, 8)
+
+	if _, err := e.Embed(context.Background(), []string{"secret text"}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries := logs.FilterMessage("model call").All()
+	if len(entries) != 1 {
+		t.Fatalf("logger saw %d model call lines, want 1", len(entries))
+	}
+	entry := entries[0]
+	fields := entry.ContextMap()
+	want := map[string]any{
+		"role":     "embedding",
+		"model":    model,
+		"protocol": "embeddings",
+		"status":   "ok",
+		"attempts": int64(2),
+		// The fake counts one token per word.
+		"input_tokens": int64(2),
+	}
+	for k, v := range want {
+		if fields[k] != v {
+			t.Errorf("%s = %v, want %v", k, fields[k], v)
+		}
+	}
+	if _, ok := fields["output_tokens"]; ok {
+		t.Errorf("output_tokens = %v, want it omitted for embeddings", fields["output_tokens"])
+	}
+	if s := fmt.Sprint(entry); strings.Contains(s, "secret text") {
+		t.Errorf("the model call log carries the input text: %s", s)
+	}
+}
+
+// A provider that reports only total_tokens still gets an input count.
+func TestEmbedLogsTotalTokensWhenPromptTokensIsAbsent(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	previous := zap.L()
+	zap.ReplaceGlobals(zap.New(core))
+	t.Cleanup(func() { zap.ReplaceGlobals(previous) })
+
+	base, _ := stub(t, func(input []string) any {
+		data := make([]map[string]any, len(input))
+		for i := range input {
+			data[i] = vector(i, 1)
+		}
+		return map[string]any{
+			"object": "list",
+			"data":   data,
+			"usage":  map[string]int{"total_tokens": 7},
+		}
+	})
+	e, err := New(role(base, model, key, 8), WithRetry(1, 0, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Embed(context.Background(), []string{"secret text"}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries := logs.FilterMessage("model call").All()
+	if len(entries) != 1 {
+		t.Fatalf("logger saw %d model call lines, want 1", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if fields["input_tokens"] != int64(7) {
+		t.Errorf("input_tokens = %v, want the total_tokens fallback 7", fields["input_tokens"])
+	}
+	if _, ok := fields["output_tokens"]; ok {
+		t.Errorf("output_tokens = %v, want it omitted for embeddings", fields["output_tokens"])
+	}
+}
+
+// A reply without a usage object logs no token fields at all.
+func TestEmbedLogsNoTokensWhenUsageIsAbsent(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	previous := zap.L()
+	zap.ReplaceGlobals(zap.New(core))
+	t.Cleanup(func() { zap.ReplaceGlobals(previous) })
+
+	base, _ := stub(t, func(input []string) any {
+		data := make([]map[string]any, len(input))
+		for i := range input {
+			data[i] = vector(i, 1)
+		}
+		return map[string]any{"object": "list", "data": data}
+	})
+	e, err := New(role(base, model, key, 8), WithRetry(1, 0, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Embed(context.Background(), []string{"secret text"}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries := logs.FilterMessage("model call").All()
+	if len(entries) != 1 {
+		t.Fatalf("logger saw %d model call lines, want 1", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if _, ok := fields["input_tokens"]; ok {
+		t.Errorf("input_tokens = %v, want it omitted without usage", fields["input_tokens"])
+	}
+	if _, ok := fields["output_tokens"]; ok {
+		t.Errorf("output_tokens = %v, want it omitted without usage", fields["output_tokens"])
 	}
 }

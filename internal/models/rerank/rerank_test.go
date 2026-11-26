@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/phongnd2802/trelis/internal/config"
 	"github.com/phongnd2802/trelis/internal/models/api"
@@ -294,5 +299,76 @@ func TestRerankRetriesAReplyThatStopsHalfway(t *testing.T) {
 	}
 	if n := calls.Load(); n != 2 {
 		t.Errorf("server saw %d requests, want the request sent again", n)
+	}
+}
+
+func TestRerankLogsOneModelCallAndCountsRetries(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	previous := zap.L()
+	zap.ReplaceGlobals(zap.New(core))
+	t.Cleanup(func() { zap.ReplaceGlobals(previous) })
+
+	p := modeltest.NewFakeProvider(t)
+	p.FailNext(modeltest.Rerank, http.StatusInternalServerError, 1)
+	r := reranker(t, p)
+
+	if _, err := r.Rerank(context.Background(), "secret query", []string{"secret document"}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries := logs.FilterMessage("model call").All()
+	if len(entries) != 1 {
+		t.Fatalf("logger saw %d model call lines, want 1", len(entries))
+	}
+	entry := entries[0]
+	fields := entry.ContextMap()
+	want := map[string]any{
+		"role":     "rerank",
+		"model":    model,
+		"protocol": "rerank",
+		"status":   "ok",
+		"attempts": int64(2),
+		// The fake counts one token per word in the query and documents.
+		"input_tokens": int64(4),
+	}
+	for k, v := range want {
+		if fields[k] != v {
+			t.Errorf("%s = %v, want %v", k, fields[k], v)
+		}
+	}
+	if _, ok := fields["output_tokens"]; ok {
+		t.Errorf("output_tokens = %v, want it omitted for rerank", fields["output_tokens"])
+	}
+	if s := fmt.Sprint(entry); strings.Contains(s, "secret query") || strings.Contains(s, "secret document") {
+		t.Errorf("the model call log carries the query or a document: %s", s)
+	}
+}
+
+// A reply without a usage object logs no token fields at all.
+func TestRerankLogsNoTokensWhenUsageIsAbsent(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	previous := zap.L()
+	zap.ReplaceGlobals(zap.New(core))
+	t.Cleanup(func() { zap.ReplaceGlobals(previous) })
+
+	base, _ := stub(t, map[string]any{"results": []any{result(0, 0.9)}})
+	r, err := New(role(base, model, key), WithRetry(api.Retry{MaxAttempts: 1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Rerank(context.Background(), "secret query", []string{"secret document"}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries := logs.FilterMessage("model call").All()
+	if len(entries) != 1 {
+		t.Fatalf("logger saw %d model call lines, want 1", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if _, ok := fields["input_tokens"]; ok {
+		t.Errorf("input_tokens = %v, want it omitted without usage", fields["input_tokens"])
+	}
+	if _, ok := fields["output_tokens"]; ok {
+		t.Errorf("output_tokens = %v, want it omitted without usage", fields["output_tokens"])
 	}
 }

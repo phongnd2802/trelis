@@ -8,14 +8,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"mime/multipart"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"github.com/phongnd2802/trelis/internal/application/repository"
 	"github.com/phongnd2802/trelis/internal/db"
 	werrors "github.com/phongnd2802/trelis/internal/errors"
+	"github.com/phongnd2802/trelis/internal/logger"
 	"github.com/phongnd2802/trelis/internal/types"
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
 	secutils "github.com/phongnd2802/trelis/internal/utils"
@@ -108,7 +109,8 @@ func (s *documentService) CreateDocumentFromFile(ctx context.Context,
 	})
 	if err != nil {
 		if deleteErr := s.fileSvc.DeleteFile(context.WithoutCancel(ctx), key); deleteErr != nil {
-			slog.ErrorContext(ctx, "delete source file after document creation failed", "key", key, "err", deleteErr)
+			logger.Ctx(ctx).Error("delete source file after document creation failed",
+				zap.String("key", key), zap.Error(deleteErr))
 		}
 		return nil, s.createErr(ctx, owner.ID, hash, err)
 	}
@@ -181,7 +183,8 @@ func (s *documentService) GetDocumentFile(ctx context.Context, id uuid.UUID) (*t
 	}
 	body, err := s.fileSvc.GetFile(ctx, doc.ObjectKey)
 	if errors.Is(err, interfaces.ErrFileNotFound) {
-		slog.ErrorContext(ctx, "source file missing from object storage", "document", doc.ID, "key", doc.ObjectKey)
+		logger.Ctx(ctx).Error("source file missing from object storage",
+			zap.Stringer("document", doc.ID), zap.String("key", doc.ObjectKey))
 		return nil, nil, errDocumentNotFound()
 	}
 	if err != nil {

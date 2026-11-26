@@ -12,8 +12,10 @@ package chat
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/phongnd2802/trelis/internal/config"
+	"github.com/phongnd2802/trelis/internal/logger"
 	"github.com/phongnd2802/trelis/internal/models/api"
 	"github.com/phongnd2802/trelis/internal/models/api/openaicompletions"
 	"github.com/phongnd2802/trelis/internal/models/api/openairesponses"
@@ -49,25 +51,112 @@ type Chat interface {
 }
 
 // NewChat builds the protocol client for one configured chat role
-// (models.chat, models.extraction or models.judge).
-func NewChat(role config.ChatRole) (Chat, error) {
+// (models.chat, models.extraction or models.judge). roleKey is that role's
+// config key, used only in the model-call log.
+func NewChat(roleKey string, role config.ChatRole) (Chat, error) {
 	endpoint, err := role.APIEndpoint("chat")
 	if err != nil {
 		return nil, err
 	}
 
+	var inner Chat
 	switch role.Protocol {
 	case api.APIOpenAICompletions:
-		return openaicompletions.New(openaicompletions.Config{
+		inner = openaicompletions.New(openaicompletions.Config{
 			Endpoint: endpoint,
 			Settings: api.DefaultOpenAICompletions(),
-		}), nil
+		})
 	case api.APIOpenAIResponses:
-		return openairesponses.New(openairesponses.Config{
+		inner = openairesponses.New(openairesponses.Config{
 			Endpoint: endpoint,
 			Settings: api.DefaultOpenAIResponses(),
-		}), nil
+		})
 	default:
 		return nil, fmt.Errorf("unsupported chat api %q for model %s", role.Protocol, role.Model)
 	}
+	return &loggingChat{roleKey: roleKey, protocol: role.Protocol, inner: inner}, nil
+}
+
+// loggingChat is a role's client with the one model-call line around each
+// logical call. A chat send is not retried by the clients, so attempts is 1.
+type loggingChat struct {
+	roleKey  string
+	protocol api.API
+	inner    Chat
+}
+
+func (c *loggingChat) GetModelName() string { return c.inner.GetModelName() }
+
+// call is the metadata every logging point shares.
+func (c *loggingChat) call(start time.Time, failed bool, httpStatus int) logger.ModelCall {
+	return logger.ModelCall{
+		Role:       c.roleKey,
+		Model:      c.GetModelName(),
+		Protocol:   string(c.protocol),
+		Duration:   time.Since(start),
+		Attempts:   1,
+		Failed:     failed,
+		HTTPStatus: httpStatus,
+	}
+}
+
+func (c *loggingChat) Chat(ctx context.Context, messages []Message, opts *ChatOptions) (*types.ChatResponse, error) {
+	start := time.Now()
+	resp, err := c.inner.Chat(ctx, messages, opts)
+	call := c.call(start, err != nil, api.HTTPStatusCode(err))
+	if err == nil && resp != nil {
+		call.HasUsage = resp.Usage.PromptTokens != 0 || resp.Usage.CompletionTokens != 0
+		call.HasOutputTokens = true
+		call.InputTokens = resp.Usage.PromptTokens
+		call.OutputTokens = resp.Usage.CompletionTokens
+	}
+	logger.LogModelCall(ctx, call)
+	return resp, err
+}
+
+func (c *loggingChat) ChatStream(ctx context.Context, messages []Message, opts *ChatOptions) (<-chan types.StreamResponse, error) {
+	start := time.Now()
+	inner, err := c.inner.ChatStream(ctx, messages, opts)
+	if err != nil {
+		logger.LogModelCall(ctx, c.call(start, true, api.HTTPStatusCode(err)))
+		return nil, err
+	}
+
+	out := make(chan types.StreamResponse)
+	go func() {
+		defer close(out)
+		var (
+			usage  *types.TokenUsage
+			failed bool
+		)
+	stream:
+		for resp := range inner {
+			if resp.ResponseType == types.ResponseTypeError {
+				failed = true
+			}
+			if resp.Done && resp.Usage != nil {
+				usage = resp.Usage
+			}
+			select {
+			case out <- resp:
+			case <-ctx.Done():
+				failed = true
+				// Drain so the protocol reader sees its own ctx and closes
+				// instead of staying parked on a channel nobody reads.
+				for range inner {
+				}
+				break stream
+			}
+		}
+
+		call := c.call(start, failed, 0)
+		if usage != nil {
+			call.HasUsage = true
+			call.HasOutputTokens = true
+			call.InputTokens = usage.PromptTokens
+			call.OutputTokens = usage.CompletionTokens
+		}
+		logger.LogModelCall(ctx, call)
+	}()
+	return out, nil
 }

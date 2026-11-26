@@ -120,4 +120,4 @@ jobs:
       - name: Ready again, no migration re-applied
         run: |
           curl -fsS --retry 15 --retry-delay 2 --retry-all-errors localhost:8080/readyz
-          docker compose logs --no-color trelis | grep 'postgres migrated' | tail -1 | tee /dev/stderr | grep -q 'applied=0'
+          docker compose logs --no-color trelis | grep 'postgres migrated' | tail -1 | tee /dev/stderr | grep -q '"applied":0'

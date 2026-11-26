@@ -5,7 +5,7 @@
 // net/http instead of gin, so a handler calls writeError where Omnisc calls
 // c.Error and lets middleware render; a non-AppError 500 says only "Internal
 // server error" (Omnisc's handlers often wrap err.Error() into it) and the
-// cause goes to slog. See NOTICE.
+// cause goes to internal/logger. See NOTICE.
 
 // Package handler turns HTTP requests into service calls and service
 // results into Omnisc's response envelope:
@@ -17,10 +17,13 @@ package handler
 
 import (
 	"encoding/json"
-	"log/slog"
 	"net/http"
 
+	"github.com/go-chi/chi/v5"
+	"go.uber.org/zap"
+
 	"github.com/phongnd2802/trelis/internal/errors"
+	"github.com/phongnd2802/trelis/internal/logger"
 	"github.com/phongnd2802/trelis/internal/types"
 )
 
@@ -78,11 +81,30 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 		}})
 		return
 	}
-	slog.ErrorContext(r.Context(), "request failed", "method", r.Method, "path", r.URL.Path, "err", err)
+	logger.Ctx(r.Context()).Error("request failed",
+		zap.String("method", r.Method),
+		zap.String("route", routePattern(r)),
+		zap.Error(err))
 	writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: ErrorBody{
 		Code:    errors.ErrInternalServer,
 		Message: "Internal server error",
 	}})
+}
+
+// unmatchedRoute stands in for the pattern of a request no route matched; the
+// raw path is never logged.
+const unmatchedRoute = "unmatched"
+
+func routePattern(r *http.Request) string {
+	rc := chi.RouteContext(r.Context())
+	if rc == nil {
+		return unmatchedRoute
+	}
+	route := rc.RoutePattern()
+	if route == "" || route == "/*" {
+		return unmatchedRoute
+	}
+	return route
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

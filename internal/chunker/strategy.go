@@ -1,8 +1,9 @@
 package chunker
 
 import (
-	"log/slog"
 	"strings"
+
+	"go.uber.org/zap"
 )
 
 // StrategyTier names one chunking implementation in a tier chain.
@@ -61,7 +62,7 @@ func resolveChain(cfg SplitterConfig) []StrategyTier {
 	case StrategyRecursive, "":
 	case StrategyAuto:
 	default:
-		slog.Warn("chunker: unknown strategy, using recursive", "strategy", cfg.Strategy)
+		zap.L().Warn("chunker: unknown strategy, using recursive", zap.String("strategy", string(cfg.Strategy)))
 	}
 	return []StrategyTier{TierRecursive}
 }
@@ -80,7 +81,7 @@ func runChain(text string, cfg SplitterConfig, chain []StrategyTier) ([]Chunk, *
 			return out, diag
 		}
 		diag.Rejected = append(diag.Rejected, TierRejection{Tier: tier, Reason: v.Reason})
-		slog.Debug("chunker: tier rejected", "tier", tier, "reason", v.Reason)
+		zap.L().Debug("chunker: tier rejected", zap.String("tier", string(tier)), zap.String("reason", v.Reason))
 	}
 	return out, diag
 }

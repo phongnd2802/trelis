@@ -2,10 +2,12 @@ package router
 
 import (
 	"errors"
-	"log/slog"
 	"net/http"
 	"strings"
 
+	"go.uber.org/zap"
+
+	"github.com/phongnd2802/trelis/internal/logger"
 	"github.com/phongnd2802/trelis/internal/types"
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
@@ -27,10 +29,11 @@ func authenticate(authn interfaces.AuthService) func(http.Handler) http.Handler 
 				return
 			}
 			if err != nil {
-				slog.ErrorContext(r.Context(), "authenticate", "err", err)
+				logger.Ctx(r.Context()).Error("authenticate", zap.Error(err))
 				writeError(w, http.StatusInternalServerError, "could not check API key")
 				return
 			}
+			recordPrincipal(r.Context(), p)
 			next.ServeHTTP(w, r.WithContext(types.WithPrincipal(r.Context(), p)))
 		})
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -13,6 +14,15 @@ import (
 	"github.com/phongnd2802/trelis/internal/db/dbtest"
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
+
+func TestAdminLogsGoToStderr(t *testing.T) {
+	if got := logOutput(true); got != os.Stderr {
+		t.Errorf("admin log writer = %T, want stderr", got)
+	}
+	if got := logOutput(false); got != os.Stdout {
+		t.Errorf("server log writer = %T, want stdout", got)
+	}
+}
 
 // services is what the admin commands run through, plus the AuthService to
 // check that the keys they print work.

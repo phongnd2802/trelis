@@ -28,6 +28,36 @@ func TestRetryDoRetriesWorthwhileFailures(t *testing.T) {
 	}
 }
 
+func TestRetryDoWithAttemptsCountsTheSends(t *testing.T) {
+	fail := &HTTPError{StatusCode: http.StatusInternalServerError}
+	r := Retry{MaxAttempts: 4, BaseDelay: time.Millisecond, MaxDelay: 2 * time.Millisecond}
+
+	sends := 0
+	attempts, err := r.DoWithAttempts(context.Background(), func(context.Context) error {
+		if sends++; sends < 3 {
+			return fail
+		}
+		return nil
+	})
+	if err != nil || attempts != 3 {
+		t.Errorf("DoWithAttempts = %d, %v, want 3, nil", attempts, err)
+	}
+
+	attempts, err = r.DoWithAttempts(context.Background(), func(context.Context) error {
+		return &HTTPError{StatusCode: http.StatusBadRequest}
+	})
+	if err == nil || attempts != 1 {
+		t.Errorf("DoWithAttempts on a 400 = %d, %v, want 1, the request's error", attempts, err)
+	}
+
+	attempts, err = r.DoWithAttempts(context.Background(), func(context.Context) error {
+		return fail
+	})
+	if err == nil || attempts != 4 {
+		t.Errorf("DoWithAttempts after every attempt failed = %d, %v, want 4, the last error", attempts, err)
+	}
+}
+
 // A 4xx other than a rate limit is the request's own fault: sending it again
 // would fail the same way.
 func TestRetryDoSendsANonRetryableFailureBackAtOnce(t *testing.T) {

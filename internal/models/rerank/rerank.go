@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/phongnd2802/trelis/internal/config"
+	"github.com/phongnd2802/trelis/internal/logger"
 	"github.com/phongnd2802/trelis/internal/models/api"
 )
 
@@ -84,12 +85,35 @@ func (c *client) Rerank(ctx context.Context, query string, documents []string) (
 	if len(documents) == 0 {
 		return nil, nil
 	}
-	var scores []float64
-	err := c.retry.Do(ctx, func(ctx context.Context) error {
-		var err error
-		scores, err = c.send(ctx, query, documents)
-		return err
+	start := time.Now()
+	var (
+		scores []float64
+		used   *usage
+	)
+	attempts, err := c.retry.DoWithAttempts(ctx, func(ctx context.Context) error {
+		got, gotUsage, err := c.send(ctx, query, documents)
+		if err != nil {
+			return err
+		}
+		// Keep only the successful attempt's accounting: a retried attempt's
+		// usage was not billed as part of this line.
+		scores, used = got, gotUsage
+		return nil
 	})
+	call := logger.ModelCall{
+		Role:       "rerank",
+		Model:      c.endpoint.Model,
+		Protocol:   "rerank",
+		Duration:   time.Since(start),
+		Attempts:   attempts,
+		Failed:     err != nil,
+		HTTPStatus: api.HTTPStatusCode(err),
+	}
+	if used != nil {
+		call.HasUsage = true
+		call.InputTokens = used.TotalTokens
+	}
+	logger.LogModelCall(ctx, call)
 	if err != nil {
 		return nil, err
 	}
@@ -97,8 +121,8 @@ func (c *client) Rerank(ctx context.Context, query string, documents []string) (
 }
 
 // send posts one rerank request and returns its scores in the documents'
-// order.
-func (c *client) send(ctx context.Context, query string, documents []string) ([]float64, error) {
+// order and the vendor's token accounting, when the reply carries it.
+func (c *client) send(ctx context.Context, query string, documents []string) ([]float64, *usage, error) {
 	body := requestBody{
 		Model:     c.endpoint.Model,
 		Query:     query,
@@ -111,7 +135,7 @@ func (c *client) send(ctx context.Context, query string, documents []string) ([]
 	}
 	raw, err := c.endpoint.PostJSON(ctx, defaultPath, body, c.timeout)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	return scoresOf(raw, len(documents))
 }
@@ -125,12 +149,19 @@ type requestBody struct {
 	ReturnDocuments bool     `json:"return_documents"`
 }
 
+// usage is the vendor's token accounting for one rerank request. A nil *usage
+// means the reply carried none.
+type usage struct {
+	TotalTokens int `json:"total_tokens"`
+}
+
 // responseBody is the Jina/Cohere rerank reply.
 type responseBody struct {
 	Results []struct {
 		Index          int     `json:"index"`
 		RelevanceScore float64 `json:"relevance_score"`
 	} `json:"results"`
+	Usage *usage `json:"usage"`
 	// Error carries the vendor's message when a gateway answers 200 with an
 	// error instead of a status code.
 	Error *struct {
@@ -140,33 +171,34 @@ type responseBody struct {
 
 // scoresOf reads a reply to a request for want documents and puts its scores
 // in the documents' order: a provider numbers each result with the index of
-// the document it belongs to and may answer in any order.
-func scoresOf(raw []byte, want int) ([]float64, error) {
+// the document it belongs to and may answer in any order. The usage pointer is
+// nil when the reply carries no usage object.
+func scoresOf(raw []byte, want int) ([]float64, *usage, error) {
 	var body responseBody
 	if err := json.Unmarshal(raw, &body); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+		return nil, nil, fmt.Errorf("decode response: %w", err)
 	}
 	if body.Error != nil && body.Error.Message != "" {
-		return nil, fmt.Errorf("API error: %s", body.Error.Message)
+		return nil, nil, fmt.Errorf("API error: %s", body.Error.Message)
 	}
 	// A reply that does not carry one score per document is not an answer to
 	// this request. It would come back the same way every time, so sending the
 	// request again cannot help.
 	if len(body.Results) != want {
-		return nil, fmt.Errorf("response carries %d results, want %d", len(body.Results), want)
+		return nil, nil, fmt.Errorf("response carries %d results, want %d", len(body.Results), want)
 	}
 	scores := make([]float64, want)
 	seen := make([]bool, want)
 	for _, result := range body.Results {
 		if result.Index < 0 || result.Index >= want || seen[result.Index] {
-			return nil, fmt.Errorf("response index %d is not one of 0..%d, or comes twice", result.Index, want-1)
+			return nil, nil, fmt.Errorf("response index %d is not one of 0..%d, or comes twice", result.Index, want-1)
 		}
 		// A score that is not a number cannot order anything.
 		if math.IsNaN(result.RelevanceScore) || math.IsInf(result.RelevanceScore, 0) {
-			return nil, fmt.Errorf("score %d is not a finite number", result.Index)
+			return nil, nil, fmt.Errorf("score %d is not a finite number", result.Index)
 		}
 		seen[result.Index] = true
 		scores[result.Index] = result.RelevanceScore
 	}
-	return scores, nil
+	return scores, body.Usage, nil
 }
