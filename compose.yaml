@@ -13,6 +13,9 @@
 #   docker compose run --rm trelis admin key create alice   # prints <id> <key>
 # then send the key as "Authorization: Bearer <key>", e.g. GET /me.
 # `admin key list alice` and `admin key revoke <id>` manage keys afterwards.
+# Upload a Document readable by alice, bob and the tax Group with:
+#   curl -H "Authorization: Bearer <key>" -F file=@luat.pdf \
+#        -F principals=bob -F groups=tax localhost:8080/documents
 
 name: trelis
 
@@ -36,5 +39,13 @@ services:
       TRELIS_NEO4J_HOST: neo4j
       TRELIS_NEO4J_PASSWORD: ${NEO4J_PASSWORD:-trelis-dev}
       TRELIS_TEMPORAL_HOST: temporal
+      TRELIS_STORAGE_LOCAL_DIR: /data/files
+    volumes:
+      # Uploaded files; the image creates /data/files owned by nonroot, so
+      # a fresh volume starts writable.
+      - files:/data/files
     ports: ["127.0.0.1:8080:8080"]
     restart: on-failure
+
+volumes:
+  files:

@@ -52,7 +52,7 @@ func get(t *testing.T, h http.Handler, path, authorization string) *httptest.Res
 }
 
 func TestMeReturnsTheCallingPrincipalAndGroups(t *testing.T) {
-	h := New(Readiness{}, keyring{"trelis_alice": alice})
+	h := New(Readiness{}, keyring{"trelis_alice": alice}, nil)
 	rec := get(t, h, "/me", "Bearer trelis_alice")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /me = %d %s, want 200", rec.Code, rec.Body)
@@ -66,7 +66,7 @@ func TestMeReturnsTheCallingPrincipalAndGroups(t *testing.T) {
 }
 
 func TestRequestsWithoutAValidKeyAre401(t *testing.T) {
-	h := New(Readiness{}, keyring{"trelis_alice": alice})
+	h := New(Readiness{}, keyring{"trelis_alice": alice}, nil)
 	for _, authz := range []string{"", "Bearer", "Bearer ", "Bearer trelis_wrong", "Basic trelis_alice", "trelis_alice"} {
 		rec := get(t, h, "/me", authz)
 		if rec.Code != http.StatusUnauthorized {
@@ -84,14 +84,14 @@ func TestRequestsWithoutAValidKeyAre401(t *testing.T) {
 }
 
 func TestAnAuthenticatorFailureIs500Not401(t *testing.T) {
-	rec := get(t, New(Readiness{}, failing{}), "/me", "Bearer trelis_alice")
+	rec := get(t, New(Readiness{}, failing{}, nil), "/me", "Bearer trelis_alice")
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500 when the key cannot be checked", rec.Code)
 	}
 }
 
 func TestProbesNeedNoKey(t *testing.T) {
-	h := New(Readiness{}, keyring{})
+	h := New(Readiness{}, keyring{}, nil)
 	for _, path := range []string{"/healthz", "/readyz"} {
 		if rec := get(t, h, path, ""); rec.Code != http.StatusOK {
 			t.Errorf("GET %s without a key = %d, want 200", path, rec.Code)

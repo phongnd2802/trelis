@@ -29,6 +29,7 @@ type Config struct {
 	Postgres Postgres `mapstructure:"postgres"`
 	Neo4j    Neo4j    `mapstructure:"neo4j"`
 	Temporal Temporal `mapstructure:"temporal"`
+	Storage  Storage  `mapstructure:"storage"`
 	Models   Models   `mapstructure:"models"`
 }
 
@@ -61,6 +62,9 @@ var defaults = map[string]any{
 	"temporal.host":      "localhost",
 	"temporal.port":      7233,
 	"temporal.namespace": "default",
+
+	"storage.local_dir":        "data/files",
+	"storage.max_file_size_mb": 50,
 }
 
 var sslModes = []string{"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
@@ -152,6 +156,10 @@ func (c *Config) validate() error {
 	port("temporal.port", c.Temporal.Port)
 	required("temporal.namespace", c.Temporal.Namespace)
 
+	required("storage.local_dir", c.Storage.LocalDir)
+	if c.Storage.MaxFileSizeMB < 1 {
+		errs = append(errs, fmt.Errorf("storage.max_file_size_mb must be at least 1, got %d", c.Storage.MaxFileSizeMB))
+	}
 	errs = append(errs, c.Models.validate()...)
 
 	return errors.Join(errs...)

@@ -18,6 +18,30 @@ type ApiKey struct {
 	RevokedAt   *time.Time
 }
 
+type Document struct {
+	ID          uuid.UUID
+	OwnerID     uuid.UUID
+	Title       string
+	FileName    string
+	FileType    string
+	FileSize    int64
+	FileHash    string
+	FilePath    string
+	ParseStatus string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+type DocumentGroup struct {
+	DocumentID uuid.UUID
+	GroupID    uuid.UUID
+}
+
+type DocumentPrincipal struct {
+	DocumentID  uuid.UUID
+	PrincipalID uuid.UUID
+}
+
 type Group struct {
 	ID        uuid.UUID
 	Name      string

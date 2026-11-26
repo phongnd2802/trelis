@@ -25,6 +25,27 @@ Files and parts (paths in this repository):
       from cli/internal/testutil/xdg.go; the scripted replay (Script) and its
       "unexpected extra call" failure, from scriptedTemplateChatModel in
       internal/application/service/wiki_page_rewrite_continuation_test.go
+    internal/errors/errors.go
+      from internal/errors/errors.go
+    internal/types/pagination.go
+      from internal/types/search.go (Pagination, PageResult)
+    internal/types/interfaces/file.go
+      from internal/types/interfaces/file.go
+    internal/application/service/file/local.go
+      from internal/application/service/file/local.go
+    internal/application/service/document_util.go
+      from internal/application/service/knowledge_util.go
+    internal/utils/security.go
+      from internal/utils/security.go
+    internal/utils/import_filetypes.go
+      from internal/utils/import_filetypes.go
+    internal/handler/response.go
+      from internal/middleware/error_handler.go and
+      internal/handler/swagger_response.go
+    internal/handler/document.go (helpers)
+      from internal/handler/knowledge.go and internal/handler/upload_limit.go
+    internal/types/document.go (duplicate error)
+      from internal/types/errors.go
 
   Derived (trimmed to the parts Trelis uses):
     internal/types/chat.go

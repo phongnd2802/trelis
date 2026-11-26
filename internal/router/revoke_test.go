@@ -24,7 +24,7 @@ func TestARevokedKeyGets401OnTheNextRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := New(Readiness{}, store)
+	h := New(Readiness{}, store, nil)
 
 	if rec := get(t, h, "/me", "Bearer "+leakedKey); rec.Code != http.StatusOK {
 		t.Fatalf("before revoke: GET /me = %d, want 200", rec.Code)

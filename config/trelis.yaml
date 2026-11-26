@@ -27,6 +27,12 @@ temporal:
   port: 7233
   namespace: default
 
+storage:
+  # Uploaded files, relative to the working directory (compose mounts a
+  # volume at /data/files and sets TRELIS_STORAGE_LOCAL_DIR).
+  local_dir: data/files
+  max_file_size_mb: 50
+
 # Model roles. Each role points at its own OpenAI-compatible provider
 # (base_url, model, api_key); a role left empty is unconfigured. Keep keys
 # out of this file: set TRELIS_MODELS_<ROLE>_API_KEY instead.
