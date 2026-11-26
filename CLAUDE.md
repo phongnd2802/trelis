@@ -20,7 +20,7 @@ The daemon listens on `http://127.0.0.1:4170` (loopback, no token). Don't send `
 
 1. Check `qwen daemon status` lists a running daemon for this repo. If none, ask the user to run `qwen serve` in the repo; don't start it yourself.
 2. Get the session: `POST /session` with `{"cwd": "<repo root>"}` returns `sessionId` (the workspace shares one session). Set `POST /session/$ID/approval-mode` `{"mode":"auto"}`. Tell the user the id so they can watch with `qwen attach --session $ID` or the Web Shell at `http://127.0.0.1:4170/`.
-3. Before every prompt, check `GET /session/$ID/status` is idle (`hasActivePrompt: false`, `pendingPromptCount: 0`) and ask the user whether they already sent Qwen this work: they may be driving the same session.
+3. Before every prompt, check `GET /session/$ID/status` is idle (`hasActivePrompt: false`, `pendingPromptCount: 0`), then send it straight away without asking the user. If the session is busy, wait for it to go idle.
 4. Send the brief or the findings: build `{"prompt":[{"type":"text","text":"..."}]}` with `jq --rawfile` and `POST /session/$ID/prompt`. It returns at once with a `promptId`.
 5. Wait with Monitor until status shows no active or pending prompt. If `isWaitingForPermission` or `isWaitingForUserQuestion` is true, tell the user. Never vote on a permission yourself. To stop a run: `POST /session/$ID/cancel`.
 6. If the daemon isn't available and the user doesn't want to start it, fall back to headless: `qwen --session-id "$SID" --approval-mode auto --max-wall-time 30m "<brief>"`, then `qwen --resume "$SID" ...` for the fix rounds.
