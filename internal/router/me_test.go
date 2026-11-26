@@ -10,34 +10,44 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/phongnd2802/trelis/internal/auth"
+	"github.com/phongnd2802/trelis/internal/application/service"
+	"github.com/phongnd2802/trelis/internal/handler"
+	"github.com/phongnd2802/trelis/internal/types"
+	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
 
-// keyring is an Authenticator over a fixed key → Principal map.
-type keyring map[string]auth.Principal
+// keyring is an AuthService over a fixed key → Principal map.
+type keyring map[string]types.Principal
 
-func (k keyring) Authenticate(_ context.Context, key string) (auth.Principal, error) {
+func (k keyring) Authenticate(_ context.Context, key string) (types.Principal, error) {
 	p, ok := k[key]
 	if !ok {
-		return auth.Principal{}, auth.ErrUnauthenticated
+		return types.Principal{}, interfaces.ErrUnauthenticated
 	}
 	return p, nil
 }
 
-// failing is an Authenticator whose backing store is down.
+// failing is an AuthService whose backing store is down.
 type failing struct{}
 
-func (failing) Authenticate(context.Context, string) (auth.Principal, error) {
-	return auth.Principal{}, errors.New("connection refused")
+func (failing) Authenticate(context.Context, string) (types.Principal, error) {
+	return types.Principal{}, errors.New("connection refused")
 }
 
-var alice = auth.Principal{
+var alice = types.Principal{
 	ID:   uuid.MustParse("0190d2a8-0000-7000-8000-000000000001"),
 	Name: "alice",
-	Groups: []auth.Group{
+	Groups: []types.Group{
 		{ID: uuid.MustParse("0190d2a8-0000-7000-8000-0000000000a1"), Name: "legal"},
 		{ID: uuid.MustParse("0190d2a8-0000-7000-8000-0000000000a2"), Name: "tax"},
 	},
+}
+
+// newRouter is the router on authn. GET /me reads only the request context,
+// so its PrincipalService needs no repositories.
+func newRouter(authn interfaces.AuthService) http.Handler {
+	me := handler.NewPrincipalHandler(service.NewPrincipalService(nil, nil, nil))
+	return New(Readiness{}, authn, me, nil)
 }
 
 func get(t *testing.T, h http.Handler, path, authorization string) *httptest.ResponseRecorder {
@@ -52,7 +62,7 @@ func get(t *testing.T, h http.Handler, path, authorization string) *httptest.Res
 }
 
 func TestMeReturnsTheCallingPrincipalAndGroups(t *testing.T) {
-	h := New(Readiness{}, keyring{"trelis_alice": alice}, nil)
+	h := newRouter(keyring{"trelis_alice": alice})
 	rec := get(t, h, "/me", "Bearer trelis_alice")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /me = %d %s, want 200", rec.Code, rec.Body)
@@ -66,7 +76,7 @@ func TestMeReturnsTheCallingPrincipalAndGroups(t *testing.T) {
 }
 
 func TestRequestsWithoutAValidKeyAre401(t *testing.T) {
-	h := New(Readiness{}, keyring{"trelis_alice": alice}, nil)
+	h := newRouter(keyring{"trelis_alice": alice})
 	for _, authz := range []string{"", "Bearer", "Bearer ", "Bearer trelis_wrong", "Basic trelis_alice", "trelis_alice"} {
 		rec := get(t, h, "/me", authz)
 		if rec.Code != http.StatusUnauthorized {
@@ -84,14 +94,14 @@ func TestRequestsWithoutAValidKeyAre401(t *testing.T) {
 }
 
 func TestAnAuthenticatorFailureIs500Not401(t *testing.T) {
-	rec := get(t, New(Readiness{}, failing{}, nil), "/me", "Bearer trelis_alice")
+	rec := get(t, newRouter(failing{}), "/me", "Bearer trelis_alice")
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500 when the key cannot be checked", rec.Code)
 	}
 }
 
 func TestProbesNeedNoKey(t *testing.T) {
-	h := New(Readiness{}, keyring{}, nil)
+	h := newRouter(keyring{})
 	for _, path := range []string{"/healthz", "/readyz"} {
 		if rec := get(t, h, path, ""); rec.Code != http.StatusOK {
 			t.Errorf("GET %s without a key = %d, want 200", path, rec.Code)

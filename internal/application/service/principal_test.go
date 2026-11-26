@@ -1,4 +1,4 @@
-package auth_test
+package service_test
 
 import (
 	"context"
@@ -7,24 +7,45 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/phongnd2802/trelis/internal/auth"
+	"github.com/phongnd2802/trelis/internal/application/repository"
+	"github.com/phongnd2802/trelis/internal/application/service"
+	"github.com/phongnd2802/trelis/internal/db"
 	"github.com/phongnd2802/trelis/internal/db/dbtest"
+	"github.com/phongnd2802/trelis/internal/types"
+	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
 
-func newStore(t *testing.T) *auth.Store {
+// services is the Principal and Auth services on one database, so a test can
+// issue a key and then authenticate with it.
+type services struct {
+	interfaces.PrincipalService
+	interfaces.AuthService
+}
+
+func newServicesOn(pool *pgxpool.Pool) services {
+	store := db.NewStore(pool)
+	principals, keys := repository.NewPrincipalRepository(store), repository.NewAPIKeyRepository(store)
+	return services{
+		PrincipalService: service.NewPrincipalService(store, principals, keys),
+		AuthService:      service.NewAuthService(principals, keys),
+	}
+}
+
+func newServices(t *testing.T) services {
 	t.Helper()
-	return auth.NewStore(dbtest.Migrated(t))
+	return newServicesOn(dbtest.Migrated(t))
 }
 
 func TestAKeyAuthenticatesAsItsPrincipal(t *testing.T) {
-	s := newStore(t)
+	s := newServices(t)
 	ctx := context.Background()
 	alice, err := s.CreatePrincipal(ctx, "alice")
 	if err != nil {
 		t.Fatalf("CreatePrincipal: %v", err)
 	}
-	_, key, err := s.CreateKey(ctx, "alice")
+	_, key, err := s.CreateAPIKey(ctx, "alice")
 	if err != nil {
 		t.Fatalf("CreateKey: %v", err)
 	}
@@ -39,25 +60,25 @@ func TestAKeyAuthenticatesAsItsPrincipal(t *testing.T) {
 }
 
 func TestAnUnknownKeyIsUnauthenticated(t *testing.T) {
-	s := newStore(t)
+	s := newServices(t)
 	ctx := context.Background()
 	if _, err := s.CreatePrincipal(ctx, "alice"); err != nil {
 		t.Fatal(err)
 	}
-	_, key, err := s.CreateKey(ctx, "alice")
+	_, key, err := s.CreateAPIKey(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	for _, bad := range []string{"", "trelis_nope", key + "x"} {
-		if _, err := s.Authenticate(ctx, bad); !errors.Is(err, auth.ErrUnauthenticated) {
+		if _, err := s.Authenticate(ctx, bad); !errors.Is(err, interfaces.ErrUnauthenticated) {
 			t.Errorf("Authenticate(%q) err = %v, want ErrUnauthenticated", bad, err)
 		}
 	}
 }
 
 func TestAuthenticateReturnsThePrincipalsGroups(t *testing.T) {
-	s := newStore(t)
+	s := newServices(t)
 	ctx := context.Background()
 	for _, name := range []string{"alice", "bob"} {
 		if _, err := s.CreatePrincipal(ctx, name); err != nil {
@@ -75,7 +96,7 @@ func TestAuthenticateReturnsThePrincipalsGroups(t *testing.T) {
 		}
 	}
 
-	_, aliceKey, err := s.CreateKey(ctx, "alice")
+	_, aliceKey, err := s.CreateAPIKey(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,12 +110,12 @@ func TestAuthenticateReturnsThePrincipalsGroups(t *testing.T) {
 }
 
 func TestAPrincipalWithNoGroupsHasAnEmptyList(t *testing.T) {
-	s := newStore(t)
+	s := newServices(t)
 	ctx := context.Background()
 	if _, err := s.CreatePrincipal(ctx, "carol"); err != nil {
 		t.Fatal(err)
 	}
-	_, key, err := s.CreateKey(ctx, "carol")
+	_, key, err := s.CreateAPIKey(ctx, "carol")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +129,7 @@ func TestAPrincipalWithNoGroupsHasAnEmptyList(t *testing.T) {
 }
 
 func TestAddMemberRejectsUnknownNames(t *testing.T) {
-	s := newStore(t)
+	s := newServices(t)
 	ctx := context.Background()
 	if _, err := s.CreatePrincipal(ctx, "alice"); err != nil {
 		t.Fatal(err)
@@ -116,18 +137,18 @@ func TestAddMemberRejectsUnknownNames(t *testing.T) {
 	if _, err := s.CreateGroup(ctx, "tax"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AddMember(ctx, "nope", "alice"); !errors.Is(err, auth.ErrNotFound) {
-		t.Errorf("unknown group: err = %v, want ErrNotFound", err)
+	if err := s.AddMember(ctx, "nope", "alice"); !errors.Is(err, repository.ErrGroupNotFound) {
+		t.Errorf("unknown group: err = %v, want ErrGroupNotFound", err)
 	}
-	if err := s.AddMember(ctx, "tax", "nope"); !errors.Is(err, auth.ErrNotFound) {
-		t.Errorf("unknown principal: err = %v, want ErrNotFound", err)
+	if err := s.AddMember(ctx, "tax", "nope"); !errors.Is(err, repository.ErrPrincipalNotFound) {
+		t.Errorf("unknown principal: err = %v, want ErrPrincipalNotFound", err)
 	}
-	if _, _, err := s.CreateKey(ctx, "nope"); !errors.Is(err, auth.ErrNotFound) {
-		t.Errorf("key for unknown principal: err = %v, want ErrNotFound", err)
+	if _, _, err := s.CreateAPIKey(ctx, "nope"); !errors.Is(err, repository.ErrPrincipalNotFound) {
+		t.Errorf("key for unknown principal: err = %v, want ErrPrincipalNotFound", err)
 	}
 }
 
-func groupNames(p auth.Principal) []string {
+func groupNames(p types.Principal) []string {
 	names := make([]string, 0, len(p.Groups))
 	for _, g := range p.Groups {
 		names = append(names, g.Name)
@@ -137,12 +158,12 @@ func groupNames(p auth.Principal) []string {
 
 func TestKeysAreStoredHashed(t *testing.T) {
 	pool := dbtest.Migrated(t)
-	s := auth.NewStore(pool)
+	s := newServicesOn(pool)
 	ctx := context.Background()
 	if _, err := s.CreatePrincipal(ctx, "alice"); err != nil {
 		t.Fatal(err)
 	}
-	_, key, err := s.CreateKey(ctx, "alice")
+	_, key, err := s.CreateAPIKey(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,41 +185,41 @@ func TestKeysAreStoredHashed(t *testing.T) {
 }
 
 func TestNamesAreUnique(t *testing.T) {
-	s := newStore(t)
+	s := newServices(t)
 	ctx := context.Background()
 	if _, err := s.CreatePrincipal(ctx, "alice"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CreatePrincipal(ctx, "alice"); !errors.Is(err, auth.ErrExists) {
-		t.Errorf("second principal alice: err = %v, want ErrExists", err)
+	if _, err := s.CreatePrincipal(ctx, "alice"); !errors.Is(err, repository.ErrPrincipalExists) {
+		t.Errorf("second principal alice: err = %v, want ErrPrincipalExists", err)
 	}
 	if _, err := s.CreateGroup(ctx, "tax"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CreateGroup(ctx, "tax"); !errors.Is(err, auth.ErrExists) {
-		t.Errorf("second group tax: err = %v, want ErrExists", err)
+	if _, err := s.CreateGroup(ctx, "tax"); !errors.Is(err, repository.ErrGroupExists) {
+		t.Errorf("second group tax: err = %v, want ErrGroupExists", err)
 	}
 }
 
 func TestARevokedKeyNoLongerAuthenticates(t *testing.T) {
-	s := newStore(t)
+	s := newServices(t)
 	ctx := context.Background()
 	if _, err := s.CreatePrincipal(ctx, "alice"); err != nil {
 		t.Fatal(err)
 	}
-	leaked, leakedKey, err := s.CreateKey(ctx, "alice")
+	leaked, leakedKey, err := s.CreateAPIKey(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, otherKey, err := s.CreateKey(ctx, "alice")
+	_, otherKey, err := s.CreateAPIKey(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := s.RevokeKey(ctx, leaked.ID); err != nil {
+	if err := s.RevokeAPIKey(ctx, leaked.ID); err != nil {
 		t.Fatalf("RevokeKey: %v", err)
 	}
-	if _, err := s.Authenticate(ctx, leakedKey); !errors.Is(err, auth.ErrUnauthenticated) {
+	if _, err := s.Authenticate(ctx, leakedKey); !errors.Is(err, interfaces.ErrUnauthenticated) {
 		t.Errorf("revoked key: err = %v, want ErrUnauthenticated", err)
 	}
 	if p, err := s.Authenticate(ctx, otherKey); err != nil || p.Name != "alice" {
@@ -207,29 +228,29 @@ func TestARevokedKeyNoLongerAuthenticates(t *testing.T) {
 }
 
 func TestListKeysShowsEachKeyAndWhetherItIsRevoked(t *testing.T) {
-	s := newStore(t)
+	s := newServices(t)
 	ctx := context.Background()
 	for _, name := range []string{"alice", "bob"} {
 		if _, err := s.CreatePrincipal(ctx, name); err != nil {
 			t.Fatal(err)
 		}
 	}
-	first, _, err := s.CreateKey(ctx, "alice")
+	first, _, err := s.CreateAPIKey(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, _, err := s.CreateKey(ctx, "alice")
+	second, _, err := s.CreateAPIKey(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.CreateKey(ctx, "bob"); err != nil {
+	if _, _, err := s.CreateAPIKey(ctx, "bob"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RevokeKey(ctx, first.ID); err != nil {
+	if err := s.RevokeAPIKey(ctx, first.ID); err != nil {
 		t.Fatal(err)
 	}
 
-	keys, err := s.ListKeys(ctx, "alice")
+	keys, err := s.ListAPIKeys(ctx, "alice")
 	if err != nil {
 		t.Fatalf("ListKeys: %v", err)
 	}
@@ -243,32 +264,32 @@ func TestListKeysShowsEachKeyAndWhetherItIsRevoked(t *testing.T) {
 		t.Errorf("CreatedAt = %v, want %v from CreateKey", keys[1].CreatedAt, second.CreatedAt)
 	}
 
-	if _, err := s.ListKeys(ctx, "ghost"); !errors.Is(err, auth.ErrNotFound) {
-		t.Errorf("ListKeys(ghost) err = %v, want ErrNotFound", err)
+	if _, err := s.ListAPIKeys(ctx, "ghost"); !errors.Is(err, repository.ErrPrincipalNotFound) {
+		t.Errorf("ListAPIKeys(ghost) err = %v, want ErrPrincipalNotFound", err)
 	}
 }
 
 func TestRevokingTwiceKeepsTheFirstRevocation(t *testing.T) {
-	s := newStore(t)
+	s := newServices(t)
 	ctx := context.Background()
 	if _, err := s.CreatePrincipal(ctx, "alice"); err != nil {
 		t.Fatal(err)
 	}
-	k, _, err := s.CreateKey(ctx, "alice")
+	k, _, err := s.CreateAPIKey(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RevokeKey(ctx, k.ID); err != nil {
+	if err := s.RevokeAPIKey(ctx, k.ID); err != nil {
 		t.Fatal(err)
 	}
-	before, err := s.ListKeys(ctx, "alice")
+	before, err := s.ListAPIKeys(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RevokeKey(ctx, k.ID); err != nil {
+	if err := s.RevokeAPIKey(ctx, k.ID); err != nil {
 		t.Fatalf("second RevokeKey: %v, want a no-op", err)
 	}
-	after, err := s.ListKeys(ctx, "alice")
+	after, err := s.ListAPIKeys(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,8 +299,20 @@ func TestRevokingTwiceKeepsTheFirstRevocation(t *testing.T) {
 }
 
 func TestRevokingAnUnknownKeyIsNotFound(t *testing.T) {
-	s := newStore(t)
-	if err := s.RevokeKey(context.Background(), uuid.New()); !errors.Is(err, auth.ErrNotFound) {
-		t.Errorf("err = %v, want ErrNotFound", err)
+	s := newServices(t)
+	if err := s.RevokeAPIKey(context.Background(), uuid.New()); !errors.Is(err, repository.ErrAPIKeyNotFound) {
+		t.Errorf("err = %v, want ErrAPIKeyNotFound", err)
+	}
+}
+
+func TestGetCurrentPrincipalIsTheAuthenticatedOne(t *testing.T) {
+	s := newServices(t)
+	alice := types.Principal{ID: uuid.New(), Name: "alice", Groups: []types.Group{}}
+	got, err := s.GetCurrentPrincipal(types.WithPrincipal(context.Background(), alice))
+	if err != nil || got.ID != alice.ID || got.Name != "alice" {
+		t.Errorf("GetCurrentPrincipal = %+v, %v; want alice", got, err)
+	}
+	if _, err := s.GetCurrentPrincipal(context.Background()); err == nil {
+		t.Error("GetCurrentPrincipal without a Principal in ctx succeeded")
 	}
 }

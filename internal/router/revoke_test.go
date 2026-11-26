@@ -5,31 +5,32 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/phongnd2802/trelis/internal/auth"
+	"github.com/phongnd2802/trelis/internal/db"
 	"github.com/phongnd2802/trelis/internal/db/dbtest"
+	"github.com/phongnd2802/trelis/internal/handler"
 )
 
 // Against the real store: revocation takes effect on the very next request.
 func TestARevokedKeyGets401OnTheNextRequest(t *testing.T) {
-	store := auth.NewStore(dbtest.Migrated(t))
+	authn, store := realAuth(db.NewStore(dbtest.Migrated(t)))
 	ctx := context.Background()
 	if _, err := store.CreatePrincipal(ctx, "alice"); err != nil {
 		t.Fatal(err)
 	}
-	leaked, leakedKey, err := store.CreateKey(ctx, "alice")
+	leaked, leakedKey, err := store.CreateAPIKey(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, otherKey, err := store.CreateKey(ctx, "alice")
+	_, otherKey, err := store.CreateAPIKey(ctx, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := New(Readiness{}, store, nil)
+	h := New(Readiness{}, authn, handler.NewPrincipalHandler(store), nil)
 
 	if rec := get(t, h, "/me", "Bearer "+leakedKey); rec.Code != http.StatusOK {
 		t.Fatalf("before revoke: GET /me = %d, want 200", rec.Code)
 	}
-	if err := store.RevokeKey(ctx, leaked.ID); err != nil {
+	if err := store.RevokeAPIKey(ctx, leaked.ID); err != nil {
 		t.Fatal(err)
 	}
 	if rec := get(t, h, "/me", "Bearer "+leakedKey); rec.Code != http.StatusUnauthorized {

@@ -9,7 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/phongnd2802/trelis/internal/auth"
+	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
 
 // adminUsage is printed for `server admin` with bad arguments.
@@ -28,8 +28,8 @@ const adminUsage = `usage: server [-config file] admin <command>
 // errUsage marks a bad admin command line.
 var errUsage = errors.New(adminUsage)
 
-// admin runs one operator command against s and writes its result to out.
-func admin(ctx context.Context, s *auth.Store, args []string, out io.Writer) error {
+// admin runs one operator command through s and writes its result to out.
+func admin(ctx context.Context, s interfaces.PrincipalService, args []string, out io.Writer) error {
 	cmd, rest := "", args
 	if len(args) >= 2 {
 		cmd, rest = args[0]+" "+args[1], args[2:]
@@ -71,7 +71,7 @@ func admin(ctx context.Context, s *auth.Store, args []string, out io.Writer) err
 		if err := need(1); err != nil {
 			return err
 		}
-		issued, key, err := s.CreateKey(ctx, rest[0])
+		issued, key, err := s.CreateAPIKey(ctx, rest[0])
 		if err != nil {
 			return err
 		}
@@ -81,7 +81,7 @@ func admin(ctx context.Context, s *auth.Store, args []string, out io.Writer) err
 		if err := need(1); err != nil {
 			return err
 		}
-		keys, err := s.ListKeys(ctx, rest[0])
+		keys, err := s.ListAPIKeys(ctx, rest[0])
 		if err != nil {
 			return err
 		}
@@ -103,7 +103,7 @@ func admin(ctx context.Context, s *auth.Store, args []string, out io.Writer) err
 		if err != nil {
 			return fmt.Errorf("key ID %q: %w", rest[0], err)
 		}
-		return s.RevokeKey(ctx, id)
+		return s.RevokeAPIKey(ctx, id)
 	default:
 		return errUsage
 	}

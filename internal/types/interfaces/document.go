@@ -11,7 +11,7 @@ import (
 )
 
 // DocumentService is the Document use cases, always on behalf of the
-// Principal in ctx (auth.NewContext). It answers with *errors.AppError for
+// Principal in ctx (types.WithPrincipal). It answers with *errors.AppError for
 // anything the client should see, and *types.DuplicateDocumentError when the
 // caller already uploaded the same content.
 type DocumentService interface {

@@ -35,7 +35,6 @@ import (
 	"github.com/phongnd2802/trelis/internal/application/repository"
 	"github.com/phongnd2802/trelis/internal/application/service"
 	"github.com/phongnd2802/trelis/internal/application/service/file"
-	"github.com/phongnd2802/trelis/internal/auth"
 	"github.com/phongnd2802/trelis/internal/config"
 	"github.com/phongnd2802/trelis/internal/db"
 	"github.com/phongnd2802/trelis/internal/handler"
@@ -112,10 +111,12 @@ func run(configPath string, args []string) error {
 		return err
 	}
 	slog.Info("postgres migrated", "applied", applied)
-	store := auth.NewStore(pool)
+	dbStore := db.NewStore(pool)
+	principalRepo, keyRepo := repository.NewPrincipalRepository(dbStore), repository.NewAPIKeyRepository(dbStore)
+	principals := service.NewPrincipalService(dbStore, principalRepo, keyRepo)
 
 	if len(args) > 0 {
-		return admin(ctx, store, args[1:], os.Stdout)
+		return admin(ctx, principals, args[1:], os.Stdout)
 	}
 
 	graph, err := neo4j.NewDriver(cfg.Neo4j.URI(), neo4j.BasicAuth(cfg.Neo4j.User, cfg.Neo4j.Password, ""))
@@ -149,10 +150,9 @@ func run(configPath string, args []string) error {
 	if s3.CreateBucket {
 		ensureBucket(ctx, files)
 	}
-	dbStore := db.NewStore(pool)
 	docs := handler.NewDocumentHandler(
 		service.NewDocumentService(dbStore,
-			repository.NewDocumentRepository(dbStore), repository.NewPrincipalRepository(dbStore), files),
+			repository.NewDocumentRepository(dbStore), principalRepo, files),
 		cfg.Storage.MaxFileSize(),
 	)
 
@@ -172,7 +172,8 @@ func run(configPath string, args []string) error {
 	}
 	slog.Info("trelis listening", "addr", ln.Addr().String(), "config", configPath)
 
-	if err := router.Serve(ctx, ln, router.New(ready, store, docs), cfg.Server.ShutdownTimeout); err != nil {
+	if err := router.Serve(ctx, ln, router.New(ready, service.NewAuthService(principalRepo, keyRepo),
+		handler.NewPrincipalHandler(principals), docs), cfg.Server.ShutdownTimeout); err != nil {
 		return err
 	}
 	slog.Info("trelis stopped")
