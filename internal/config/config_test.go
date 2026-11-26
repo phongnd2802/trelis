@@ -181,6 +181,21 @@ func TestLoadDependencies(t *testing.T) {
 	if cfg.Temporal.Namespace != "trelis" {
 		t.Errorf("Temporal.Namespace = %q, want trelis", cfg.Temporal.Namespace)
 	}
+	if cfg.Temporal.TaskQueue != "trelis-ingest" {
+		t.Errorf("Temporal.TaskQueue = %q, want trelis-ingest", cfg.Temporal.TaskQueue)
+	}
+}
+
+func TestTemporalTaskQueueIsReadFromEnv(t *testing.T) {
+	t.Setenv("TRELIS_TEMPORAL_TASK_QUEUE", "ingest-test")
+
+	cfg, err := Load(writeConfig(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Temporal.TaskQueue != "ingest-test" {
+		t.Errorf("Temporal.TaskQueue = %q, want the env value ingest-test", cfg.Temporal.TaskQueue)
+	}
 }
 
 func TestLoadDependencyDefaults(t *testing.T) {
@@ -196,6 +211,9 @@ func TestLoadDependencyDefaults(t *testing.T) {
 	}
 	if got, want := cfg.Temporal.HostPort(), "localhost:7233"; got != want {
 		t.Errorf("default Temporal.HostPort() = %q, want %q", got, want)
+	}
+	if cfg.Temporal.TaskQueue != "trelis-ingest" {
+		t.Errorf("default Temporal.TaskQueue = %q, want trelis-ingest", cfg.Temporal.TaskQueue)
 	}
 	if cfg.Storage.MaxFileSize() != 50<<20 {
 		t.Errorf("default max file size = %d bytes, want 50 MB", cfg.Storage.MaxFileSize())
@@ -418,6 +436,7 @@ func TestLoadRejectsInvalidDependencies(t *testing.T) {
 		{"empty temporal host", map[string]string{"TRELIS_TEMPORAL_HOST": " "}, "temporal.host"},
 		{"temporal port zero", map[string]string{"TRELIS_TEMPORAL_PORT": "0"}, "temporal.port"},
 		{"empty temporal namespace", map[string]string{"TRELIS_TEMPORAL_NAMESPACE": " "}, "temporal.namespace"},
+		{"empty temporal task queue", map[string]string{"TRELIS_TEMPORAL_TASK_QUEUE": " "}, "temporal.task_queue"},
 		{"empty bucket", map[string]string{"TRELIS_STORAGE_S3_BUCKET": " "}, "storage.s3.bucket"},
 		{"empty region", map[string]string{"TRELIS_STORAGE_S3_REGION": " "}, "storage.s3.region"},
 		{"endpoint not a URL", map[string]string{"TRELIS_STORAGE_S3_ENDPOINT": "localhost:9000"}, "storage.s3.endpoint"},

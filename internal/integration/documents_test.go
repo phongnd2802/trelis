@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -28,8 +29,15 @@ func (tr *trelis) principalKey(t *testing.T, name string) string {
 	return key
 }
 
-// upload POSTs one file to /documents and returns the new Document's ID.
+// upload POSTs one text file to /documents and returns the new Document's ID.
 func (tr *trelis) upload(t *testing.T, key, name, content string) string {
+	t.Helper()
+	return tr.uploadBytes(t, key, name, []byte(content))
+}
+
+// uploadBytes POSTs one file with arbitrary bytes to /documents and returns
+// the new Document's ID.
+func (tr *trelis) uploadBytes(t *testing.T, key, name string, content []byte) string {
 	t.Helper()
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
@@ -37,7 +45,7 @@ func (tr *trelis) upload(t *testing.T, key, name, content string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := io.WriteString(w, content); err != nil {
+	if _, err := w.Write(content); err != nil {
 		t.Fatal(err)
 	}
 	if err := mw.Close(); err != nil {
@@ -63,6 +71,48 @@ func (tr *trelis) upload(t *testing.T, key, name, content string) string {
 		t.Fatalf("upload %s = %d (%v), want 200 with a Document", name, resp.StatusCode, err)
 	}
 	return out.Data.ID
+}
+
+// documentView is the part of a Document the ingest tests read.
+type documentView struct {
+	ID          string `json:"id"`
+	ParseStatus string `json:"parse_status"`
+	ParseError  string `json:"parse_error"`
+}
+
+// waitForIngest polls GET /documents/{id} until ingest reaches a final
+// status, and returns the Document.
+func (tr *trelis) waitForIngest(t *testing.T, key, id string) documentView {
+	t.Helper()
+	const timeout = 60 * time.Second
+	deadline := time.Now().Add(timeout)
+	for {
+		req, err := http.NewRequest(http.MethodGet, tr.url+"/documents/"+id, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET /documents/%s: %v", id, err)
+		}
+		var out struct {
+			Data documentView `json:"data"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&out)
+		_ = resp.Body.Close()
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET /documents/%s = %d (%v), want 200 with the Document", id, resp.StatusCode, err)
+		}
+		switch out.Data.ParseStatus {
+		case "completed", "failed":
+			return out.Data
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Document %s still %q after %v, want completed or failed", id, out.Data.ParseStatus, timeout)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // objects lists the keys in this Trelis's bucket, straight from silo.

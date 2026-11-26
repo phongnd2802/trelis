@@ -16,7 +16,9 @@ import (
 // caller already uploaded the same content.
 type DocumentService interface {
 	// CreateDocumentFromFile stores the file as a pending Document owned by
-	// the caller, readable by the caller and everyone on accessList.
+	// the caller, readable by the caller and everyone on accessList, and
+	// starts its ingest workflow. A workflow that will not start does not
+	// fail the upload.
 	CreateDocumentFromFile(ctx context.Context, file *multipart.FileHeader, accessList types.AccessList) (*types.Document, error)
 	// GetDocumentByID returns a Document the caller can read; one that does
 	// not exist and one they cannot read are the same not-found error.
@@ -40,6 +42,13 @@ type DocumentRepository interface {
 	// GetDocumentByOwnerAndHash returns the owner's Document with that
 	// content hash, or ErrDocumentNotFound.
 	GetDocumentByOwnerAndHash(ctx context.Context, ownerID uuid.UUID, fileHash string) (*types.Document, error)
+	// GetDocumentByID returns the Document without checking any Access List.
+	// It is the system view the ingest activities use, which run with no
+	// Principal; it returns ErrDocumentNotFound when no row matches.
+	GetDocumentByID(ctx context.Context, id uuid.UUID) (*types.Document, error)
+	// SetParseStatus sets a Document's parse status and, when it is failed, the
+	// reason shown with it; any other status clears the reason.
+	SetParseStatus(ctx context.Context, id uuid.UUID, status, parseError string) error
 	// GetReadableDocumentByID returns the Document if principalID can read
 	// it, else ErrDocumentNotFound.
 	GetReadableDocumentByID(ctx context.Context, principalID, id uuid.UUID) (*types.Document, error)

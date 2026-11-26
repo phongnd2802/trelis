@@ -25,7 +25,7 @@ func (q *Queries) CountReadableDocuments(ctx context.Context, principalID uuid.U
 const createDocument = `-- name: CreateDocument :one
 INSERT INTO documents (id, owner_id, title, file_name, file_type, file_size, file_hash, upload_id, object_key)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-RETURNING id, owner_id, title, file_name, file_type, file_size, file_hash, object_key, parse_status, created_at, updated_at, upload_id
+RETURNING id, owner_id, title, file_name, file_type, file_size, file_hash, object_key, parse_status, created_at, updated_at, upload_id, parse_error
 `
 
 type CreateDocumentParams struct {
@@ -66,12 +66,40 @@ func (q *Queries) CreateDocument(ctx context.Context, arg CreateDocumentParams) 
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.UploadID,
+		&i.ParseError,
+	)
+	return i, err
+}
+
+const getDocumentByID = `-- name: GetDocumentByID :one
+SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, object_key, parse_status, created_at, updated_at, upload_id, parse_error FROM documents WHERE id = $1
+`
+
+// The system view of one Document, with no access check: the ingest
+// activities run with no Principal.
+func (q *Queries) GetDocumentByID(ctx context.Context, id uuid.UUID) (Document, error) {
+	row := q.db.QueryRow(ctx, getDocumentByID, id)
+	var i Document
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerID,
+		&i.Title,
+		&i.FileName,
+		&i.FileType,
+		&i.FileSize,
+		&i.FileHash,
+		&i.ObjectKey,
+		&i.ParseStatus,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.UploadID,
+		&i.ParseError,
 	)
 	return i, err
 }
 
 const getDocumentByOwnerAndHash = `-- name: GetDocumentByOwnerAndHash :one
-SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, object_key, parse_status, created_at, updated_at, upload_id FROM documents WHERE owner_id = $1 AND file_hash = $2
+SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, object_key, parse_status, created_at, updated_at, upload_id, parse_error FROM documents WHERE owner_id = $1 AND file_hash = $2
 `
 
 type GetDocumentByOwnerAndHashParams struct {
@@ -95,12 +123,13 @@ func (q *Queries) GetDocumentByOwnerAndHash(ctx context.Context, arg GetDocument
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.UploadID,
+		&i.ParseError,
 	)
 	return i, err
 }
 
 const getReadableDocument = `-- name: GetReadableDocument :one
-SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, object_key, parse_status, created_at, updated_at, upload_id FROM documents
+SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, object_key, parse_status, created_at, updated_at, upload_id, parse_error FROM documents
 WHERE id = $1 AND can_read_document(id, $2::uuid)
 `
 
@@ -127,6 +156,7 @@ func (q *Queries) GetReadableDocument(ctx context.Context, arg GetReadableDocume
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.UploadID,
+		&i.ParseError,
 	)
 	return i, err
 }
@@ -218,7 +248,7 @@ func (q *Queries) ListDocumentPrincipals(ctx context.Context, documentID uuid.UU
 }
 
 const listReadableDocuments = `-- name: ListReadableDocuments :many
-SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, object_key, parse_status, created_at, updated_at, upload_id FROM documents
+SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, object_key, parse_status, created_at, updated_at, upload_id, parse_error FROM documents
 WHERE can_read_document(id, $1::uuid)
 ORDER BY created_at DESC, id
 LIMIT $3 OFFSET $2
@@ -253,6 +283,7 @@ func (q *Queries) ListReadableDocuments(ctx context.Context, arg ListReadableDoc
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.UploadID,
+			&i.ParseError,
 		); err != nil {
 			return nil, err
 		}
@@ -262,4 +293,29 @@ func (q *Queries) ListReadableDocuments(ctx context.Context, arg ListReadableDoc
 		return nil, err
 	}
 	return items, nil
+}
+
+const setDocumentParseStatus = `-- name: SetDocumentParseStatus :exec
+UPDATE documents
+SET parse_status = $1,
+    parse_error = CASE
+        WHEN $1 = 'failed' THEN NULLIF($2::text, '')
+        ELSE NULL
+    END,
+    updated_at = now()
+WHERE id = $3
+`
+
+type SetDocumentParseStatusParams struct {
+	ParseStatus string
+	ParseError  string
+	ID          uuid.UUID
+}
+
+// A failed parse keeps its reason; a pending, processing or completed
+// Document carries none, so the reason can neither go stale nor be set on a
+// Document that did not fail.
+func (q *Queries) SetDocumentParseStatus(ctx context.Context, arg SetDocumentParseStatusParams) error {
+	_, err := q.db.Exec(ctx, setDocumentParseStatus, arg.ParseStatus, arg.ParseError, arg.ID)
+	return err
 }

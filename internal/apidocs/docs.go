@@ -580,6 +580,10 @@ const docTemplate = `{
                     "description": "Unique identifier of the Document",
                     "type": "string"
                 },
+                "parse_error": {
+                    "description": "ParseError is why the last parse failed; empty unless ParseStatus is\nfailed. It names no file name or Document text.",
+                    "type": "string"
+                },
                 "parse_status": {
                     "description": "Parse status of the Document",
                     "type": "string"

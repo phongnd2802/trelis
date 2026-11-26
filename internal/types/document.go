@@ -47,6 +47,9 @@ type Document struct {
 	ObjectKey string `json:"-"`
 	// Parse status of the Document
 	ParseStatus string `json:"parse_status"`
+	// ParseError is why the last parse failed; empty unless ParseStatus is
+	// failed. It names no file name or Document text.
+	ParseError string `json:"parse_error,omitempty"`
 	// Creation time of the Document
 	CreatedAt time.Time `json:"created_at"`
 	// Last updated time of the Document

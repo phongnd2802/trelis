@@ -30,20 +30,24 @@ type documentService struct {
 	repo       interfaces.DocumentRepository
 	principals interfaces.PrincipalRepository
 	fileSvc    interfaces.FileService
+	ingest     interfaces.IngestStarter
 }
 
 // NewDocumentService returns the Document use cases.
 func NewDocumentService(store db.Store, repo interfaces.DocumentRepository,
 	principals interfaces.PrincipalRepository, fileSvc interfaces.FileService,
+	ingest interfaces.IngestStarter,
 ) interfaces.DocumentService {
-	return &documentService{store: store, repo: repo, principals: principals, fileSvc: fileSvc}
+	return &documentService{store: store, repo: repo, principals: principals, fileSvc: fileSvc, ingest: ingest}
 }
 
-// CreateDocumentFromFile creates a pending Document from an uploaded file.
-// The order follows Omnisc's CreateKnowledgeFromFile: check the type, hash
-// for deduplication, validate the name, save the file, then the record,
-// removing the file again if the record cannot be saved. No ingest is
-// started here (#21).
+// CreateDocumentFromFile creates a pending Document from an uploaded file and
+// starts its ingest workflow. The order follows Omnisc's
+// CreateKnowledgeFromFile: check the type, hash for deduplication, validate
+// the name, save the file, then the record, removing the file again if the
+// record cannot be saved. A workflow that will not start is a warning, not a
+// failed upload: the Document stays pending for the reconciler (#26) to pick
+// up.
 func (s *documentService) CreateDocumentFromFile(ctx context.Context,
 	file *multipart.FileHeader, accessList types.AccessList,
 ) (*types.Document, error) {
@@ -113,6 +117,13 @@ func (s *documentService) CreateDocumentFromFile(ctx context.Context,
 				zap.String("key", key), zap.Error(deleteErr))
 		}
 		return nil, s.createErr(ctx, owner.ID, hash, err)
+	}
+	// Starting is not part of the transaction (ADR-0005): a failure here
+	// leaves a pending Document that the reconciler restarts, so the upload
+	// still succeeds.
+	if err := s.ingest.StartIngest(ctx, doc.ID); err != nil {
+		logger.Ctx(ctx).Warn("start ingest workflow failed",
+			zap.Stringer("document", doc.ID), zap.Error(err))
 	}
 	if doc.AccessList, err = s.repo.GetAccessList(ctx, doc.ID); err != nil {
 		return nil, err

@@ -25,6 +25,7 @@ import (
 	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
 	tcneo4j "github.com/testcontainers/testcontainers-go/modules/neo4j"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"go.temporal.io/sdk/testsuite"
 
 	"github.com/phongnd2802/trelis/internal/models/modeltest"
 )
@@ -52,6 +53,8 @@ var deps struct {
 	config string
 	pg     hostPort
 	neo4j  hostPort
+	// temporal is the shared Temporal dev server Trelis starts workflows on.
+	temporal hostPort
 	// s3 is the base URL of the shared silo server, e.g. http://127.0.0.1:41234.
 	s3 string
 }
@@ -89,11 +92,12 @@ func runSuite(m *testing.M) (int, error) {
 	}
 
 	var (
-		wg                     sync.WaitGroup
-		pg                     *tcpostgres.PostgresContainer
-		graph                  *tcneo4j.Neo4jContainer
-		silo                   *tcminio.MinioContainer
-		pgErr, neo4jErr, s3Err error
+		wg                           sync.WaitGroup
+		pg                           *tcpostgres.PostgresContainer
+		graph                        *tcneo4j.Neo4jContainer
+		silo                         *tcminio.MinioContainer
+		devServer                    *testsuite.DevServer
+		pgErr, neo4jErr, s3Err, tErr error
 	)
 	wg.Go(func() {
 		pg, pgErr = tcpostgres.Run(ctx, postgresImage,
@@ -109,11 +113,19 @@ func runSuite(m *testing.M) (int, error) {
 	wg.Go(func() {
 		silo, s3Err = tcminio.Run(ctx, siloImage, tcminio.WithUsername(s3User), tcminio.WithPassword(s3Password))
 	})
+	wg.Go(func() {
+		// The CLI-based dev server downloads once into the temp directory and
+		// serves every test in the package from there.
+		devServer, tErr = testsuite.StartDevServer(ctx, testsuite.DevServerOptions{})
+	})
 	wg.Wait()
 	defer func() {
 		_ = testcontainers.TerminateContainer(pg)
 		_ = testcontainers.TerminateContainer(graph)
 		_ = testcontainers.TerminateContainer(silo)
+		if devServer != nil {
+			_ = devServer.Stop()
+		}
 	}()
 	if pgErr != nil {
 		return 0, fmt.Errorf("start postgres: %w", pgErr)
@@ -123,6 +135,9 @@ func runSuite(m *testing.M) (int, error) {
 	}
 	if s3Err != nil {
 		return 0, fmt.Errorf("start silo: %w", s3Err)
+	}
+	if tErr != nil {
+		return 0, fmt.Errorf("start temporal dev server: %w", tErr)
 	}
 
 	if deps.pg, err = endpoint(ctx, pg, "5432/tcp"); err != nil {
@@ -136,6 +151,11 @@ func runSuite(m *testing.M) (int, error) {
 		return 0, err
 	}
 	deps.s3 = "http://" + net.JoinHostPort(s3.host, s3.port)
+	host, port, err := net.SplitHostPort(devServer.FrontendHostPort())
+	if err != nil {
+		return 0, fmt.Errorf("temporal dev server address: %w", err)
+	}
+	deps.temporal = hostPort{host: host, port: port}
 	return m.Run(), nil
 }
 
@@ -184,6 +204,12 @@ type trelis struct {
 	env []string
 	// bucket is this Trelis's own bucket on the shared silo server.
 	bucket string
+	// dbname is this Trelis's own database on the shared Postgres; the tests
+	// also read it directly to see what ingest wrote.
+	dbname string
+	// taskQueue is this Trelis's Temporal task queue, named after dbname so
+	// processes running side by side never take each other's tasks.
+	taskQueue string
 }
 
 // listeningAddr returns the addr field of the JSON record Trelis logs once it
@@ -217,6 +243,8 @@ func startWith(t *testing.T, extraEnv ...string) *trelis {
 	tr := &trelis{provider: modeltest.NewFakeProvider(t)}
 	dbname := freshDatabase(t)
 	tr.bucket = strings.ReplaceAll(dbname, "_", "-")
+	tr.dbname = dbname
+	tr.taskQueue = dbname
 	tr.env = append(trelisEnv(dbname, tr.bucket), extraEnv...)
 
 	cmd := exec.Command(deps.binary, "-config", deps.config)
@@ -310,11 +338,12 @@ func freshDatabase(t *testing.T) string {
 	return name
 }
 
-// trelisEnv configures Trelis for the containers, dbname and bucket, as an operator
-// would, through TRELIS_* env. TRELIS_* variables of the developer's shell
-// are dropped, so every key Trelis reads is either set here or its default.
-// Temporal is left unreachable: the client connects lazily and nothing under
-// test uses it yet.
+// trelisEnv configures Trelis for the containers, dbname and bucket, as an
+// operator would, through TRELIS_* env. TRELIS_* variables of the developer's
+// shell are dropped, so every key Trelis reads is either set here or its
+// default. Every test shares the package's Temporal dev server; the task
+// queue is the test's database name, so concurrent Trelis processes never
+// take each other's workflow tasks.
 func trelisEnv(dbname, bucket string) []string {
 	var env []string
 	for _, kv := range os.Environ() {
@@ -340,14 +369,46 @@ func trelisEnv(dbname, bucket string) []string {
 		"TRELIS_NEO4J_PORT="+deps.neo4j.port,
 		"TRELIS_NEO4J_USER=neo4j",
 		"TRELIS_NEO4J_PASSWORD="+neo4jPassword,
-		"TRELIS_TEMPORAL_HOST=127.0.0.1",
-		"TRELIS_TEMPORAL_PORT=1",
+		"TRELIS_TEMPORAL_HOST="+deps.temporal.host,
+		"TRELIS_TEMPORAL_PORT="+deps.temporal.port,
+		"TRELIS_TEMPORAL_TASK_QUEUE="+dbname,
 		"TRELIS_STORAGE_S3_ENDPOINT="+deps.s3,
 		"TRELIS_STORAGE_S3_BUCKET="+bucket,
 		"TRELIS_STORAGE_S3_ACCESS_KEY_ID="+s3User,
 		"TRELIS_STORAGE_S3_SECRET_ACCESS_KEY="+s3Password,
 		"TRELIS_STORAGE_S3_CREATE_BUCKET=true",
 	)
+}
+
+// chunkContents returns this Trelis's stored Chunks for a Document in seq
+// order, read straight from Postgres. The API does not serve Chunks yet, so
+// this is how the ingest tests check what the workflow wrote.
+func (tr *trelis) chunkContents(t *testing.T, documentID string) []string {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
+		pgUser, pgPassword, deps.pg.host, deps.pg.port, tr.dbname))
+	if err != nil {
+		t.Fatalf("connect to database %s: %v", tr.dbname, err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	rows, err := conn.Query(ctx, "SELECT content FROM chunks WHERE document_id = $1 ORDER BY seq", documentID)
+	if err != nil {
+		t.Fatalf("select chunks of %s: %v", documentID, err)
+	}
+	defer rows.Close()
+	var contents []string
+	for rows.Next() {
+		var content string
+		if err := rows.Scan(&content); err != nil {
+			t.Fatal(err)
+		}
+		contents = append(contents, content)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return contents
 }
 
 // admin runs `trelis admin <args>` against this Trelis's database, as an

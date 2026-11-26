@@ -6,6 +6,24 @@ RETURNING *;
 -- name: GetDocumentByOwnerAndHash :one
 SELECT * FROM documents WHERE owner_id = $1 AND file_hash = $2;
 
+-- The system view of one Document, with no access check: the ingest
+-- activities run with no Principal.
+-- name: GetDocumentByID :one
+SELECT * FROM documents WHERE id = $1;
+
+-- A failed parse keeps its reason; a pending, processing or completed
+-- Document carries none, so the reason can neither go stale nor be set on a
+-- Document that did not fail.
+-- name: SetDocumentParseStatus :exec
+UPDATE documents
+SET parse_status = @parse_status,
+    parse_error = CASE
+        WHEN @parse_status = 'failed' THEN NULLIF(@parse_error::text, '')
+        ELSE NULL
+    END,
+    updated_at = now()
+WHERE id = @id;
+
 -- name: GrantDocumentToPrincipal :exec
 INSERT INTO document_principals (document_id, principal_id) VALUES ($1, $2)
 ON CONFLICT DO NOTHING;

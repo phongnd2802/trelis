@@ -17,6 +17,10 @@ type Querier interface {
 	CreateDocument(ctx context.Context, arg CreateDocumentParams) (Document, error)
 	CreateGroup(ctx context.Context, name string) (CreateGroupRow, error)
 	CreatePrincipal(ctx context.Context, name string) (CreatePrincipalRow, error)
+	DeleteChunksByDocument(ctx context.Context, documentID uuid.UUID) error
+	// The system view of one Document, with no access check: the ingest
+	// activities run with no Principal.
+	GetDocumentByID(ctx context.Context, id uuid.UUID) (Document, error)
 	GetDocumentByOwnerAndHash(ctx context.Context, arg GetDocumentByOwnerAndHashParams) (Document, error)
 	GetGroupByName(ctx context.Context, name string) (GetGroupByNameRow, error)
 	GetPrincipalByKeyHash(ctx context.Context, keyHash []byte) (GetPrincipalByKeyHashRow, error)
@@ -26,7 +30,9 @@ type Querier interface {
 	GetReadableDocument(ctx context.Context, arg GetReadableDocumentParams) (Document, error)
 	GrantDocumentToGroup(ctx context.Context, arg GrantDocumentToGroupParams) error
 	GrantDocumentToPrincipal(ctx context.Context, arg GrantDocumentToPrincipalParams) error
+	InsertChunk(ctx context.Context, arg InsertChunkParams) error
 	ListAPIKeys(ctx context.Context, principalID uuid.UUID) ([]ListAPIKeysRow, error)
+	ListChunksByDocument(ctx context.Context, documentID uuid.UUID) ([]Chunk, error)
 	ListDocumentGroups(ctx context.Context, documentID uuid.UUID) ([]string, error)
 	ListDocumentPrincipals(ctx context.Context, documentID uuid.UUID) ([]string, error)
 	ListPrincipalGroups(ctx context.Context, principalID uuid.UUID) ([]ListPrincipalGroupsRow, error)
@@ -34,6 +40,10 @@ type Querier interface {
 	ListReadableDocuments(ctx context.Context, arg ListReadableDocumentsParams) ([]Document, error)
 	// Revoking twice keeps the first revocation time.
 	RevokeAPIKey(ctx context.Context, id uuid.UUID) (int64, error)
+	// A failed parse keeps its reason; a pending, processing or completed
+	// Document carries none, so the reason can neither go stale nor be set on a
+	// Document that did not fail.
+	SetDocumentParseStatus(ctx context.Context, arg SetDocumentParseStatusParams) error
 }
 
 var _ Querier = (*Queries)(nil)
