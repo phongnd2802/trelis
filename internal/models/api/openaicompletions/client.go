@@ -1,6 +1,7 @@
 // Derived from WeKnora (https://github.com/Tencent/WeKnora), internal/models/api/openaicompletions/client.go.
-// Trelis drops the multimodal retry, raw packet dumps, DSML tool-call
-// recovery, reasoning_details and vendor tool-call metadata.
+// Trelis drops the multimodal retry, raw packet dumps, request/usage logging, DSML tool-call
+// recovery, reasoning_details, vendor tool-call metadata and GetModelID (roles
+// come from config, not a model database).
 // Copyright (C) 2026 Tencent. Licensed under the MIT License; see NOTICE.
 
 package openaicompletions
@@ -9,7 +10,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -57,10 +57,7 @@ func (c *Client) Chat(ctx context.Context, messages []api.Message, opts *api.Opt
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := api.ReadResponseCapped(resp.Body, 0)
 	if err != nil {
-		if errors.Is(err, api.ErrResponseTooLarge) {
-			return nil, err
-		}
-		return nil, &api.TransportError{Op: "read response", Err: err}
+		return nil, fmt.Errorf("read response: %w", err)
 	}
 	return c.parseResponse(raw)
 }

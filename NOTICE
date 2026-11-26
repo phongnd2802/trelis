@@ -26,9 +26,12 @@ Files (paths in this repository):
     internal/models/api/usage.go
     internal/models/api/compat_settings.go
     internal/models/api/stream_assembler.go
+    internal/models/api/special_tokens.go
+    internal/models/api/special_tokens_test.go
     internal/models/api/openaicompletions/client.go
     internal/models/api/openaicompletions/request.go
     internal/models/api/openaicompletions/stream_tool_index_test.go
+    internal/models/api/openaicompletions/content_parts_test.go
     internal/models/chat/chat.go
 
 WeKnora is licensed under the MIT License:

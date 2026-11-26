@@ -1,6 +1,8 @@
 // Derived from WeKnora (https://github.com/Tencent/WeKnora), internal/models/api/openaicompletions/request.go.
-// Trelis drops multimodal parts, thinking-level dialects, prompt caching,
-// extra_body and vendor tool-call fields.
+// Trelis drops multimodal parts, thinking-level dialects and the developer
+// role for reasoning models (no catalog says which models reason), prompt
+// caching, extra_body and vendor tool-call fields. BuildRequestBody returns
+// no error because finalizeBody (cache_control breakpoints) is not ported.
 // Copyright (C) 2026 Tencent. Licensed under the MIT License; see NOTICE.
 
 // Package openaicompletions implements the OpenAI Chat Completions wire
@@ -43,21 +45,12 @@ func (c *Client) convertMessages(messages []api.Message) []wireMessage {
 	s := c.cfg.Settings
 	out := make([]wireMessage, 0, len(messages))
 	for _, msg := range messages {
-		wm := wireMessage{Role: msg.Role}
-
-		if msg.Content != "" || len(msg.ToolCalls) == 0 {
-			wm.Content = msg.Content
-		} else {
-			// Assistant tool-call turn with empty content: emit an explicit
-			// `"content": ""` instead of omitting the field. Strict local
-			// engines (vLLM / Xinference serving Qwen-family Jinja chat
-			// templates) treat a missing content field as undefined and crash
-			// when rendering the assistant turn for the next round. The
-			// *string keeps `omitempty` from dropping the field: a non-nil
-			// interface holding a pointer serializes as "".
-			empty := ""
-			wm.Content = &empty
-		}
+		msg = api.NeutralizeMessageSpecialTokens(msg)
+		// Content is always sent, "" included: an assistant tool-call turn
+		// with the field missing crashes strict local engines (vLLM /
+		// Xinference serving Qwen-family Jinja chat templates). An interface
+		// holding "" is non-nil, so omitempty keeps it.
+		wm := wireMessage{Role: msg.Role, Content: msg.Content}
 
 		if len(msg.ToolCalls) > 0 {
 			wm.ToolCalls = make([]wireToolCall, 0, len(msg.ToolCalls))

@@ -23,8 +23,6 @@ import (
 
 // Message and the other aliases below re-export the request model defined
 // in internal/models/api so callers only import chat.
-//
-//nolint:revive // ChatOptions is the name every caller uses.
 type (
 	Message      = api.Message
 	ToolCall     = api.ToolCall
@@ -39,9 +37,12 @@ type Chat interface {
 	// Chat performs a non-streaming chat.
 	Chat(ctx context.Context, messages []Message, opts *ChatOptions) (*types.ChatResponse, error)
 
-	// ChatStream performs a streaming chat. The closing chunk has Done set
-	// and carries the tool calls and the usage; a broken stream closes with
-	// a ResponseTypeError chunk.
+	// ChatStream performs a streaming chat. Drain the channel until it
+	// closes: answer chunks may have Done set as soon as the provider sends
+	// a finish reason, but the last chunk is the one that carries the tool
+	// calls and the usage. A broken stream ends with a ResponseTypeError
+	// chunk. Stopping early leaves the reader goroutine parked until ctx is
+	// cancelled, so cancel ctx when abandoning a stream.
 	ChatStream(ctx context.Context, messages []Message, opts *ChatOptions) (<-chan types.StreamResponse, error)
 
 	// GetModelName returns the model name sent on the wire.

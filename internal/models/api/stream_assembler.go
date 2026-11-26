@@ -119,9 +119,6 @@ func (a *StreamAssembler) OrderedToolCalls() []types.LLMToolCall {
 	return result
 }
 
-// ToolCallCount reports how many distinct tool calls have been seen.
-func (a *StreamAssembler) ToolCallCount() int { return len(a.toolCallMap) }
-
 // SetUsage records usage from the vendor's final chunk.
 func (a *StreamAssembler) SetUsage(u types.TokenUsage) { a.Usage = &u }
 
