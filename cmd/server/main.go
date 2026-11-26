@@ -32,6 +32,7 @@ import (
 	"github.com/phongnd2802/trelis/internal/auth"
 	"github.com/phongnd2802/trelis/internal/config"
 	"github.com/phongnd2802/trelis/internal/db"
+	"github.com/phongnd2802/trelis/internal/documents"
 	"github.com/phongnd2802/trelis/internal/router"
 )
 
@@ -110,7 +111,7 @@ func run(configPath string, args []string) error {
 	}
 	slog.Info("trelis listening", "addr", ln.Addr().String(), "config", configPath)
 
-	if err := router.Serve(ctx, ln, router.New(ready, store), cfg.Server.ShutdownTimeout); err != nil {
+	if err := router.Serve(ctx, ln, router.New(ready, store, documents.NewStore(pool)), cfg.Server.ShutdownTimeout); err != nil {
 		return err
 	}
 	slog.Info("trelis stopped")

@@ -15,7 +15,7 @@ import (
 // so orchestrators can probe them; everything else, unknown paths and
 // methods included, needs an API key that authn accepts, so a caller
 // without one cannot map the routes.
-func New(ready Readiness, authn Authenticator) http.Handler {
+func New(ready Readiness, authn Authenticator, docs Documents) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Get("/healthz", healthz)
@@ -30,6 +30,10 @@ func New(ready Readiness, authn Authenticator) http.Handler {
 	r.Group(func(r chi.Router) {
 		r.Use(authed)
 		r.Get("/me", me)
+		d := documentsAPI{docs}
+		r.Post("/documents", d.upload)
+		r.Get("/documents", d.list)
+		r.Get("/documents/{id}", d.get)
 	})
 	return r
 }
