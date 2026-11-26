@@ -2,10 +2,13 @@
 //
 // Split resolves a chain of tiers from SplitterConfig.Strategy, runs each
 // tier in turn, and returns the first output that ValidateChunks accepts.
-// The recursive tier always ends the chain and its output is returned even
-// when rejected, so non-blank text always yields Chunks. Protected spans
-// (fenced code, tables, math, inline code, links and images) are kept whole
-// within a Chunk; overlap between Chunks starts at a semantic boundary.
+// The heading tier, which StrategyAuto selects when a Document's headings
+// are dense enough, splits Markdown at its ATX headings and puts the heading
+// breadcrumb its Content does not already hold in ContextHeader. The
+// recursive tier always ends the chain and its output is returned even when
+// rejected, so non-blank text always yields Chunks. Protected spans (fenced
+// code, tables, math, inline code, links and images) are kept whole within a
+// Chunk; overlap between Chunks starts at a semantic boundary.
 package chunker
 
 import (

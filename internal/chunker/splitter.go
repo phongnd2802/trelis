@@ -38,11 +38,19 @@ type unit struct {
 // units into Chunks of at most ChunkSize runes, each starting with the
 // overlap from the one before. cfg must have its defaults applied.
 func splitRecursive(text string, cfg SplitterConfig) []Chunk {
+	return splitRecursiveLimited(text, cfg, protectedLimit(cfg, text))
+}
+
+// splitRecursiveLimited is splitRecursive with the protected-span cap
+// decided by the caller. The heading tier splits one section at a time but
+// must keep the whole Document's token-limit budget, which its language
+// detection sets, so it passes the cap computed from the full text.
+func splitRecursiveLimited(text string, cfg SplitterConfig, hardMax int) []Chunk {
 	s := splitter{
 		text:      text,
 		cfg:       cfg,
 		protected: protectedSpans(text),
-		hardMax:   protectedLimit(cfg, text),
+		hardMax:   hardMax,
 	}
 	return s.merge(s.units())
 }

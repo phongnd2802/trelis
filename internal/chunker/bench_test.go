@@ -5,6 +5,18 @@ import (
 	"testing"
 )
 
+func BenchmarkSplitAutoHeaded(b *testing.B) {
+	text := strings.Repeat("# Phần\n\n"+prose(1, 3)+"\n\n", 200)
+	cfg := DefaultConfig()
+	cfg.Strategy = StrategyAuto
+	b.SetBytes(int64(len(text)))
+	for b.Loop() {
+		if len(Split(text, cfg)) == 0 {
+			b.Fatal("no chunks")
+		}
+	}
+}
+
 func BenchmarkSplit(b *testing.B) {
 	inputs := map[string]string{
 		"prose":             prose(4000, 8),
