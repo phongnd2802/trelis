@@ -173,7 +173,7 @@ func run(configPath string, args []string) error {
 	slog.Info("trelis listening", "addr", ln.Addr().String(), "config", configPath)
 
 	if err := router.Serve(ctx, ln, router.New(ready, service.NewAuthService(principalRepo, keyRepo),
-		handler.NewPrincipalHandler(principals), docs), cfg.Server.ShutdownTimeout); err != nil {
+		handler.NewPrincipalHandler(principals), docs, cfg.Server.Swagger), cfg.Server.ShutdownTimeout); err != nil {
 		return err
 	}
 	slog.Info("trelis stopped")

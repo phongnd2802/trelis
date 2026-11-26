@@ -54,7 +54,7 @@ func newServer(t *testing.T, principals ...string) *server {
 	docs := service.NewDocumentService(store,
 		repository.NewDocumentRepository(store), principalRepo, c.files)
 	c.h = New(Readiness{}, authn, handler.NewPrincipalHandler(principalSvc),
-		handler.NewDocumentHandler(docs, testMaxFileSize))
+		handler.NewDocumentHandler(docs, testMaxFileSize), false)
 	return c
 }
 

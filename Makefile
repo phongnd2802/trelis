@@ -1,4 +1,4 @@
-.PHONY: help tools sqlc anydoc-lib build build-lite dev test test-linked test-integration vet vet-lite vet-linked lint lint-linked stack-up dev-up dev-down clean
+.PHONY: help tools sqlc swagger anydoc-lib build build-lite dev test test-linked test-integration vet vet-lite vet-linked lint lint-linked stack-up dev-up dev-down clean
 
 BIN_DIR := bin
 BINARY  := $(BIN_DIR)/trelis
@@ -8,6 +8,7 @@ help:
 	@echo "Targets:"
 	@echo "  tools        install pinned dev tools (golangci-lint) into GOPATH/bin"
 	@echo "  sqlc         regenerate internal/db/sqlc from migrations/ and internal/db/queries/"
+	@echo "  swagger      regenerate internal/apidocs from the handlers' swag annotations"
 	@echo "  anydoc-lib   build the anydoc Rust static archive (needs cargo)"
 	@echo "  build        build trelis with the anydoc engine linked (needs anydoc-lib)"
 	@echo "  build-lite   build trelis without anydoc (no Rust needed; engine unavailable)"
@@ -67,6 +68,7 @@ vet-linked:
 GOLANGCI_LINT_VERSION := v2.15.0
 GOLANGCI_LINT ?= $(shell go env GOPATH)/bin/golangci-lint
 SQLC_VERSION  := v1.30.0
+SWAG_VERSION  := v1.16.6
 
 tools:
 	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
@@ -75,6 +77,12 @@ tools:
 # sqlc; `go run` with a pinned version keeps it out of `make tools` and CI.
 sqlc:
 	go run github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION) generate
+
+# The generated spec is committed, so building needs no swag; `go run` with a
+# pinned version keeps it out of `make tools` and CI. The general API Info
+# lives in internal/router, so -g is read relative to that first -d directory.
+swagger:
+	go run github.com/swaggo/swag/cmd/swag@$(SWAG_VERSION) init -g router.go -d ./internal/router,./internal/handler,./internal/types,./internal/errors -o internal/apidocs --outputTypes go,json,yaml --packageName apidocs
 
 lint:
 	$(GOLANGCI_LINT) run --build-tags integration ./...

@@ -35,6 +35,14 @@ jobs:
         run: make tools
       - name: Lint (golangci-lint + gofmt)
         run: make lint
+      - name: Swagger spec is up to date
+        run: |
+          make swagger
+          if [ -n "$(git status --porcelain -- internal/apidocs)" ]; then
+            echo "internal/apidocs is stale; commit the output of make swagger" >&2
+            git status --porcelain -- internal/apidocs
+            exit 1
+          fi
       - name: Vet
         run: make vet-lite
       - name: Test

@@ -1,0 +1,430 @@
+basePath: /
+definitions:
+  errors.ErrorCode:
+    enum:
+    - 1000
+    - 1001
+    - 1002
+    - 1003
+    - 1004
+    - 1005
+    - 1006
+    - 1007
+    - 1008
+    - 1009
+    - 1010
+    - 1011
+    type: integer
+    x-enum-varnames:
+    - ErrBadRequest
+    - ErrUnauthorized
+    - ErrForbidden
+    - ErrNotFound
+    - ErrMethodNotAllowed
+    - ErrConflict
+    - ErrTooManyRequests
+    - ErrInternalServer
+    - ErrServiceUnavailable
+    - ErrTimeout
+    - ErrValidation
+    - ErrRequestEntityTooLarge
+  handler.DataResponse:
+    properties:
+      data: {}
+      success:
+        type: boolean
+    type: object
+  handler.DuplicateDocumentResponse:
+    properties:
+      code:
+        enum:
+        - duplicate_document
+        type: string
+      data:
+        $ref: '#/definitions/types.Document'
+      message:
+        type: string
+      success:
+        example: false
+        type: boolean
+    type: object
+  handler.ErrorBody:
+    properties:
+      code:
+        $ref: '#/definitions/errors.ErrorCode'
+      details: {}
+      message:
+        type: string
+    type: object
+  handler.ErrorResponse:
+    properties:
+      error:
+        $ref: '#/definitions/handler.ErrorBody'
+      success:
+        type: boolean
+    type: object
+  handler.PageResponse:
+    properties:
+      data: {}
+      page:
+        type: integer
+      page_size:
+        type: integer
+      success:
+        type: boolean
+      total:
+        type: integer
+    type: object
+  router.CheckStatus:
+    properties:
+      error:
+        type: string
+      status:
+        type: string
+    type: object
+  router.ErrorResponse:
+    properties:
+      error:
+        type: string
+    type: object
+  router.HealthStatus:
+    properties:
+      status:
+        type: string
+    type: object
+  router.ReadyStatus:
+    properties:
+      checks:
+        additionalProperties:
+          $ref: '#/definitions/router.CheckStatus'
+        type: object
+      status:
+        type: string
+    type: object
+  types.AccessList:
+    properties:
+      groups:
+        items:
+          type: string
+        type: array
+      principals:
+        items:
+          type: string
+        type: array
+    type: object
+  types.Document:
+    properties:
+      access_list:
+        allOf:
+        - $ref: '#/definitions/types.AccessList'
+        description: |-
+          AccessList is filled in only for the owner, so other readers do not
+          learn who else can read the Document.
+      created_at:
+        description: Creation time of the Document
+        type: string
+      file_hash:
+        description: 'File hash of the Document: hex SHA-256 of its content'
+        type: string
+      file_name:
+        description: File name of the Document
+        type: string
+      file_size:
+        description: File size of the Document in bytes
+        type: integer
+      file_type:
+        description: 'File type of the Document: its lower-case extension'
+        type: string
+      id:
+        description: Unique identifier of the Document
+        type: string
+      parse_status:
+        description: Parse status of the Document
+        type: string
+      title:
+        description: Title of the Document; the file name at upload
+        type: string
+      updated_at:
+        description: Last updated time of the Document
+        type: string
+    type: object
+  types.Group:
+    properties:
+      id:
+        type: string
+      name:
+        type: string
+    type: object
+  types.Principal:
+    properties:
+      groups:
+        items:
+          $ref: '#/definitions/types.Group'
+        type: array
+      id:
+        type: string
+      name:
+        type: string
+    type: object
+info:
+  contact: {}
+  description: HTTP API for uploading and reading Documents. Every route except the
+    probes needs an API key.
+  title: Trelis API
+  version: 0.1.0
+paths:
+  /documents:
+    get:
+      description: 'Returns one page of the Documents the caller can read, newest
+        first, without Access Lists. A page or page_size of 0, or either left out,
+        takes the default: page 1 and page_size 20.'
+      parameters:
+      - default: 1
+        description: Page number, 1-based; 0 or absent means the default of 1
+        in: query
+        maximum: 1000000
+        minimum: 0
+        name: page
+        type: integer
+      - default: 20
+        description: Page size; 0 or absent means the default of 20
+        in: query
+        maximum: 1000
+        minimum: 0
+        name: page_size
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/handler.PageResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/types.Document'
+                  type: array
+              type: object
+        "400":
+          description: Invalid page or page_size
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "401":
+          description: Missing or invalid API key
+          schema:
+            $ref: '#/definitions/router.ErrorResponse'
+        "500":
+          description: Internal server error; a failed API key check answers the router's
+            error body instead
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - bearerAuth: []
+      summary: List readable Documents
+      tags:
+      - documents
+    post:
+      consumes:
+      - multipart/form-data
+      description: Uploads one file as a new Document. "principals" and "groups" each
+        name a comma-separated list added to the Access List; the uploader is always
+        on it. Answers 409 when the caller already uploaded the same content.
+      parameters:
+      - description: The file to upload
+        in: formData
+        name: file
+        required: true
+        type: file
+      - description: Comma-separated Principal names for the Access List
+        in: formData
+        name: principals
+        type: string
+      - description: Comma-separated Group names for the Access List
+        in: formData
+        name: groups
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/handler.DataResponse'
+            - properties:
+                data:
+                  $ref: '#/definitions/types.Document'
+              type: object
+        "400":
+          description: Malformed upload, unknown Principal or Group, or unsupported
+            file type
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "401":
+          description: Missing or invalid API key
+          schema:
+            $ref: '#/definitions/router.ErrorResponse'
+        "409":
+          description: The caller already uploaded this content
+          schema:
+            $ref: '#/definitions/handler.DuplicateDocumentResponse'
+        "413":
+          description: File larger than storage.max_file_size_mb
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal server error; a failed API key check answers the router's
+            error body instead
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - bearerAuth: []
+      summary: Upload a Document
+      tags:
+      - documents
+  /documents/{id}:
+    get:
+      description: Returns the Document, or 404 when it does not exist or the caller
+        cannot read it, so a Restricted Document's existence is not revealed. Only
+        the owner sees its Access List.
+      parameters:
+      - description: Document ID
+        format: uuid
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/handler.DataResponse'
+            - properties:
+                data:
+                  $ref: '#/definitions/types.Document'
+              type: object
+        "401":
+          description: Missing or invalid API key
+          schema:
+            $ref: '#/definitions/router.ErrorResponse'
+        "404":
+          description: No readable Document with that ID
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal server error; a failed API key check answers the router's
+            error body instead
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - bearerAuth: []
+      summary: Get a Document
+      tags:
+      - documents
+  /documents/{id}/file:
+    get:
+      description: Streams the file as an attachment, never rendered in the API's
+        origin. The Content-Disposition header names it and Content-Length gives its
+        size.
+      parameters:
+      - description: Document ID
+        format: uuid
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/octet-stream
+      responses:
+        "200":
+          description: The Source File
+          schema:
+            type: file
+        "401":
+          description: Missing or invalid API key
+          schema:
+            $ref: '#/definitions/router.ErrorResponse'
+        "404":
+          description: No readable Document with that ID
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal server error; a failed API key check answers the router's
+            error body instead
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - bearerAuth: []
+      summary: Download a Document's Source File
+      tags:
+      - documents
+  /healthz:
+    get:
+      description: Answers 200 while the process is serving requests, whatever its
+        dependencies are.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/router.HealthStatus'
+      summary: Liveness probe
+      tags:
+      - system
+  /me:
+    get:
+      description: Returns the Principal the API key belongs to, with its Groups,
+        as the bare Principal rather than the response envelope.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/types.Principal'
+        "401":
+          description: Missing or invalid API key
+          schema:
+            $ref: '#/definitions/router.ErrorResponse'
+        "500":
+          description: Internal server error; a failed API key check answers the router's
+            error body instead
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - bearerAuth: []
+      summary: Get the calling Principal
+      tags:
+      - principals
+  /readyz:
+    get:
+      description: Probes Postgres, object storage, Neo4j and Temporal concurrently.
+        Answers 200 when all are up, 503 when any is down.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/router.ReadyStatus'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/router.ReadyStatus'
+      summary: Readiness probe
+      tags:
+      - system
+securityDefinitions:
+  bearerAuth:
+    description: Paste "Bearer <key>", with a key from `admin key create <principal>`
+      (`go run ./cmd/server admin key create <principal>` in dev).
+    in: header
+    name: Authorization
+    type: apiKey
+swagger: "2.0"

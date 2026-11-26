@@ -53,6 +53,28 @@ func TestLoadEnvOverridesIndividualKeys(t *testing.T) {
 	}
 }
 
+func TestSwaggerIsOffByDefault(t *testing.T) {
+	cfg, err := Load(writeConfig(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Server.Swagger {
+		t.Error("Server.Swagger = true, want false unless the config or the env turns it on")
+	}
+}
+
+func TestSwaggerIsReadFromEnv(t *testing.T) {
+	t.Setenv("TRELIS_SERVER_SWAGGER", "true")
+
+	cfg, err := Load(writeConfig(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Server.Swagger {
+		t.Error("Server.Swagger = false, want the env value true")
+	}
+}
+
 func TestLoadEnvOverridesKeyMissingFromYAML(t *testing.T) {
 	t.Setenv("TRELIS_SERVER_SHUTDOWN_TIMEOUT", "30s")
 

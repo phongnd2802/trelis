@@ -39,6 +39,12 @@ type Server struct {
 	Addr string `mapstructure:"addr"`
 	// ShutdownTimeout bounds how long SIGTERM waits for in-flight requests.
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
+	// Swagger serves the Swagger UI and the generated spec at /swagger/,
+	// open and unauthenticated. The code default is false; config/trelis.yaml
+	// turns it on (and the Docker image bakes that file in), so production
+	// must set TRELIS_SERVER_SWAGGER=false. Otherwise anyone who can reach
+	// the port can read the API description.
+	Swagger bool `mapstructure:"swagger"`
 }
 
 // defaults also registers every key with viper, which is what lets an env
@@ -46,6 +52,7 @@ type Server struct {
 var defaults = map[string]any{
 	"server.addr":             ":8080",
 	"server.shutdown_timeout": 10 * time.Second,
+	"server.swagger":          false,
 
 	"postgres.host":     "localhost",
 	"postgres.port":     5432,
