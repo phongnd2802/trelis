@@ -8,7 +8,7 @@ import (
 
 func TestHealthzReturnsOK(t *testing.T) {
 	rec := httptest.NewRecorder()
-	New(Readiness{}, keyring{}, nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	newRouter(keyring{}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -22,14 +22,14 @@ func TestHealthzReturnsOK(t *testing.T) {
 }
 
 func TestUnknownRouteIs404WithAKey(t *testing.T) {
-	rec := get(t, New(Readiness{}, keyring{"trelis_alice": alice}, nil), "/nope", "Bearer trelis_alice")
+	rec := get(t, newRouter(keyring{"trelis_alice": alice}), "/nope", "Bearer trelis_alice")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
 }
 
 func TestUnknownRoutesAndMethodsNeedAKey(t *testing.T) {
-	h := New(Readiness{}, keyring{"trelis_alice": alice}, nil)
+	h := newRouter(keyring{"trelis_alice": alice})
 	for _, req := range []*http.Request{
 		httptest.NewRequest(http.MethodGet, "/nope", nil),
 		httptest.NewRequest(http.MethodDelete, "/me", nil),

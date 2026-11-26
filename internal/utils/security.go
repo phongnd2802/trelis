@@ -3,7 +3,8 @@
 // License, by way of Omnisc. Modified for Trelis: only the input check
 // the upload path needs; comments translated. See NOTICE.
 
-// Package utils holds small input-safety helpers shared across layers.
+// Package utils holds small helpers shared across layers: input checks, and
+// API key generation and hashing.
 package utils
 
 import (

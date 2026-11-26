@@ -14,7 +14,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/phongnd2802/trelis/internal/application/repository"
-	"github.com/phongnd2802/trelis/internal/auth"
 	"github.com/phongnd2802/trelis/internal/db"
 	werrors "github.com/phongnd2802/trelis/internal/errors"
 	"github.com/phongnd2802/trelis/internal/types"
@@ -37,16 +36,6 @@ func NewDocumentService(store db.Store, repo interfaces.DocumentRepository,
 	principals interfaces.PrincipalRepository, fileSvc interfaces.FileService,
 ) interfaces.DocumentService {
 	return &documentService{store: store, repo: repo, principals: principals, fileSvc: fileSvc}
-}
-
-// caller is the Principal a request was authenticated as. Every route behind
-// the router's authenticate middleware has one.
-func caller(ctx context.Context) (auth.Principal, error) {
-	p, ok := auth.FromContext(ctx)
-	if !ok {
-		return auth.Principal{}, errors.New("no authenticated principal in context")
-	}
-	return p, nil
 }
 
 // CreateDocumentFromFile creates a pending Document from an uploaded file.
@@ -152,17 +141,17 @@ func errDocumentNotFound() error { return werrors.NewNotFoundError("Document not
 
 // readableDocument returns the caller and the Document if the caller can
 // read it, else errDocumentNotFound.
-func (s *documentService) readableDocument(ctx context.Context, id uuid.UUID) (auth.Principal, *types.Document, error) {
+func (s *documentService) readableDocument(ctx context.Context, id uuid.UUID) (types.Principal, *types.Document, error) {
 	p, err := caller(ctx)
 	if err != nil {
-		return auth.Principal{}, nil, err
+		return types.Principal{}, nil, err
 	}
 	doc, err := s.repo.GetReadableDocumentByID(ctx, p.ID, id)
 	if errors.Is(err, repository.ErrDocumentNotFound) {
-		return auth.Principal{}, nil, errDocumentNotFound()
+		return types.Principal{}, nil, errDocumentNotFound()
 	}
 	if err != nil {
-		return auth.Principal{}, nil, err
+		return types.Principal{}, nil, err
 	}
 	return p, doc, nil
 }

@@ -74,3 +74,53 @@ func TestResolveNamesNamesTheUnknownEntry(t *testing.T) {
 		}
 	}
 }
+
+func TestPrincipalAndGroupNamesAreUnique(t *testing.T) {
+	s, _ := seeded(t)
+	repo, ctx := NewPrincipalRepository(s), context.Background()
+	if _, err := repo.CreatePrincipal(ctx, "alice"); !errors.Is(err, ErrPrincipalExists) {
+		t.Errorf("second principal alice: err = %v, want ErrPrincipalExists", err)
+	}
+	if _, err := repo.CreateGroup(ctx, "tax"); !errors.Is(err, ErrGroupExists) {
+		t.Errorf("second group tax: err = %v, want ErrGroupExists", err)
+	}
+}
+
+func TestLookupsByNameReportUnknownNames(t *testing.T) {
+	s, ids := seeded(t)
+	repo, ctx := NewPrincipalRepository(s), context.Background()
+	if p, err := repo.GetPrincipalByName(ctx, "bob"); err != nil || p.ID != ids["bob"] {
+		t.Errorf("GetPrincipalByName(bob) = %+v, %v; want bob", p, err)
+	}
+	if g, err := repo.GetGroupByName(ctx, "legal"); err != nil || g.ID != ids["legal"] {
+		t.Errorf("GetGroupByName(legal) = %+v, %v; want legal", g, err)
+	}
+	if _, err := repo.GetPrincipalByName(ctx, "ghost"); !errors.Is(err, ErrPrincipalNotFound) {
+		t.Errorf("GetPrincipalByName(ghost): err = %v, want ErrPrincipalNotFound", err)
+	}
+	if _, err := repo.GetGroupByName(ctx, "nobody"); !errors.Is(err, ErrGroupNotFound) {
+		t.Errorf("GetGroupByName(nobody): err = %v, want ErrGroupNotFound", err)
+	}
+}
+
+func TestListGroupsReturnsMembershipsByName(t *testing.T) {
+	s, ids := seeded(t)
+	repo, ctx := NewPrincipalRepository(s), context.Background()
+	for _, m := range [][2]string{{"tax", "alice"}, {"legal", "alice"}, {"tax", "alice"}} {
+		if err := repo.AddMember(ctx, ids[m[0]], ids[m[1]]); err != nil {
+			t.Fatalf("AddMember(%s, %s): %v", m[0], m[1], err)
+		}
+	}
+	got, err := repo.ListGroups(ctx, ids["alice"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []types.Group{{ID: ids["legal"], Name: "legal"}, {ID: ids["tax"], Name: "tax"}}
+	if !slices.Equal(got, want) {
+		t.Errorf("alice's groups = %+v, want %+v", got, want)
+	}
+	bobs, err := repo.ListGroups(ctx, ids["bob"])
+	if err != nil || bobs == nil || len(bobs) != 0 {
+		t.Errorf("bob's groups = %#v, %v; want an empty, non-nil list", bobs, err)
+	}
+}

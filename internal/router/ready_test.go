@@ -34,7 +34,7 @@ type readyBody struct {
 func getReady(t *testing.T, r Readiness) (int, readyBody) {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	New(r, keyring{}, nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	New(r, keyring{}, nil, nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	var body readyBody
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode %q: %v", rec.Body.String(), err)
@@ -95,7 +95,7 @@ func TestReadyzTimesOutAHangingProbe(t *testing.T) {
 func TestHealthzStaysUpWhenDependenciesAreDown(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r := Readiness{Timeout: time.Second, Checks: []Check{{Name: "postgres", Probe: down("nope")}}}
-	New(r, keyring{}, nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	New(r, keyring{}, nil, nil).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("/healthz = %d, want 200 (liveness ignores dependencies)", rec.Code)
 	}

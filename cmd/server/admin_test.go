@@ -7,11 +7,28 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phongnd2802/trelis/internal/auth"
+	"github.com/phongnd2802/trelis/internal/application/repository"
+	"github.com/phongnd2802/trelis/internal/application/service"
+	"github.com/phongnd2802/trelis/internal/db"
 	"github.com/phongnd2802/trelis/internal/db/dbtest"
+	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
 
-func runAdmin(t *testing.T, s *auth.Store, args ...string) (string, error) {
+// services is what the admin commands run through, plus the AuthService to
+// check that the keys they print work.
+type services struct {
+	interfaces.PrincipalService
+	interfaces.AuthService
+}
+
+func newServices(t *testing.T) services {
+	t.Helper()
+	store := db.NewStore(dbtest.Migrated(t))
+	principals, keys := repository.NewPrincipalRepository(store), repository.NewAPIKeyRepository(store)
+	return services{service.NewPrincipalService(store, principals, keys), service.NewAuthService(principals, keys)}
+}
+
+func runAdmin(t *testing.T, s services, args ...string) (string, error) {
 	t.Helper()
 	var out bytes.Buffer
 	err := admin(context.Background(), s, args, &out)
@@ -19,7 +36,7 @@ func runAdmin(t *testing.T, s *auth.Store, args ...string) (string, error) {
 }
 
 func TestAdminCreatesEverythingAKeyNeeds(t *testing.T) {
-	s := auth.NewStore(dbtest.Migrated(t))
+	s := newServices(t)
 	for _, args := range [][]string{
 		{"principal", "create", "alice"},
 		{"group", "create", "tax"},
@@ -45,7 +62,7 @@ func TestAdminCreatesEverythingAKeyNeeds(t *testing.T) {
 }
 
 func TestAdminRejectsBadUsage(t *testing.T) {
-	s := auth.NewStore(dbtest.Migrated(t))
+	s := newServices(t)
 	for _, args := range [][]string{
 		nil,
 		{"principal"},
@@ -65,9 +82,9 @@ func TestAdminRejectsBadUsage(t *testing.T) {
 }
 
 func TestAdminReportsUnknownNames(t *testing.T) {
-	s := auth.NewStore(dbtest.Migrated(t))
-	if _, err := runAdmin(t, s, "key", "create", "ghost"); !errors.Is(err, auth.ErrNotFound) {
-		t.Errorf("key for unknown principal: err = %v, want ErrNotFound", err)
+	s := newServices(t)
+	if _, err := runAdmin(t, s, "key", "create", "ghost"); !errors.Is(err, repository.ErrPrincipalNotFound) {
+		t.Errorf("key for unknown principal: err = %v, want ErrPrincipalNotFound", err)
 	}
 }
 
@@ -82,7 +99,7 @@ func createdKey(t *testing.T, out string) (id, key string) {
 }
 
 func TestAdminListsAndRevokesKeys(t *testing.T) {
-	s := auth.NewStore(dbtest.Migrated(t))
+	s := newServices(t)
 	ctx := context.Background()
 	if _, err := runAdmin(t, s, "principal", "create", "alice"); err != nil {
 		t.Fatal(err)
@@ -101,7 +118,7 @@ func TestAdminListsAndRevokesKeys(t *testing.T) {
 	if _, err := runAdmin(t, s, "key", "revoke", leakedID); err != nil {
 		t.Fatalf("key revoke: %v", err)
 	}
-	if _, err := s.Authenticate(ctx, leakedKey); !errors.Is(err, auth.ErrUnauthenticated) {
+	if _, err := s.Authenticate(ctx, leakedKey); !errors.Is(err, interfaces.ErrUnauthenticated) {
 		t.Errorf("revoked key: err = %v, want ErrUnauthenticated", err)
 	}
 	if _, err := s.Authenticate(ctx, otherKey); err != nil {
@@ -128,11 +145,36 @@ func TestAdminListsAndRevokesKeys(t *testing.T) {
 }
 
 func TestAdminRevokeRejectsBadIDs(t *testing.T) {
-	s := auth.NewStore(dbtest.Migrated(t))
-	if _, err := runAdmin(t, s, "key", "revoke", "not-a-uuid"); err == nil || errors.Is(err, auth.ErrNotFound) {
+	s := newServices(t)
+	if _, err := runAdmin(t, s, "key", "revoke", "not-a-uuid"); err == nil || errors.Is(err, repository.ErrAPIKeyNotFound) {
 		t.Errorf("malformed ID: err = %v, want a parse error", err)
 	}
-	if _, err := runAdmin(t, s, "key", "revoke", "0190d2a8-0000-7000-8000-000000000001"); !errors.Is(err, auth.ErrNotFound) {
-		t.Errorf("unknown ID: err = %v, want ErrNotFound", err)
+	if _, err := runAdmin(t, s, "key", "revoke", "0190d2a8-0000-7000-8000-000000000001"); !errors.Is(err, repository.ErrAPIKeyNotFound) {
+		t.Errorf("unknown ID: err = %v, want ErrAPIKeyNotFound", err)
+	}
+}
+
+func TestAdminErrorsKeepTheirWording(t *testing.T) {
+	s := newServices(t)
+	for _, args := range [][]string{{"principal", "create", "alice"}, {"group", "create", "tax"}} {
+		if _, err := runAdmin(t, s, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"principal", "create", "alice"}, `auth: already exists: principal "alice"`},
+		{[]string{"group", "create", "tax"}, `auth: already exists: group "tax"`},
+		{[]string{"group", "add-member", "nope", "alice"}, `auth: not found: group "nope"`},
+		{[]string{"group", "add-member", "tax", "ghost"}, `auth: not found: principal "ghost"`},
+		{[]string{"key", "create", "ghost"}, `auth: not found: principal "ghost"`},
+		{[]string{"key", "list", "ghost"}, `auth: not found: principal "ghost"`},
+		{[]string{"key", "revoke", "0190d2a8-0000-7000-8000-000000000001"}, "auth: not found: key 0190d2a8-0000-7000-8000-000000000001"},
+	} {
+		if _, err := runAdmin(t, s, tc.args...); err == nil || err.Error() != tc.want {
+			t.Errorf("admin %v: err = %v, want %q", tc.args, err, tc.want)
+		}
 	}
 }

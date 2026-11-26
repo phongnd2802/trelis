@@ -13,10 +13,10 @@ import (
 	"github.com/phongnd2802/trelis/internal/application/repository"
 	"github.com/phongnd2802/trelis/internal/application/service"
 	"github.com/phongnd2802/trelis/internal/application/service/file/filetest"
-	"github.com/phongnd2802/trelis/internal/auth"
 	"github.com/phongnd2802/trelis/internal/db"
 	"github.com/phongnd2802/trelis/internal/db/dbtest"
 	"github.com/phongnd2802/trelis/internal/handler"
+	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
 
 // testMaxFileSize keeps the over-the-limit test small.
@@ -25,9 +25,9 @@ const testMaxFileSize = 1 << 10
 // server is Trelis on a fresh database and file store, with Principals that
 // each hold one API key.
 type server struct {
-	t    *testing.T
-	auth *auth.Store
-	h    http.Handler
+	t          *testing.T
+	principals interfaces.PrincipalService
+	h          http.Handler
 	// files is the object store the server writes Source Files to.
 	files *filetest.Memory
 	keys  map[string]string // Principal name → API key
@@ -36,34 +36,42 @@ type server struct {
 
 func newServer(t *testing.T, principals ...string) *server {
 	t.Helper()
-	pool := dbtest.Migrated(t)
-	c := &server{t: t, auth: auth.NewStore(pool), keys: map[string]string{}, ctx: context.Background()}
+	store := db.NewStore(dbtest.Migrated(t))
+	principalRepo := repository.NewPrincipalRepository(store)
+	authn, principalSvc := realAuth(store)
+	c := &server{t: t, principals: principalSvc, keys: map[string]string{}, ctx: context.Background()}
 	for _, name := range principals {
-		if _, err := c.auth.CreatePrincipal(c.ctx, name); err != nil {
+		if _, err := c.principals.CreatePrincipal(c.ctx, name); err != nil {
 			t.Fatal(err)
 		}
-		_, key, err := c.auth.CreateKey(c.ctx, name)
+		_, key, err := c.principals.CreateAPIKey(c.ctx, name)
 		if err != nil {
 			t.Fatal(err)
 		}
 		c.keys[name] = key
 	}
 	c.files = filetest.NewMemory()
-	store := db.NewStore(pool)
 	docs := service.NewDocumentService(store,
-		repository.NewDocumentRepository(store), repository.NewPrincipalRepository(store), c.files)
-	c.h = New(Readiness{}, c.auth, handler.NewDocumentHandler(docs, testMaxFileSize))
+		repository.NewDocumentRepository(store), principalRepo, c.files)
+	c.h = New(Readiness{}, authn, handler.NewPrincipalHandler(principalSvc),
+		handler.NewDocumentHandler(docs, testMaxFileSize))
 	return c
+}
+
+// realAuth is the Auth and Principal services on store.
+func realAuth(store db.Store) (interfaces.AuthService, interfaces.PrincipalService) {
+	principals, keys := repository.NewPrincipalRepository(store), repository.NewAPIKeyRepository(store)
+	return service.NewAuthService(principals, keys), service.NewPrincipalService(store, principals, keys)
 }
 
 // group creates a Group with the given members.
 func (c *server) group(name string, members ...string) {
 	c.t.Helper()
-	if _, err := c.auth.CreateGroup(c.ctx, name); err != nil {
+	if _, err := c.principals.CreateGroup(c.ctx, name); err != nil {
 		c.t.Fatal(err)
 	}
 	for _, m := range members {
-		if err := c.auth.AddMember(c.ctx, name, m); err != nil {
+		if err := c.principals.AddMember(c.ctx, name, m); err != nil {
 			c.t.Fatal(err)
 		}
 	}
@@ -282,7 +290,7 @@ func TestJoiningAGroupGrantsItsDocumentsOnTheNextRequest(t *testing.T) {
 	if got := c.list("bob"); len(got) != 0 {
 		t.Fatalf("bob before joining lists %v, want nothing", got)
 	}
-	if err := c.auth.AddMember(c.ctx, "legal", "bob"); err != nil {
+	if err := c.principals.AddMember(c.ctx, "legal", "bob"); err != nil {
 		t.Fatal(err)
 	}
 	if got := c.list("bob"); len(got) != 1 {

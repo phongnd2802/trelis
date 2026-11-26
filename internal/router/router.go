@@ -10,15 +10,18 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/phongnd2802/trelis/internal/handler"
+	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
 
 // New returns the service's routes. GET /healthz is liveness and ignores
 // dependencies; GET /readyz probes every dependency in ready. Both are open
 // so orchestrators can probe them; everything else, unknown paths and
 // methods included, needs an API key that authn accepts, so a caller
-// without one cannot map the routes. docs serves /documents and may be nil
-// only where those routes are never called.
-func New(ready Readiness, authn Authenticator, docs *handler.DocumentHandler) http.Handler {
+// without one cannot map the routes. principals serves /me and docs
+// /documents; either may be nil only where its routes are never called.
+func New(ready Readiness, authn interfaces.AuthService,
+	principals *handler.PrincipalHandler, docs *handler.DocumentHandler,
+) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Get("/healthz", healthz)
@@ -32,7 +35,7 @@ func New(ready Readiness, authn Authenticator, docs *handler.DocumentHandler) ht
 
 	r.Group(func(r chi.Router) {
 		r.Use(authed)
-		r.Get("/me", me)
+		r.Get("/me", principals.Me)
 		r.Post("/documents", docs.CreateDocumentFromFile)
 		r.Get("/documents", docs.ListDocuments)
 		r.Get("/documents/{id}", docs.GetDocument)
