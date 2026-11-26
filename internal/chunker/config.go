@@ -4,8 +4,9 @@ import "strings"
 
 // Strategy values for SplitterConfig.Strategy.
 const (
-	// StrategyAuto lets the document decide which tiers to try. Until the
-	// profiler lands (#28) it runs the recursive tier alone.
+	// StrategyAuto profiles the Document and lets it decide which tiers to
+	// try: dense headings get the heading tier then recursive, anything
+	// else the recursive tier alone.
 	StrategyAuto = "auto"
 	// StrategyRecursive runs the recursive tier alone.
 	StrategyRecursive = "recursive"

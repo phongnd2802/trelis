@@ -183,6 +183,93 @@ func TestSplitAndDiagnosticsAgree(t *testing.T) {
 	}
 }
 
+func TestAutoTierChains(t *testing.T) {
+	var dense strings.Builder
+	dense.WriteString("# Tài liệu\n\n")
+	dense.WriteString(prose(1, 3))
+	dense.WriteString("\n\n")
+	for i := range 5 {
+		fmt.Fprintf(&dense, "## Phần %d\n\n", i)
+		dense.WriteString(prose(1, 3))
+		dense.WriteString("\n\n")
+	}
+	fragmented := "# Dài\n\n" + prose(2, 3) + "\n\n" + strings.Repeat("# Ngắn\n\nx\n\n", 4)
+	sparse := "# Mở đầu\n\n" + prose(20, 4)
+
+	// Fragmentation is the only validator rejection the real heading tier can
+	// reach through StrategyAuto: the profiler counts at least three headed
+	// sections with body (so "no chunks" and "one chunk" are out), heading
+	// boundaries sit outside protected spans, and the lower bound keeps the
+	// longest Chunk over a quarter of the target.
+	tests := []struct {
+		name     string
+		text     string
+		cfg      SplitterConfig
+		chain    []StrategyTier
+		selected StrategyTier
+		rejected []TierRejection
+	}{
+		{
+			name:     "the heading tier is picked and accepted",
+			text:     dense.String(),
+			cfg:      SplitterConfig{ChunkSize: 200, Strategy: StrategyAuto},
+			chain:    []StrategyTier{TierHeading, TierRecursive},
+			selected: TierHeading,
+		},
+		{
+			name:     "the heading tier fragments and falls back",
+			text:     fragmented,
+			cfg:      SplitterConfig{ChunkSize: 100, Strategy: StrategyAuto},
+			chain:    []StrategyTier{TierHeading, TierRecursive},
+			selected: TierRecursive,
+			rejected: []TierRejection{{Tier: TierHeading, Reason: "fragmented"}},
+		},
+		{
+			name:     "sparse headings go straight to recursive",
+			text:     sparse,
+			cfg:      SplitterConfig{Strategy: StrategyAuto},
+			chain:    []StrategyTier{TierRecursive},
+			selected: TierRecursive,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chunks, diag := SplitWithDiagnostics(tt.text, tt.cfg)
+			if !slices.Equal(diag.TierChain, tt.chain) {
+				t.Fatalf("chain = %v, want %v", diag.TierChain, tt.chain)
+			}
+			if diag.SelectedTier != tt.selected {
+				t.Fatalf("selected %q, want %q (rejected %v)", diag.SelectedTier, tt.selected, diag.Rejected)
+			}
+			if len(diag.Rejected) != len(tt.rejected) {
+				t.Fatalf("rejected = %v, want %v", diag.Rejected, tt.rejected)
+			}
+			for i, want := range tt.rejected {
+				got := diag.Rejected[i]
+				if got.Tier != want.Tier || !strings.Contains(got.Reason, want.Reason) {
+					t.Fatalf("rejection %d = %v, want tier %q with a reason about %q", i, got, want.Tier, want.Reason)
+				}
+			}
+			if diag.Profile == nil {
+				t.Fatal("the auto strategy returned no profile")
+			}
+			assertPositions(t, tt.text, chunks)
+		})
+	}
+}
+
+func TestRecursiveNeverProfiles(t *testing.T) {
+	text := strings.Repeat("# Phần\n\nNội dung.\n\n", 6)
+
+	_, diag := SplitWithDiagnostics(text, SplitterConfig{Strategy: StrategyRecursive})
+	if diag.Profile != nil {
+		t.Fatalf("profile = %+v, want nil for an explicit strategy", diag.Profile)
+	}
+	if !slices.Equal(diag.TierChain, []StrategyTier{TierRecursive}) {
+		t.Fatalf("chain = %v, want recursive alone", diag.TierChain)
+	}
+}
+
 func TestDiagnosticsForEmptyText(t *testing.T) {
 	chunks, diag := SplitWithDiagnostics("", DefaultConfig())
 	if chunks != nil || diag == nil || diag.SelectedTier != TierRecursive {
