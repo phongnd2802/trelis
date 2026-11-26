@@ -78,9 +78,15 @@ func chatBody(user string) map[string]any {
 
 func TestScriptReplaysRepliesInOrderAcrossBothProtocols(t *testing.T) {
 	p := modeltest.NewFakeProvider(t)
-	p.Script(modeltest.Call("search", `{"q":"tax"}`), modeltest.Text("Done."))
+	p.Script(modeltest.Contains("tax rules"), modeltest.Call("search", `{"q":"tax"}`), modeltest.Text("Done."))
+	p.Reply(modeltest.Any(), modeltest.Text("unrelated"))
 
-	_, raw := post(t, p, "/chat/completions", chatBody("Find the tax rules"))
+	// A request the script's Match rejects does not consume it.
+	_, raw := post(t, p, "/chat/completions", chatBody("Something else"))
+	if got := decode[chatCompletion](t, raw).Choices[0].Message.Content; got == nil || *got != "unrelated" {
+		t.Errorf("unrelated call = %s, want the rule's reply", raw)
+	}
+	_, raw = post(t, p, "/chat/completions", chatBody("Find the tax rules"))
 	if c := decode[chatCompletion](t, raw).Choices[0]; len(c.Message.ToolCalls) != 1 || c.Message.ToolCalls[0].Function.Name != "search" {
 		t.Errorf("first call = %s, want the search tool call", raw)
 	}
@@ -88,15 +94,15 @@ func TestScriptReplaysRepliesInOrderAcrossBothProtocols(t *testing.T) {
 	if out := decode[response](t, raw).Output; len(out) != 1 || out[0].Content[0].Text != "Done." {
 		t.Errorf("second call = %s, want Done.", raw)
 	}
-	if n := p.CallCount(modeltest.ChatCompletions) + p.CallCount(modeltest.Responses); n != 2 {
-		t.Errorf("call count = %d, want 2", n)
+	if n := p.CallCount(modeltest.ChatCompletions) + p.CallCount(modeltest.Responses); n != 3 {
+		t.Errorf("call count = %d, want 3", n)
 	}
 }
 
-func TestScriptFallsBackToRulesThenFailsAnUnexpectedExtraCall(t *testing.T) {
+func TestAnUnexpectedExtraCallAfterTheScriptFailsTheTest(t *testing.T) {
 	rec := &recorder{TB: t}
 	p := modeltest.NewFakeProvider(rec)
-	p.Script(modeltest.Text("first"))
+	p.Script(modeltest.Any(), modeltest.Text("first"))
 
 	_, raw := post(t, p, "/chat/completions", chatBody("hi"))
 	if got := decode[chatCompletion](t, raw).Choices[0].Message.Content; got == nil || *got != "first" {

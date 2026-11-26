@@ -2,7 +2,7 @@ Trelis
 =======
 
 Parts of Trelis are copied near-verbatim from Omnisc, a fork of WeKnora
-(https://github.com/Tencent/WeKnora), which is licensed under the MIT license
+(https://github.com/Tencent/WeKnora), under the MIT terms of its license,
 reproduced below. Each such part says so in a comment where it appears.
 
   internal/integration/harness_test.go
@@ -11,7 +11,9 @@ reproduced below. Each such part says so in a comment where it appears.
 
   internal/models/modeltest/fake_provider.go
     the "Build tag is intentionally absent" paragraph of the package doc
-    from cli/internal/testutil/xdg.go
+    from cli/internal/testutil/xdg.go; the scripted replay (Script) and its
+    "unexpected extra call" failure, from scriptedTemplateChatModel in
+    internal/application/service/wiki_page_rewrite_continuation_test.go
 
 --------------------------------------------------------------------
 WeKnora

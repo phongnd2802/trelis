@@ -41,10 +41,6 @@ const (
 	bootTimeout = 30 * time.Second
 )
 
-// configFile is the repo's config, which every Trelis process starts from;
-// the harness overrides keys through TRELIS_* env vars, as an operator would.
-const configFile = "../../config/trelis.yaml"
-
 // deps is what TestMain starts once for the whole package.
 var deps struct {
 	binary string
@@ -57,7 +53,7 @@ var deps struct {
 type hostPort struct{ host, port string }
 
 func TestMain(m *testing.M) {
-	code, err := setUp(m)
+	code, err := runSuite(m)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "integration:", err)
 		os.Exit(1)
@@ -65,9 +61,9 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// setUp builds Trelis and starts the containers, runs the tests, then
+// runSuite builds Trelis and starts the containers, runs the tests, then
 // tears everything down.
-func setUp(m *testing.M) (int, error) {
+func runSuite(m *testing.M) (int, error) {
 	ctx := context.Background()
 
 	dir, err := os.MkdirTemp("", "trelis-integration-")
@@ -78,7 +74,10 @@ func setUp(m *testing.M) (int, error) {
 	if deps.binary, err = buildBinary(dir); err != nil {
 		return 0, err
 	}
-	if deps.config, err = filepath.Abs(configFile); err != nil {
+	// Every key comes from TRELIS_* env (see trelisEnv), so the config file
+	// is empty and a change to config/trelis.yaml cannot reach the tests.
+	deps.config = filepath.Join(dir, "trelis.yaml")
+	if err := os.WriteFile(deps.config, []byte("# all keys from TRELIS_* env\n"), 0o600); err != nil {
 		return 0, err
 	}
 
@@ -158,8 +157,8 @@ type trelis struct {
 	// url is the base URL of its HTTP API, e.g. http://127.0.0.1:41234.
 	url string
 	// provider is the fake model provider this Trelis is meant to call. No
-	// model role is configurable yet; when roles land, point them at
-	// provider.URL() in trelisEnv.
+	// model role is configurable yet; when roles land, pass provider.URL()
+	// to trelisEnv and point every role at it.
 	provider *modeltest.FakeProvider
 	// env is the process environment of every command run as this Trelis.
 	env []string
@@ -253,11 +252,19 @@ func freshDatabase(t *testing.T) string {
 	return name
 }
 
-// trelisEnv points the config at the containers and dbname through env
-// overrides. Temporal is left unreachable: the client connects lazily and
-// nothing under test uses it yet.
+// trelisEnv configures Trelis for the containers and dbname, as an operator
+// would, through TRELIS_* env. TRELIS_* variables of the developer's shell
+// are dropped, so every key Trelis reads is either set here or its default.
+// Temporal is left unreachable: the client connects lazily and nothing under
+// test uses it yet.
 func trelisEnv(dbname string) []string {
-	return append(os.Environ(),
+	var env []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "TRELIS_") {
+			env = append(env, kv)
+		}
+	}
+	return append(env,
 		"TRELIS_SERVER_ADDR=127.0.0.1:0",
 		"TRELIS_SERVER_SHUTDOWN_TIMEOUT=5s",
 		"TRELIS_POSTGRES_HOST="+deps.pg.host,

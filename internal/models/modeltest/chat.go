@@ -216,5 +216,5 @@ func badRequest(err error) (int, any) {
 // unscripted answers a request no rule matched; the test has already been
 // failed by generate.
 func unscripted(prompt Prompt) (int, any) {
-	return http.StatusInternalServerError, newError("modeltest: unexpected extra call: the script is used up and no Reply rule matches this request:\n"+prompt.String(), "unscripted")
+	return http.StatusInternalServerError, newError("modeltest: unexpected extra call: no scripted reply is left and no Reply rule matches this request:\n"+prompt.String(), "unscripted")
 }

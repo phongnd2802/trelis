@@ -14,12 +14,16 @@
 // endpoint's wire format and streamed when the request asks for it:
 //
 //   - [FakeProvider.Script] replays a fixed sequence of replies, one per
-//     call, the way an agent loop consumes them.
-//   - [FakeProvider.Reply] rules answer any request their [Match] accepts,
-//     once the sequence is used up; the first matching rule wins.
+//     call its [Match] accepts, the way an agent loop consumes them. The
+//     Match keeps other callers (ingest, Entity Resolution) from taking a
+//     turn meant for the loop.
+//   - [FakeProvider.Reply] rules answer any request their Match accepts,
+//     when no script does; the first matching rule wins.
 //
 // A generation request that neither answers fails the test: an unexpected
-// extra call. Embeddings and rerank need no script: they answer from the
+// extra call. (The replay and that wording follow Omnisc/WeKnora's
+// scriptedTemplateChatModel, Copyright (C) 2026 Tencent, MIT license; see
+// NOTICE.) Embeddings and rerank need no script: they answer from the
 // input text ([FakeProvider.EmbedAs] and [FakeProvider.ScoreAs] pin values).
 // [FakeProvider.FailNext] makes an endpoint return errors for a while, and
 // [FakeProvider.CallCount] and [FakeProvider.Requests] report what each
@@ -54,9 +58,8 @@ type FakeProvider struct {
 	t   testing.TB
 	srv *httptest.Server
 
-	mu sync.Mutex
-	// script is what Script queued and the next calls consume.
-	script   []Reply
+	mu       sync.Mutex
+	scripts  []script
 	rules    []rule
 	failures map[Endpoint][]failure
 	requests map[Endpoint][]Request
@@ -64,6 +67,12 @@ type FakeProvider struct {
 	scores   map[[2]string]float64
 	dims     int
 	seq      int
+}
+
+// script is one Script registration; replies still to be given.
+type script struct {
+	match   Match
+	replies []Reply
 }
 
 // rule is one Reply registration.
@@ -123,12 +132,13 @@ func (p *FakeProvider) Reply(match Match, r Reply) {
 }
 
 // Script queues replies that the next Chat Completions or Responses calls
-// get, one per call, before any [FakeProvider.Reply] rule is consulted.
-// Calls append to the sequence.
-func (p *FakeProvider) Script(replies ...Reply) {
+// match accepts get, one per call and in order, before any
+// [FakeProvider.Reply] rule is consulted. Scripts are tried in the order
+// they were added; a used-up script no longer answers.
+func (p *FakeProvider) Script(match Match, replies ...Reply) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.script = append(p.script, replies...)
+	p.scripts = append(p.scripts, script{match: match, replies: replies})
 }
 
 // FailNext makes the next n requests to e answer status with an
@@ -198,22 +208,23 @@ func (p *FakeProvider) takeFailure(e Endpoint) int {
 	return status
 }
 
-// generate takes the next scripted reply, else the first matching rule's,
-// else fails the test.
+// generate takes the next reply of the first script that matches prompt,
+// else the first matching rule's, else fails the test.
 func (p *FakeProvider) generate(prompt Prompt) (Reply, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.script) > 0 {
-		next := p.script[0]
-		p.script = p.script[1:]
-		return next, true
+	for i, s := range p.scripts {
+		if len(s.replies) > 0 && s.match(prompt) {
+			p.scripts[i].replies = s.replies[1:]
+			return s.replies[0], true
+		}
 	}
 	for _, r := range p.rules {
 		if r.match(prompt) {
 			return r.reply, true
 		}
 	}
-	p.t.Errorf("modeltest: unexpected extra call: the script is used up and no Reply rule matches this %s request:\n%s", prompt.Endpoint, prompt)
+	p.t.Errorf("modeltest: unexpected extra call: no scripted reply is left and no Reply rule matches this %s request:\n%s", prompt.Endpoint, prompt)
 	return Reply{}, false
 }
 
