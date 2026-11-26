@@ -172,6 +172,22 @@ func TestTheFinalTierAlwaysReturnsChunks(t *testing.T) {
 	assertCovers(t, text, res.Chunks)
 }
 
+func TestListingTheRecursiveTierDoesNotRunItTwice(t *testing.T) {
+	never := func(chunker.Input, []chunker.Chunk, chunker.Sizer) error { return errors.New("no") }
+	c, err := chunker.New(chunker.Config{TokenLimit: 20},
+		chunker.WithTiers(chunker.Recursive, byLines), chunker.WithValidator(never))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	var tiers []string
+	for _, r := range c.Chunk(prose(2, 2)).Rejected {
+		tiers = append(tiers, r.Tier)
+	}
+	if want := []string{"lines", "recursive"}; !slices.Equal(tiers, want) {
+		t.Fatalf("tiers tried = %q, want %q", tiers, want)
+	}
+}
+
 func FuzzRecursiveOutputIsValid(f *testing.F) {
 	f.Add("Mở đầu.\n\n"+table+"\n\n"+prose(2, 3), 7)
 	f.Add("```\na\n\nb\n```\n$$\nx\n\n$$\n| a |\n| b |", 1)

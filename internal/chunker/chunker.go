@@ -12,12 +12,16 @@ package chunker
 
 import (
 	"errors"
+	"slices"
 	"strings"
+	"unicode"
 )
 
 // Chunk is a contiguous piece of the source text. Content is exactly
 // text[Start:End], with Start and End byte offsets into the text given to
-// Chunker.Chunk.
+// Chunker.Chunk. Context a tier adds that is not at those offsets (a
+// heading breadcrumb, a table header carried into a continuation Chunk)
+// belongs in a field of its own, so offsets stay exact.
 type Chunk struct {
 	Content string
 	Start   int
@@ -99,9 +103,12 @@ type Result struct {
 // Option configures a Chunker beyond its Config.
 type Option func(*Chunker)
 
-// WithTiers sets the tiers tried, in order, before the recursive tier.
+// WithTiers sets the tiers tried, in order, before the recursive tier. The
+// recursive tier always runs last, so listing it here has no effect.
 func WithTiers(tiers ...Tier) Option {
-	return func(c *Chunker) { c.tiers = tiers }
+	return func(c *Chunker) {
+		c.tiers = slices.DeleteFunc(slices.Clone(tiers), func(t Tier) bool { return t == Recursive })
+	}
 }
 
 // WithValidator replaces Validate as the Validator.
@@ -141,18 +148,17 @@ func (c *Chunker) Chunk(text string) Result {
 	}
 	in := Input{Text: text, Protected: ProtectedSpans(text)}
 	var res Result
-	for _, tier := range c.tiers {
-		chunks := tier.Split(in, c.sizer)
-		if err := c.validate(in, chunks, c.sizer); err != nil {
-			res.Rejected = append(res.Rejected, Rejection{Tier: tier.Name(), Reason: err})
-			continue
+	chain := append(slices.Clip(c.tiers), Recursive)
+	for i, tier := range chain {
+		res.Chunks, res.Tier = tier.Split(in, c.sizer), tier.Name()
+		err := c.validate(in, res.Chunks, c.sizer)
+		if err == nil {
+			break
 		}
-		res.Chunks, res.Tier = chunks, tier.Name()
-		return res
-	}
-	res.Chunks, res.Tier = Recursive.Split(in, c.sizer), Recursive.Name()
-	if err := c.validate(in, res.Chunks, c.sizer); err != nil {
-		res.Rejected = append(res.Rejected, Rejection{Tier: Recursive.Name(), Reason: err})
+		res.Rejected = append(res.Rejected, Rejection{Tier: tier.Name(), Reason: err})
+		if i == len(chain)-1 {
+			break // the recursive tier's Chunks are kept anyway
+		}
 	}
 	return res
 }
@@ -160,8 +166,8 @@ func (c *Chunker) Chunk(text string) Result {
 // trim narrows [start,end) of text to exclude surrounding whitespace.
 func trim(text string, start, end int) (int, int) {
 	s := text[start:end]
-	left := strings.TrimLeft(s, " \t\r\n\f\v")
+	left := strings.TrimLeftFunc(s, unicode.IsSpace)
 	start += len(s) - len(left)
-	end = start + len(strings.TrimRight(left, " \t\r\n\f\v"))
+	end = start + len(strings.TrimRightFunc(left, unicode.IsSpace))
 	return start, end
 }

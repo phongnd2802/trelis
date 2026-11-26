@@ -78,6 +78,51 @@ func TestAProtectedSpanOverTheCapIsItsOwnChunk(t *testing.T) {
 	}
 }
 
+func TestProtectedSpans(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want []string
+	}{
+		{
+			name: "inline code at line start is not a fence",
+			text: "```x``` then text\nmore\n```\ncode\n```",
+			want: []string{"```\ncode\n```"},
+		},
+		{
+			name: "prose between dollar amounts is not math",
+			text: "$$5 is cheap\nand so on, end$$",
+			want: nil,
+		},
+		{
+			name: "one-line math block",
+			text: "Tổng:\n$$ a + b $$\nhết.",
+			want: []string{"$$ a + b $$"},
+		},
+		{
+			name: "table inside a fence is code",
+			text: "```\n| a | b |\n|---|---|\n```",
+			want: []string{"```\n| a | b |\n|---|---|\n```"},
+		},
+		{
+			name: "a lone pipe row is not a table",
+			text: "| chỉ một dòng |\nvăn bản",
+			want: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []string
+			for _, s := range chunker.ProtectedSpans(tt.text) {
+				got = append(got, tt.text[s.Start:s.End])
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("spans = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAnUnclosedFenceDoesNotProtectTheRestOfTheText(t *testing.T) {
 	text := "```\n" + prose(4, 4)
 	res := mustNew(t, chunker.Config{TokenLimit: 20, CountTokens: words}).Chunk(text)

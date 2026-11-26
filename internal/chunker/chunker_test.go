@@ -92,8 +92,17 @@ func TestShortTextIsOneChunk(t *testing.T) {
 	assertOffsets(t, text, res.Chunks)
 }
 
+func TestUnicodeSpacesAreWhitespace(t *testing.T) {
+	text := "Đoạn một.\n\n 　 \n\nĐoạn hai."
+	res := mustNew(t, chunker.Config{TokenLimit: 3, CountTokens: words}).Chunk(text)
+	want := []string{"Đoạn một.", "Đoạn hai."}
+	if got := contents(res.Chunks); !slices.Equal(got, want) {
+		t.Fatalf("chunks = %q, want %q", got, want)
+	}
+}
+
 func TestEmptyTextHasNoChunks(t *testing.T) {
-	for _, text := range []string{"", " \n\t\n"} {
+	for _, text := range []string{"", " \n\t\n", " 　"} {
 		if res := mustNew(t, chunker.Config{TokenLimit: 512}).Chunk(text); len(res.Chunks) != 0 {
 			t.Fatalf("Chunk(%q) gave %d chunks, want 0", text, len(res.Chunks))
 		}

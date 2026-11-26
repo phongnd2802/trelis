@@ -105,7 +105,9 @@ func matchFence(lines []line, i int) (int, bool) {
 	}
 	marker := open[0]
 	n := len(open) - len(strings.TrimLeft(open, string(marker)))
-	if n < 3 {
+	if n < 3 || (marker == '`' && strings.ContainsRune(open[n:], '`')) {
+		// A backtick in a backtick fence's info string makes the line
+		// inline code, not a fence.
 		return 0, false
 	}
 	for j := i + 1; j < len(lines); j++ {
@@ -117,8 +119,11 @@ func matchFence(lines []line, i int) (int, bool) {
 	return 0, false
 }
 
-// matchMath reports whether lines[i] opens a display math block ($$ or \[)
-// and returns the index of the line that closes it.
+// matchMath reports whether lines[i] holds a display math block ($$ or \[)
+// and returns the index of the line that closes it. The block is either
+// one line that opens and closes it, or an opener alone on its line through
+// the next line that ends with the closer, so prose that happens to start
+// with "$$" is not taken for math.
 func matchMath(lines []line, i int) (int, bool) {
 	open := strings.TrimSpace(lines[i].text)
 	var opener, closer string
@@ -130,8 +135,8 @@ func matchMath(lines []line, i int) (int, bool) {
 	default:
 		return 0, false
 	}
-	if len(open) > len(opener) && strings.HasSuffix(open[len(opener):], closer) {
-		return i, true
+	if len(open) > len(opener) {
+		return i, strings.HasSuffix(open[len(opener):], closer)
 	}
 	for j := i + 1; j < len(lines); j++ {
 		if strings.HasSuffix(strings.TrimSpace(lines[j].text), closer) {
