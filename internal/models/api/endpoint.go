@@ -7,10 +7,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // AuthFunc stamps credentials onto an outbound request. body is the exact
@@ -84,6 +86,44 @@ func (e Endpoint) Do(req *http.Request) (*http.Response, error) {
 		return nil, &HTTPError{StatusCode: resp.StatusCode, Body: string(body), Header: resp.Header}
 	}
 	return resp, nil
+}
+
+// PostJSON sends body as one non-streaming JSON POST to path under BaseURL
+// and returns the raw reply. It is the whole request a model client makes:
+// one deadline (timeout, applied only when ctx carries none), one reply read
+// with the shared cap, and a reply that stops halfway reported as a
+// TransportError so the caller can send it again. An oversized body is a
+// plain error instead, because the same request would get the same oversized
+// reply every time.
+func (e Endpoint) PostJSON(ctx context.Context, path string, body any, timeout time.Duration) ([]byte, error) {
+	ctx, cancel := WithLLMTimeout(ctx, timeout)
+	defer cancel()
+
+	req, _, err := e.NewRequest(ctx, e.Resolve(path), body, false)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := e.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return readReply(resp.Body, 0)
+}
+
+// readReply reads a reply body, refusing anything over limit (0 for the
+// shared cap). A body past the cap is deterministic and comes back as a plain
+// error; every other read failure is worth a retry and comes back as a
+// TransportError.
+func readReply(body io.Reader, limit int64) ([]byte, error) {
+	raw, err := ReadResponseCapped(body, limit)
+	if err != nil {
+		if errors.Is(err, ErrResponseTooLarge) {
+			return nil, fmt.Errorf("read response: %w", err)
+		}
+		return nil, &TransportError{Op: "read response", Err: err}
+	}
+	return raw, nil
 }
 
 // TransportError is a request that never got a whole answer: DNS, connect,
