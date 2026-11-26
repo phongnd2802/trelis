@@ -72,11 +72,14 @@ jobs:
         run: make vet-linked
       - name: Test
         run: make test-linked
+      - name: Integration tests with the linked engine
+        run: make test-integration-linked
       - name: Build
         run: make build
 
-  # The HTTP API against Postgres and Neo4j in testcontainers, with the fake
-  # model provider (internal/integration). The runner's Docker hosts them.
+  # The HTTP API against Postgres, Neo4j and S3 in testcontainers plus a
+  # Temporal dev server, with the fake model provider (internal/integration).
+  # The runner's Docker hosts the containers.
   integration:
     runs-on: ubuntu-latest
     timeout-minutes: 20

@@ -71,9 +71,10 @@ var defaults = map[string]any{
 	"neo4j.user":     "neo4j",
 	"neo4j.password": "",
 
-	"temporal.host":      "localhost",
-	"temporal.port":      7233,
-	"temporal.namespace": "default",
+	"temporal.host":       "localhost",
+	"temporal.port":       7233,
+	"temporal.namespace":  "default",
+	"temporal.task_queue": "trelis-ingest",
 
 	"storage.max_file_size_mb":     50,
 	"storage.s3.endpoint":          "",
@@ -203,6 +204,7 @@ func (c *Config) validate() error {
 	required("temporal.host", c.Temporal.Host)
 	port("temporal.port", c.Temporal.Port)
 	required("temporal.namespace", c.Temporal.Namespace)
+	required("temporal.task_queue", c.Temporal.TaskQueue)
 
 	if c.Storage.MaxFileSizeMB < 1 {
 		errs = append(errs, fmt.Errorf("storage.max_file_size_mb must be at least 1, got %d", c.Storage.MaxFileSizeMB))

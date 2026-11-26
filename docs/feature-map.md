@@ -6,12 +6,12 @@ Status: **done** (built, tested, reachable), **partial** (code exists but nothin
 
 ## System at a glance
 
-- **One Go process**, `cmd/server`, serves the HTTP API and runs the admin CLI (`trelis admin ...`). The binary is `trelis` (`bin/trelis` from `make build`, `/trelis` in the image); in development `go run ./cmd/server` runs it. Background work will run as Temporal workflows (ADR-0005); no worker exists yet.
+- **One Go process**, `cmd/server`, serves the HTTP API and runs the admin CLI (`trelis admin ...`). The binary is `trelis` (`bin/trelis` from `make build`, `/trelis` in the image); in development `go run ./cmd/server` runs it. Ingest runs as a Temporal workflow (ADR-0005), served by a worker inside the same process.
 - **Stores** (`compose.yaml`, `compose.dev.yaml`):
   - Postgres (ParadeDB image, `pgvector` and `pg_search`): the source of truth (ADR-0002). Schema in `migrations/`, applied by goose on every start.
   - S3-compatible object storage (silo in dev): Source Files, later Figures (ADR-0006).
   - Neo4j: a rebuildable graph projection (ADR-0002). Only probed by `/readyz` today.
-  - Temporal: background work (ADR-0005). Only probed by `/readyz` today.
+  - Temporal: runs the ingest workflow (ADR-0005); also probed by `/readyz`.
 - **Layers** (ADR-0007): `internal/router` (chi, middleware) → `internal/handler` (HTTP ↔ service) → `internal/application/service` (use cases, transactions) → `internal/application/repository` (Postgres through `db.Store`) → `internal/db` (sqlc queries, `ExecTx`). Contracts between layers are in `internal/types/interfaces`; domain types in `internal/types`.
 - **A request's path**: `requestID` → `accessLog` → `recoverer` (`internal/router/logging.go`) → `authenticate` (`internal/router/authn.go`, puts the Principal in the context) → handler → service (checks the Access List) → repository.
 
@@ -33,11 +33,12 @@ Status: **done** (built, tested, reachable), **partial** (code exists but nothin
 
 | Feature | Status | Where | Entry points | Tests | Decisions / issues |
 |---|---|---|---|---|---|
-| Parse office documents to Markdown (anydoc, in process, cgo) | partial | `internal/parser/anydoc_parser.go`, `internal/parser/anydoc/`, `third_party/anydoc-go/` | — (no caller yet); build with `make anydoc-lib`, `make build` | `internal/parser/anydoc/anydoc_test.go`, `internal/parser/anydoc/convert_linked_test.go` (`make test-linked`) | — |
+| Parse office documents to Markdown (anydoc, in process, cgo) | done | `internal/parser/anydoc_parser.go`, `internal/parser/anydoc/`, `third_party/anydoc-go/` | the ingest workflow's parse activity; build with `make anydoc-lib`, `make build` | `internal/parser/anydoc/anydoc_test.go`, `internal/parser/anydoc/convert_linked_test.go` (`make test-linked`), `internal/integration/ingest_anydoc_test.go` | ADR-0005, #21 |
 | Supported upload types | done | `internal/utils/import_filetypes.go` | `POST /documents` rejects other types | `internal/router/documents_test.go` | — |
-| Chunker: recursive tier, token limit, protected spans, validator | partial | `internal/chunker/` | — (no caller yet) | `internal/chunker/splitter_test.go`, `internal/chunker/strategy_test.go`, `internal/chunker/config_test.go` | #27 |
+| Chunker: recursive tier, token limit, protected spans, validator | done | `internal/chunker/` | the ingest workflow (`internal/application/service/ingest.go`) | `internal/chunker/splitter_test.go`, `internal/chunker/strategy_test.go`, `internal/chunker/config_test.go` | #27 |
 | Chunker: heading tier, heuristic tier (Vietnamese legal), tables, parent-child | planned | — | — | — | #28, #29, #30 |
-| Ingest workflow on Temporal (parse, chunk, embed), reconciler, cancel on delete, progress over SSE | planned | — | — | — | Week 1 (#2): #21, #22, #26, #24, #23, #31 |
+| Ingest workflow on Temporal: parse a Source File, chunk it, store the Chunks | done | `internal/ingest/`, `internal/application/service/ingest.go`, `internal/application/repository/chunk.go`, `migrations/00006_chunks.sql` | `POST /documents` starts it; the worker runs in `cmd/server` | `internal/integration/ingest_test.go`, `internal/integration/ingest_anydoc_test.go` | ADR-0005, #21 |
+| Ingest: embedding, reconciler, cancel on delete, progress over SSE | planned | — | — | — | Week 1 (#2): #22, #26, #24, #23, #31 |
 | OCR fallback (Docling, VLM), image captions | planned | — | — | — | Week 7 (#8): #76, #77, #78, #79 |
 
 ## Model clients
@@ -74,7 +75,7 @@ Each role (`models.chat`, `models.extraction`, `models.judge`, `models.embedding
 | Postgres connection, migrations, `db.Store` with context-carried transactions | done | `internal/db/`, `internal/db/queries/`, `internal/db/sqlc/` (generated), `migrations/` | `make sqlc` | `internal/db/store_test.go`, `internal/db/migrate_test.go` | ADR-0007, #13, #109 |
 | Local stack | done | `compose.dev.yaml` (dependencies), `compose.yaml` (full stack), `scripts/stack-up.sh`, `deploy/temporal/` | `make dev-up`, `make dev`, `make stack-up`, `make dev-down` | CI `compose-smoke` job | #13, #97 |
 | CI: lint (golangci-lint, depguard, gofmt, NOTICE, this map), vet, unit, linked, integration, compose smoke, Swagger spec freshness | done | `.github/workflows/ci.yml`, `.golangci.yml`, `scripts/check-notice.sh`, `scripts/check-feature-map.sh` | `make lint vet test`, `scripts/ci-wait.sh <branch>` | — | #11 |
-| Integration tests: Trelis binary against Postgres, Neo4j and S3 in testcontainers, fake model provider | done | `internal/integration/` | `make test-integration` | `internal/integration/documents_test.go`, `internal/integration/me_test.go` | #15 |
+| Integration tests: Trelis binary against Postgres, Neo4j, S3 and a Temporal dev server, fake model provider | done | `internal/integration/` | `make test-integration`, `make test-integration-linked` | `internal/integration/documents_test.go`, `internal/integration/me_test.go`, `internal/integration/ingest_test.go`, `internal/integration/ingest_anydoc_test.go` | #15, #21 |
 | Tracing (OpenTelemetry to Langfuse) | planned | — | — | — | #74 |
 
 ## Planned areas

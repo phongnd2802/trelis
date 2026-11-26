@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type ApiKey struct {
@@ -16,6 +17,20 @@ type ApiKey struct {
 	KeyHash     []byte
 	CreatedAt   time.Time
 	RevokedAt   *time.Time
+}
+
+type Chunk struct {
+	ID         uuid.UUID
+	DocumentID uuid.UUID
+	// Position of the Chunk in its Document, from 0
+	Seq           int32
+	Content       string
+	ContextHeader string
+	// First rune of the Markdown held in content
+	StartOffset int32
+	// Rune just past the last one held in content
+	EndOffset int32
+	CreatedAt time.Time
 }
 
 type Document struct {
@@ -32,6 +47,8 @@ type Document struct {
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 	UploadID    uuid.UUID
+	// Why the last parse failed; NULL unless parse_status is failed
+	ParseError pgtype.Text
 }
 
 type DocumentGroup struct {

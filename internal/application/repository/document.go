@@ -82,6 +82,33 @@ func (r *documentRepository) GetDocumentByOwnerAndHash(ctx context.Context, owne
 	return fromRow(row), nil
 }
 
+// GetDocumentByID returns the Document without checking an Access List. It is
+// the system view the ingest activities use, which run with no Principal.
+func (r *documentRepository) GetDocumentByID(ctx context.Context, id uuid.UUID) (*types.Document, error) {
+	row, err := r.store.Querier(ctx).GetDocumentByID(ctx, id)
+	if errors.Is(err, db.ErrNotFound) {
+		return nil, ErrDocumentNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("document %s: %w", id, err)
+	}
+	return fromRow(row), nil
+}
+
+// SetParseStatus sets a Document's parse status and, when it failed, the
+// reason it is shown with; any other status clears the reason.
+func (r *documentRepository) SetParseStatus(ctx context.Context, id uuid.UUID, status, parseError string) error {
+	err := r.store.Querier(ctx).SetDocumentParseStatus(ctx, sqlc.SetDocumentParseStatusParams{
+		ID:          id,
+		ParseStatus: status,
+		ParseError:  parseError,
+	})
+	if err != nil {
+		return fmt.Errorf("set parse status of document %s: %w", id, err)
+	}
+	return nil
+}
+
 // GetReadableDocumentByID returns the Document if principalID can read it.
 func (r *documentRepository) GetReadableDocumentByID(ctx context.Context, principalID, id uuid.UUID) (*types.Document, error) {
 	row, err := r.store.Querier(ctx).GetReadableDocument(ctx, sqlc.GetReadableDocumentParams{ID: id, PrincipalID: principalID})
@@ -139,7 +166,7 @@ func nonNil(s []string) []string {
 }
 
 func fromRow(r sqlc.Document) *types.Document {
-	return &types.Document{
+	doc := &types.Document{
 		ID:          r.ID,
 		OwnerID:     r.OwnerID,
 		Title:       r.Title,
@@ -153,4 +180,8 @@ func fromRow(r sqlc.Document) *types.Document {
 		CreatedAt:   r.CreatedAt,
 		UpdatedAt:   r.UpdatedAt,
 	}
+	if r.ParseError.Valid {
+		doc.ParseError = r.ParseError.String
+	}
+	return doc
 }

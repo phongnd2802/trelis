@@ -9,14 +9,14 @@
 // (run `trelis admin` for the list); they migrate Postgres and exit without
 // serving. Every HTTP route except /healthz and /readyz needs an API key.
 //
-// On start it applies pending Postgres migrations, then serves. When
-// storage.s3.create_bucket is set it creates the bucket Source Files go to,
-// retrying in the background while object storage is unreachable.
+// On start it applies pending Postgres migrations, then serves. The ingest
+// workflow's worker runs in the process, retrying in the background while
+// Temporal is unreachable, as the bucket is created while object storage is.
 // GET /readyz probes Postgres, object storage, Neo4j and Temporal; the last
 // three are reached lazily, so the service starts even while they are still
 // coming up.
-// SIGINT or SIGTERM stops accepting connections and drains in-flight
-// requests for up to server.shutdown_timeout before exiting.
+// SIGINT or SIGTERM stops accepting connections, drains in-flight requests
+// for up to server.shutdown_timeout and stops the worker before exiting.
 package main
 
 import (
@@ -41,7 +41,9 @@ import (
 	"github.com/phongnd2802/trelis/internal/config"
 	"github.com/phongnd2802/trelis/internal/db"
 	"github.com/phongnd2802/trelis/internal/handler"
+	"github.com/phongnd2802/trelis/internal/ingest"
 	"github.com/phongnd2802/trelis/internal/logger"
+	"github.com/phongnd2802/trelis/internal/parser"
 	"github.com/phongnd2802/trelis/internal/router"
 )
 
@@ -75,6 +77,53 @@ func ensureBucket(ctx context.Context, files *file.S3FileService) {
 			return
 		}
 	}()
+}
+
+// workerRetry is how long startIngestWorker waits between attempts while
+// Temporal is unreachable.
+const workerRetry = 2 * time.Second
+
+// startIngestWorker runs the ingest worker in the background, retrying while
+// Temporal is unreachable, the way ensureBucket waits for object storage: the
+// service starts and serves either way, and /readyz reports Temporal. The
+// returned stop function cancels the retries, stops a running worker and
+// waits for it, so shutdown finishes before its Temporal client closes.
+func startIngestWorker(ctx context.Context, c client.Client, taskQueue string,
+	activities *ingest.Activities,
+) (stop func()) {
+	workerCtx, cancel := context.WithCancel(ctx)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		first := true
+		for {
+			w := ingest.NewWorker(c, taskQueue, activities)
+			err := w.Start()
+			if err == nil {
+				logger.Ctx(ctx).Info("ingest worker started", zap.String("task_queue", taskQueue))
+				<-workerCtx.Done()
+				w.Stop()
+				return
+			}
+			// One warning when Temporal is first found down, then debug: a
+			// long outage should not fill the log with the same line.
+			if first {
+				logger.Ctx(ctx).Warn("ingest worker not ready, retrying in the background", zap.Error(err))
+				first = false
+			} else {
+				logger.Ctx(ctx).Debug("ingest worker still not ready", zap.Error(err))
+			}
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-time.After(workerRetry):
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-stopped
+	}
 }
 
 // readyTimeout bounds each dependency probe behind /readyz.
@@ -188,9 +237,14 @@ func run(configPath string, args []string) (err error) {
 	if s3.CreateBucket {
 		ensureBucket(ctx, files)
 	}
+	docRepo := repository.NewDocumentRepository(dbStore)
+	ingestActivities := ingest.NewActivities(service.NewIngestService(dbStore, docRepo,
+		repository.NewChunkRepository(dbStore), files, parser.NewAnydocParser(false)))
+	stopIngestWorker := startIngestWorker(ctx, temporal, cfg.Temporal.TaskQueue, ingestActivities)
+	defer stopIngestWorker()
 	docs := handler.NewDocumentHandler(
-		service.NewDocumentService(dbStore,
-			repository.NewDocumentRepository(dbStore), principalRepo, files),
+		service.NewDocumentService(dbStore, docRepo, principalRepo, files,
+			ingest.NewStarter(temporal, cfg.Temporal.TaskQueue)),
 		cfg.Storage.MaxFileSize(),
 	)
 

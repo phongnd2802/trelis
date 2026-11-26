@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/google/uuid"
 
 	"github.com/phongnd2802/trelis/internal/application/repository"
 	"github.com/phongnd2802/trelis/internal/application/service"
@@ -30,8 +34,33 @@ type server struct {
 	h          http.Handler
 	// files is the object store the server writes Source Files to.
 	files *filetest.Memory
-	keys  map[string]string // Principal name → API key
-	ctx   context.Context
+	// ingest records the Documents uploads asked the ingest workflow to
+	// process.
+	ingest *fakeStarter
+	keys   map[string]string // Principal name → API key
+	ctx    context.Context
+}
+
+// fakeStarter is an IngestStarter that records the IDs it was asked to start
+// and can fail.
+type fakeStarter struct {
+	mu      sync.Mutex
+	started []uuid.UUID
+	err     error
+}
+
+func (f *fakeStarter) StartIngest(_ context.Context, documentID uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.started = append(f.started, documentID)
+	return f.err
+}
+
+// startedIDs returns the IDs StartIngest was called with, in order.
+func (f *fakeStarter) startedIDs() []uuid.UUID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]uuid.UUID(nil), f.started...)
 }
 
 func newServer(t *testing.T, principals ...string) *server {
@@ -51,8 +80,9 @@ func newServer(t *testing.T, principals ...string) *server {
 		c.keys[name] = key
 	}
 	c.files = filetest.NewMemory()
+	c.ingest = &fakeStarter{}
 	docs := service.NewDocumentService(store,
-		repository.NewDocumentRepository(store), principalRepo, c.files)
+		repository.NewDocumentRepository(store), principalRepo, c.files, c.ingest)
 	c.h = New(Readiness{}, authn, handler.NewPrincipalHandler(principalSvc),
 		handler.NewDocumentHandler(docs, testMaxFileSize), false)
 	return c
@@ -298,6 +328,32 @@ func TestJoiningAGroupGrantsItsDocumentsOnTheNextRequest(t *testing.T) {
 	}
 }
 
+func TestAnUploadStartsTheIngestWorkflowForTheNewDocument(t *testing.T) {
+	c := newServer(t, "alice")
+	id := c.uploaded("alice", upFile("luat-thue.txt", "Điều 1. Phạm vi điều chỉnh"))
+
+	started := c.ingest.startedIDs()
+	if len(started) != 1 || started[0].String() != id {
+		t.Errorf("StartIngest called with %v, want once with %s", started, id)
+	}
+}
+
+func TestAnUploadSucceedsWhenTheIngestWorkflowWillNotStart(t *testing.T) {
+	c := newServer(t, "alice")
+	c.ingest.err = errors.New("temporal unreachable")
+
+	rec := c.upload("alice", upFile("luat-thue.txt", "Điều 1. Phạm vi điều chỉnh"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload = %d %s, want 200 even when the workflow did not start", rec.Code, rec.Body)
+	}
+	if doc := decodeDoc(t, rec); doc.ParseStatus != "pending" {
+		t.Errorf("parse_status = %q, want pending", doc.ParseStatus)
+	}
+	if got := c.ingest.startedIDs(); len(got) != 1 {
+		t.Errorf("StartIngest called %d times, want once even though it failed", len(got))
+	}
+}
+
 func TestAnUploadNamingAnUnknownPrincipalOrGroupStoresNothing(t *testing.T) {
 	c := newServer(t, "alice")
 	for _, f := range []form{principals("ghost"), groups("nobody")} {
@@ -324,6 +380,9 @@ func TestUploadingTheSameFileTwiceIsAConflict(t *testing.T) {
 	}
 	if e := decode(t, rec); e.Code != "duplicate_document" || decodeDoc(t, rec).ID != id {
 		t.Errorf("409 body = %s, want code duplicate_document and the existing Document %s", rec.Body, id)
+	}
+	if got := c.ingest.startedIDs(); len(got) != 1 || got[0].String() != id {
+		t.Errorf("StartIngest called with %v after a duplicate upload, want only the first upload's %s", got, id)
 	}
 	// Another Principal's identical file is their own Document.
 	c.uploaded("bob", upFile("luat.txt", "Luật 04/2007"))

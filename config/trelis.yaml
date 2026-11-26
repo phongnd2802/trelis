@@ -51,6 +51,9 @@ temporal:
   host: localhost
   port: 7233
   namespace: default
+  # The queue the ingest workflow and its activities run on; every Trelis
+  # process serving these Documents must use the same one.
+  task_queue: trelis-ingest
 
 storage:
   max_file_size_mb: 50

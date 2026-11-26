@@ -56,6 +56,10 @@ type Temporal struct {
 	Host      string `mapstructure:"host"`
 	Port      int    `mapstructure:"port"`
 	Namespace string `mapstructure:"namespace"`
+	// TaskQueue is the queue the ingest workflow and its activities run on.
+	// Every Trelis process serving these Documents must agree on it, or work
+	// one of them starts is never picked up.
+	TaskQueue string `mapstructure:"task_queue"`
 }
 
 // HostPort is the frontend gRPC address.
