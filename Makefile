@@ -17,7 +17,7 @@ help:
 	@echo "  test-linked  full tests against the linked anydoc archive"
 	@echo "  test-integration  HTTP API tests against Postgres, Neo4j and silo (S3) in testcontainers (needs Docker)"
 	@echo "  vet          go vet both build variants (vet-lite / vet-linked for one)"
-	@echo "  lint         golangci-lint incl. gofmt, no archive (lint-linked: -tags anydoc); NOTICE check"
+	@echo "  lint         golangci-lint incl. gofmt, no archive (lint-linked: -tags anydoc); NOTICE and feature-map checks"
 	@echo "  dev-up       start only the dependencies (compose.dev.yaml) for \`make dev\`, and wait"
 	@echo "  dev-down     stop the local stack (dev or full), keeping its volumes"
 	@echo "  stack-up     full stack (compose.yaml, builds trelis) and wait; on failure print the broken services' logs"
@@ -87,6 +87,7 @@ swagger:
 lint:
 	$(GOLANGCI_LINT) run --build-tags integration ./...
 	scripts/check-notice.sh
+	scripts/check-feature-map.sh
 
 lint-linked:
 	CGO_ENABLED=1 $(GOLANGCI_LINT) run --build-tags anydoc,integration ./...
