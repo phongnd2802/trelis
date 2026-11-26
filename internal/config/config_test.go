@@ -187,6 +187,11 @@ models:
   judge:
     base_url: https://api.openai.com/v1
     model: gpt-4.1
+  embedding:
+    base_url: http://litellm:4000/v1
+    model: text-embedding-3-small
+    api_key: sk-embed
+    batch_size: 16
 `
 
 func TestLoadModelRoles(t *testing.T) {
@@ -203,9 +208,43 @@ func TestLoadModelRoles(t *testing.T) {
 			BaseURL: "https://openrouter.ai/api/v1", Model: "qwen/qwen3-32b"}},
 		Judge: ChatRole{Protocol: "openai-completions", Endpoint: Endpoint{
 			BaseURL: "https://api.openai.com/v1", Model: "gpt-4.1", APIKey: "sk-judge"}},
+		Embedding: EmbeddingRole{BatchSize: 16, Endpoint: Endpoint{
+			BaseURL: "http://litellm:4000/v1", Model: "text-embedding-3-small", APIKey: "sk-embed"}},
 	}
 	if cfg.Models != want {
 		t.Errorf("Models = %+v,\nwant     %+v", cfg.Models, want)
+	}
+}
+
+func TestLoadEmbeddingRoleOnItsOwn(t *testing.T) {
+	t.Setenv("TRELIS_MODELS_EMBEDDING_BASE_URL", "http://localhost:4000/v1")
+	t.Setenv("TRELIS_MODELS_EMBEDDING_MODEL", "local-embed")
+	t.Setenv("TRELIS_MODELS_EMBEDDING_API_KEY", "sk-local")
+
+	cfg, err := Load(writeConfig(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := EmbeddingRole{BatchSize: DefaultEmbeddingBatchSize, Endpoint: Endpoint{
+		BaseURL: "http://localhost:4000/v1", Model: "local-embed", APIKey: "sk-local"}}
+	if cfg.Models.Embedding != want {
+		t.Errorf("Models.Embedding = %+v,\nwant             %+v", cfg.Models.Embedding, want)
+	}
+	// A provider for one role is not a provider for the others.
+	if cfg.Models.Chat.Configured() || cfg.Models.Extraction.Configured() || cfg.Models.Judge.Configured() {
+		t.Errorf("Models = %+v, want the chat roles unconfigured", cfg.Models)
+	}
+}
+
+func TestLoadEmbeddingBatchSizeFromEnv(t *testing.T) {
+	t.Setenv("TRELIS_MODELS_EMBEDDING_BATCH_SIZE", "8")
+
+	cfg, err := Load(writeConfig(t, modelsYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Models.Embedding.BatchSize; got != 8 {
+		t.Errorf("Models.Embedding.BatchSize = %d, want the env value 8 over the 16 in YAML", got)
 	}
 }
 
@@ -247,6 +286,9 @@ func TestLoadRejectsInvalidModelRoles(t *testing.T) {
 		{"base url without model", map[string]string{"TRELIS_MODELS_JUDGE_MODEL": " "}, "models.judge.model"},
 		{"base url not http", map[string]string{"TRELIS_MODELS_EXTRACTION_BASE_URL": "litellm:4000"}, "models.extraction.base_url"},
 		{"unknown protocol", map[string]string{"TRELIS_MODELS_CHAT_PROTOCOL": "grpc"}, "models.chat.protocol"},
+		{"embedding model without base url", map[string]string{"TRELIS_MODELS_EMBEDDING_BASE_URL": " "}, "models.embedding.base_url"},
+		{"embedding batch size zero", map[string]string{"TRELIS_MODELS_EMBEDDING_BATCH_SIZE": "0"}, "models.embedding.batch_size"},
+		{"embedding batch size negative", map[string]string{"TRELIS_MODELS_EMBEDDING_BATCH_SIZE": "-4"}, "models.embedding.batch_size"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

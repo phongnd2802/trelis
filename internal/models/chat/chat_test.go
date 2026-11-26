@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/phongnd2802/trelis/internal/config"
@@ -78,17 +79,28 @@ func TestNewChat_EachRoleCallsItsOwnProvider(t *testing.T) {
 func TestNewChat_RejectsIncompleteRole(t *testing.T) {
 	unknown := role("http://localhost:4000/v1", "m", "")
 	unknown.Protocol = "carrier-pigeon"
-	cases := map[string]config.ChatRole{
-		"unconfigured":     {},
-		"no base URL":      role("", "gpt-4o-mini", ""),
-		"no model":         role("http://localhost:4000/v1", "", ""),
-		"blank base URL":   role("   ", "gpt-4o-mini", ""),
-		"unknown protocol": unknown,
+	cases := map[string]struct {
+		role config.ChatRole
+		// want is the part of the message that says which role, or which of
+		// its settings, is missing.
+		want string
+	}{
+		"unconfigured":     {role: config.ChatRole{}, want: "chat:"},
+		"no base URL":      {role: role("", "gpt-4o-mini", ""), want: "chat:"},
+		"no model":         {role: role("http://localhost:4000/v1", "", ""), want: "chat:"},
+		"blank base URL":   {role: role("   ", "gpt-4o-mini", ""), want: "chat:"},
+		"unknown protocol": {role: unknown, want: "unsupported chat api"},
 	}
-	for name, r := range cases {
+	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			if c, err := NewChat(r); err == nil {
-				t.Fatalf("NewChat(%+v) = %v, want an error", r, c)
+			c, err := NewChat(tc.role)
+			if err == nil {
+				t.Fatalf("NewChat(%+v) = %v, want an error", tc.role, c)
+			}
+			// The endpoint errors name the role, so a caller wiring several of
+			// them together can tell which one is incomplete.
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("NewChat err = %q, want it to contain %q", err, tc.want)
 			}
 		})
 	}

@@ -11,9 +11,7 @@ package chat
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/phongnd2802/trelis/internal/config"
 	"github.com/phongnd2802/trelis/internal/models/api"
@@ -52,16 +50,9 @@ type Chat interface {
 // NewChat builds the protocol client for one configured chat role
 // (models.chat, models.extraction or models.judge).
 func NewChat(role config.ChatRole) (Chat, error) {
-	if strings.TrimSpace(role.BaseURL) == "" {
-		return nil, errors.New("chat: base URL is required")
-	}
-	if strings.TrimSpace(role.Model) == "" {
-		return nil, errors.New("chat: model is required")
-	}
-	endpoint := api.Endpoint{
-		BaseURL: role.BaseURL,
-		Model:   role.Model,
-		Auth:    api.BearerAuth(role.APIKey),
+	endpoint, err := role.APIEndpoint("chat")
+	if err != nil {
+		return nil, err
 	}
 
 	switch role.Protocol {
