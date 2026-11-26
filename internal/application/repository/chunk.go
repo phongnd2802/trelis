@@ -3,6 +3,8 @@ package repository
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -43,4 +45,81 @@ func (r *chunkRepository) ReplaceChunks(ctx context.Context, documentID uuid.UUI
 		}
 	}
 	return nil
+}
+
+// ListUnembeddedChunks returns a Document's Chunks in [from, to) that still
+// need embedding, in seq order. Re-running a range therefore skips the Chunks
+// an earlier attempt already stored, and an empty result is a no-op for the
+// caller. The vector itself is not selected: no application code reads a
+// stored embedding, and keeping it out of the scan keeps pgvector's type out
+// of the query.
+func (r *chunkRepository) ListUnembeddedChunks(ctx context.Context, documentID uuid.UUID, from, to int) ([]*types.Chunk, error) {
+	rows, err := r.store.Querier(ctx).ListUnembeddedChunksByDocument(ctx, sqlc.ListUnembeddedChunksByDocumentParams{
+		DocumentID: documentID,
+		FromSeq:    int32(from),
+		ToSeq:      int32(to),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list unembedded chunks %d-%d of document %s: %w", from, to, documentID, err)
+	}
+	chunks := make([]*types.Chunk, 0, len(rows))
+	for _, row := range rows {
+		chunks = append(chunks, &types.Chunk{
+			ID:            row.ID,
+			DocumentID:    documentID,
+			Seq:           int(row.Seq),
+			Content:       row.Content,
+			ContextHeader: row.ContextHeader,
+			StartOffset:   int(row.StartOffset),
+			EndOffset:     int(row.EndOffset),
+		})
+	}
+	return chunks, nil
+}
+
+// CountChunksWithoutEmbedding counts a Document's Chunks that have no vector.
+// Complete uses it so no Document is marked completed with a missing
+// embedding.
+func (r *chunkRepository) CountChunksWithoutEmbedding(ctx context.Context, documentID uuid.UUID) (int, error) {
+	count, err := r.store.Querier(ctx).CountChunksWithoutEmbedding(ctx, documentID)
+	if err != nil {
+		return 0, fmt.Errorf("count unembedded chunks of document %s: %w", documentID, err)
+	}
+	return int(count), nil
+}
+
+// SetChunkEmbedding stores vector and the model that produced it on a Chunk.
+// It starts no transaction of its own: call it inside the service's ExecTx so
+// a failed update leaves no half-embedded batch. A Chunk that no longer exists
+// is an error, not a silent skip, so the activity retries against the Chunk set
+// it has now.
+func (r *chunkRepository) SetChunkEmbedding(ctx context.Context, chunkID uuid.UUID, vector []float32, model string) error {
+	rows, err := r.store.Querier(ctx).SetChunkEmbedding(ctx, sqlc.SetChunkEmbeddingParams{
+		ID:             chunkID,
+		Embedding:      vectorText(vector),
+		EmbeddingModel: model,
+	})
+	if err != nil {
+		return fmt.Errorf("set embedding of chunk %s: %w", chunkID, err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("set embedding of chunk %s: the Chunk no longer exists", chunkID)
+	}
+	return nil
+}
+
+// vectorText renders vector in pgvector's text form, [0.1,0.2], which the
+// query casts to vector. Formatting float32 with its own bit size keeps the
+// value the model returned; %g uses the shortest form that reads back the same.
+func vectorText(vector []float32) string {
+	var b strings.Builder
+	b.WriteByte('[')
+	for i, x := range vector {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(strconv.FormatFloat(float64(x), 'g', -1, 32))
+	}
+	b.WriteByte(']')
+	return b.String()
 }

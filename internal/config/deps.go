@@ -60,6 +60,18 @@ type Temporal struct {
 	// Every Trelis process serving these Documents must agree on it, or work
 	// one of them starts is never picked up.
 	TaskQueue string `mapstructure:"task_queue"`
+	// ModelTaskQueue is the queue model-calling activities run on, kept
+	// separate so ModelActivitiesPerSecond can limit model calls without
+	// slowing the rest of ingest. It must differ from TaskQueue: the ingest
+	// worker does not register model activities, and the model-call limit
+	// would otherwise throttle ordinary ingest.
+	ModelTaskQueue string `mapstructure:"model_task_queue"`
+	// ModelActivitiesPerSecond is the cap on activity starts per second across
+	// every worker on ModelTaskQueue, enforced by the Temporal server. One
+	// embed-batch activity sends one embeddings request, apart from the
+	// client's own retries on 429 or 5xx inside that attempt, so this is close
+	// to a limit on embeddings requests.
+	ModelActivitiesPerSecond float64 `mapstructure:"model_activities_per_second"`
 }
 
 // HostPort is the frontend gRPC address.

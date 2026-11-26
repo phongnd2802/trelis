@@ -47,7 +47,8 @@ type DocumentRepository interface {
 	// Principal; it returns ErrDocumentNotFound when no row matches.
 	GetDocumentByID(ctx context.Context, id uuid.UUID) (*types.Document, error)
 	// SetParseStatus sets a Document's parse status and, when it is failed, the
-	// reason shown with it; any other status clears the reason.
+	// reason shown with it; any other status clears the reason. It returns
+	// ErrDocumentNotFound when no row matches.
 	SetParseStatus(ctx context.Context, id uuid.UUID, status, parseError string) error
 	// GetReadableDocumentByID returns the Document if principalID can read
 	// it, else ErrDocumentNotFound.

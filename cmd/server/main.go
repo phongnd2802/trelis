@@ -32,6 +32,7 @@ import (
 
 	"github.com/neo4j/neo4j-go-driver/v6/neo4j"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/worker"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -43,6 +44,7 @@ import (
 	"github.com/phongnd2802/trelis/internal/handler"
 	"github.com/phongnd2802/trelis/internal/ingest"
 	"github.com/phongnd2802/trelis/internal/logger"
+	"github.com/phongnd2802/trelis/internal/models/embedding"
 	"github.com/phongnd2802/trelis/internal/parser"
 	"github.com/phongnd2802/trelis/internal/router"
 )
@@ -79,28 +81,28 @@ func ensureBucket(ctx context.Context, files *file.S3FileService) {
 	}()
 }
 
-// workerRetry is how long startIngestWorker waits between attempts while
-// Temporal is unreachable.
+// workerRetry is how long startWorker waits between attempts while Temporal
+// is unreachable.
 const workerRetry = 2 * time.Second
 
-// startIngestWorker runs the ingest worker in the background, retrying while
+// startWorker runs one Temporal worker in the background, retrying while
 // Temporal is unreachable, the way ensureBucket waits for object storage: the
-// service starts and serves either way, and /readyz reports Temporal. The
-// returned stop function cancels the retries, stops a running worker and
-// waits for it, so shutdown finishes before its Temporal client closes.
-func startIngestWorker(ctx context.Context, c client.Client, taskQueue string,
-	activities *ingest.Activities,
-) (stop func()) {
+// service starts and serves either way, and /readyz reports Temporal. name
+// says which worker a record is about. The returned stop function cancels the
+// retries, stops a running worker and waits for it, so shutdown finishes
+// before its Temporal client closes.
+func startWorker(ctx context.Context, name, taskQueue string, newWorker func() worker.Worker) (stop func()) {
 	workerCtx, cancel := context.WithCancel(ctx)
 	stopped := make(chan struct{})
 	go func() {
 		defer close(stopped)
 		first := true
 		for {
-			w := ingest.NewWorker(c, taskQueue, activities)
+			w := newWorker()
 			err := w.Start()
 			if err == nil {
-				logger.Ctx(ctx).Info("ingest worker started", zap.String("task_queue", taskQueue))
+				logger.Ctx(ctx).Info("temporal worker started",
+					zap.String("worker", name), zap.String("task_queue", taskQueue))
 				<-workerCtx.Done()
 				w.Stop()
 				return
@@ -108,10 +110,12 @@ func startIngestWorker(ctx context.Context, c client.Client, taskQueue string,
 			// One warning when Temporal is first found down, then debug: a
 			// long outage should not fill the log with the same line.
 			if first {
-				logger.Ctx(ctx).Warn("ingest worker not ready, retrying in the background", zap.Error(err))
+				logger.Ctx(ctx).Warn("temporal worker not ready, retrying in the background",
+					zap.String("worker", name), zap.Error(err))
 				first = false
 			} else {
-				logger.Ctx(ctx).Debug("ingest worker still not ready", zap.Error(err))
+				logger.Ctx(ctx).Debug("temporal worker still not ready",
+					zap.String("worker", name), zap.Error(err))
 			}
 			select {
 			case <-workerCtx.Done():
@@ -238,10 +242,30 @@ func run(configPath string, args []string) (err error) {
 		ensureBucket(ctx, files)
 	}
 	docRepo := repository.NewDocumentRepository(dbStore)
+	// The embedder is optional: without a configured embedding role, ingest
+	// still parses and chunks, and the embed step fails the Document with a
+	// reason an operator can act on.
+	var embedder embedding.Embedder
+	if cfg.Models.Embedding.Configured() {
+		embedder, err = embedding.New(cfg.Models.Embedding)
+		if err != nil {
+			return fmt.Errorf("embedding model: %w", err)
+		}
+	} else {
+		logger.Ctx(ctx).Warn("no embedding model configured; Documents will fail ingest until one is set")
+	}
 	ingestActivities := ingest.NewActivities(service.NewIngestService(dbStore, docRepo,
-		repository.NewChunkRepository(dbStore), files, parser.NewAnydocParser(false)))
-	stopIngestWorker := startIngestWorker(ctx, temporal, cfg.Temporal.TaskQueue, ingestActivities)
+		repository.NewChunkRepository(dbStore), files, parser.NewAnydocParser(false), embedder))
+	stopIngestWorker := startWorker(ctx, "ingest", cfg.Temporal.TaskQueue, func() worker.Worker {
+		return ingest.NewWorker(temporal, cfg.Temporal.TaskQueue, cfg.Temporal.ModelTaskQueue,
+			cfg.Models.Embedding.BatchSize, ingestActivities)
+	})
 	defer stopIngestWorker()
+	stopModelWorker := startWorker(ctx, "models", cfg.Temporal.ModelTaskQueue, func() worker.Worker {
+		return ingest.NewModelWorker(temporal, cfg.Temporal.ModelTaskQueue,
+			cfg.Temporal.ModelActivitiesPerSecond, ingestActivities)
+	})
+	defer stopModelWorker()
 	docs := handler.NewDocumentHandler(
 		service.NewDocumentService(dbStore, docRepo, principalRepo, files,
 			ingest.NewStarter(temporal, cfg.Temporal.TaskQueue)),

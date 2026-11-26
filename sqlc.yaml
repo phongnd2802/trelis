@@ -23,3 +23,7 @@ sql:
             go_type:
               type: time.Time
               pointer: true
+          # pgvector's vector as its text form, the way the queries pass it,
+          # rather than pulling in pgvector-go for a column no query scans.
+          - column: chunks.embedding
+            go_type: string

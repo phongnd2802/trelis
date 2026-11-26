@@ -13,8 +13,8 @@ SELECT * FROM documents WHERE id = $1;
 
 -- A failed parse keeps its reason; a pending, processing or completed
 -- Document carries none, so the reason can neither go stale nor be set on a
--- Document that did not fail.
--- name: SetDocumentParseStatus :exec
+-- Document that did not fail. execrows lets the caller notice a missing row.
+-- name: SetDocumentParseStatus :execrows
 UPDATE documents
 SET parse_status = @parse_status,
     parse_error = CASE

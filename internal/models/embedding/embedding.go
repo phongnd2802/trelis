@@ -1,15 +1,15 @@
-// Package embedding exposes the Embedder interface used by the application
-// layer and builds the client for a configured embedding role
-// (models.embedding). A provider embeds a whole batch of texts per request
-// and rate-limits callers that send too much at once, so the client splits
-// texts into batches and sends a batch again when the provider reports a
-// failure worth waiting out.
+// Package embedding builds the client for a configured embedding role
+// (models.embedding); the client satisfies the interfaces.Embedder the
+// application layer calls. A provider embeds a whole batch of texts per
+// request and rate-limits callers that send too much at once, so the client
+// splits texts into batches and sends a batch again when the provider reports
+// a failure worth waiting out.
 //
 // Ingest runs these calls as Temporal activities that retry on their own
 // (docs/adr/0005-temporal-for-background-work.md), and the client retries
 // anyway: its retries absorb a short rate limit inside one activity attempt,
-// so a single 429 does not make the whole activity, and every Chunk it had
-// already embedded, run again.
+// so a single 429 does not fail the batch activity and wait for Temporal to
+// restart it.
 package embedding
 
 import (
@@ -22,20 +22,16 @@ import (
 	"github.com/phongnd2802/trelis/internal/config"
 	"github.com/phongnd2802/trelis/internal/logger"
 	"github.com/phongnd2802/trelis/internal/models/api"
+	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
 
 // defaultPath is where an OpenAI-compatible provider takes embeddings, under
 // the role's base URL.
 const defaultPath = "/embeddings"
 
-// Embedder is the embedding model role.
-type Embedder interface {
-	// Embed returns one vector per text, in the order of texts.
-	Embed(ctx context.Context, texts []string) ([][]float32, error)
-
-	// GetModelName returns the model name sent on the wire.
-	GetModelName() string
-}
+// Embedder is the embedding model role. It is the application-layer contract
+// from internal/types/interfaces, re-exported for callers of New.
+type Embedder = interfaces.Embedder
 
 // Option configures the client New builds.
 type Option func(*client)
@@ -77,6 +73,9 @@ type client struct {
 	// of them would cut the call off and throw away the batches that finished.
 	timeout time.Duration
 }
+
+// The client is the application-layer embedding contract's implementation.
+var _ interfaces.Embedder = (*client)(nil)
 
 // New builds the client for one configured embedding role (models.embedding).
 func New(role config.EmbeddingRole, opts ...Option) (Embedder, error) {

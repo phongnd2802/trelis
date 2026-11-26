@@ -42,6 +42,9 @@ const (
 	pgUser, pgPassword = "trelis", "trelis"
 	neo4jPassword      = "trelis-test"
 	s3User, s3Password = "trelis", "trelis-test-secret"
+	// embeddingModel is the model name Trelis is configured with; the fake
+	// provider echoes whatever name a role sends.
+	embeddingModel = "test-embedding"
 	// bootTimeout bounds how long a Trelis process may take to migrate and
 	// start listening.
 	bootTimeout = 30 * time.Second
@@ -196,9 +199,8 @@ func endpoint(ctx context.Context, c testcontainers.Container, port string) (hos
 type trelis struct {
 	// url is the base URL of its HTTP API, e.g. http://127.0.0.1:41234.
 	url string
-	// provider is the fake model provider this Trelis is meant to call. No
-	// model role is configurable yet; when roles land, pass provider.URL()
-	// to trelisEnv and point every role at it.
+	// provider is the fake model provider this Trelis calls: the embedding
+	// role points at it, so tests can fail embedding requests on purpose.
 	provider *modeltest.FakeProvider
 	// env is the process environment of every command run as this Trelis.
 	env []string
@@ -245,7 +247,7 @@ func startWith(t *testing.T, extraEnv ...string) *trelis {
 	tr.bucket = strings.ReplaceAll(dbname, "_", "-")
 	tr.dbname = dbname
 	tr.taskQueue = dbname
-	tr.env = append(trelisEnv(dbname, tr.bucket), extraEnv...)
+	tr.env = append(trelisEnv(dbname, tr.bucket, tr.provider.URL()), extraEnv...)
 
 	cmd := exec.Command(deps.binary, "-config", deps.config)
 	cmd.Env = tr.env
@@ -342,9 +344,10 @@ func freshDatabase(t *testing.T) string {
 // operator would, through TRELIS_* env. TRELIS_* variables of the developer's
 // shell are dropped, so every key Trelis reads is either set here or its
 // default. Every test shares the package's Temporal dev server; the task
-// queue is the test's database name, so concurrent Trelis processes never
-// take each other's workflow tasks.
-func trelisEnv(dbname, bucket string) []string {
+// queues are named after the test's database, so concurrent Trelis processes
+// never take each other's workflow or model tasks. embeddingURL is the fake
+// provider the embedding role calls.
+func trelisEnv(dbname, bucket, embeddingURL string) []string {
 	var env []string
 	for _, kv := range os.Environ() {
 		if !strings.HasPrefix(kv, "TRELIS_") {
@@ -372,6 +375,9 @@ func trelisEnv(dbname, bucket string) []string {
 		"TRELIS_TEMPORAL_HOST="+deps.temporal.host,
 		"TRELIS_TEMPORAL_PORT="+deps.temporal.port,
 		"TRELIS_TEMPORAL_TASK_QUEUE="+dbname,
+		"TRELIS_TEMPORAL_MODEL_TASK_QUEUE="+dbname+"-models",
+		"TRELIS_MODELS_EMBEDDING_BASE_URL="+embeddingURL,
+		"TRELIS_MODELS_EMBEDDING_MODEL="+embeddingModel,
 		"TRELIS_STORAGE_S3_ENDPOINT="+deps.s3,
 		"TRELIS_STORAGE_S3_BUCKET="+bucket,
 		"TRELIS_STORAGE_S3_ACCESS_KEY_ID="+s3User,

@@ -60,7 +60,9 @@ const DefaultEmbeddingBatchSize = 64
 // EmbeddingRole is a role served by an embedding model over /v1/embeddings.
 type EmbeddingRole struct {
 	Endpoint `mapstructure:",squash"`
-	// BatchSize is how many texts one request carries. A provider answers a
+	// BatchSize is how many texts one request carries. The ingest workflow
+	// also uses it as the size of each embed-batch activity, so it sets both
+	// the provider request and the fan-out granularity. A provider answers a
 	// batch whole or rejects it, so this has to stay under the model's own
 	// input limit: a smaller batch costs more requests but loses less work
 	// when one of them fails.

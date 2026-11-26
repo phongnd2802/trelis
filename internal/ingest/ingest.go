@@ -3,14 +3,21 @@
 // An upload starts one workflow whose ID is the Document ID, which is what
 // makes starting the same Document twice safe: a second start joins a run
 // that is still going and does not start a completed one again. The workflow
-// passes only the Document ID between steps — never Document or Chunk
-// content, which would run into payload size limits and history growth — and
-// every activity does the I/O. The parse activity reads the Source File
-// through the FileService by the Document's object key, parses it with the
-// in-process anydoc engine, splits the Markdown into Chunks and commits them
-// with the Document's completed status.
-// A Source File that cannot be parsed is not retried: the workflow records
-// the reason on the Document and ends.
+// passes only the Document ID and seq ranges between steps — never Document
+// or Chunk content, which would run into payload size limits and history
+// growth — and every activity does the I/O. The parse-and-chunk activity
+// reads the Source File through the FileService by the Document's object
+// key, parses it with the in-process anydoc engine, splits the Markdown into
+// Chunks and commits them; the Document stays processing. The workflow then
+// starts one embed-batch activity per seq range on the model task queue, each
+// of which sends one embeddings request for the Chunks in its range that have
+// no vector yet, so the queue's per-second limit is close to a limit on
+// embeddings requests. Finally the complete activity checks that no Chunk is
+// left without an embedding and only then marks the Document completed.
+// A Source File that cannot be parsed, or a Document that cannot be embedded,
+// is not retried: the workflow records the reason on the Document and ends.
+// A transient model or database failure is retried by the affected activity
+// alone, without parsing the Source File again or redoing other batches.
 package ingest
 
 // Names the workflow and its activities are registered and started under.
@@ -21,6 +28,11 @@ const (
 	WorkflowName = "ingest"
 	// ParseAndChunkActivity parses a Source File and stores its Chunks.
 	ParseAndChunkActivity = "ingest.parse_and_chunk"
+	// EmbedBatchActivity embeds one seq range of a Document's Chunks.
+	EmbedBatchActivity = "ingest.embed_batch"
+	// CompleteActivity marks a Document completed once no Chunk lacks an
+	// embedding.
+	CompleteActivity = "ingest.complete"
 	// MarkFailedActivity records why a Document's ingest failed.
 	MarkFailedActivity = "ingest.mark_failed"
 )

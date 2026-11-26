@@ -54,6 +54,17 @@ temporal:
   # The queue the ingest workflow and its activities run on; every Trelis
   # process serving these Documents must use the same one.
   task_queue: trelis-ingest
+  # Model-calling activities (embedding for now) run on their own queue, so
+  # the rate limit below covers model calls and not the rest of ingest. It
+  # must differ from task_queue: the ingest worker has no model activities
+  # registered, and the limit would otherwise throttle ordinary ingest.
+  model_task_queue: trelis-models
+  # The global limit on model-call activity starts per second across every
+  # worker on model_task_queue, enforced by the Temporal server. One
+  # embed-batch activity sends one embeddings request, apart from the
+  # client's own retries on 429 or 5xx inside that attempt, so this is close
+  # to a limit on embeddings requests.
+  model_activities_per_second: 5
 
 storage:
   max_file_size_mb: 50
@@ -87,7 +98,7 @@ storage:
 #   embedding:                     # POST {base_url}/embeddings
 #     base_url: https://api.openai.com/v1
 #     model: text-embedding-3-small
-#     batch_size: 64               # texts per request, at least 1
+#     batch_size: 64               # texts per request and per embed activity, at least 1
 #   rerank:                        # POST {base_url}/rerank
 #     base_url: https://api.jina.ai/v1
 #     model: jina-reranker-v2-base-multilingual

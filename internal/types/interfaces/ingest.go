@@ -25,11 +25,24 @@ type IngestStarter interface {
 type IngestService interface {
 	// ParseAndChunk parses a Document's Source File, splits the Markdown into
 	// Chunks and, in one transaction, replaces the Document's Chunks and
-	// marks it completed. It returns how many Chunks it stored. A
+	// leaves it processing. It returns how many Chunks it stored. A
 	// *types.UnparseableError means the Source File cannot be parsed, and a
 	// *types.DocumentNotFoundError means the Document is gone; neither can be
 	// fixed by retrying. Any other error is retryable.
 	ParseAndChunk(ctx context.Context, documentID uuid.UUID) (int, error)
+	// EmbedBatch embeds the Chunks of a Document whose Seq is in [from, to)
+	// and that have no embedding yet, in one embedding call, and stores their
+	// vectors in one transaction. It returns how many Chunks it embedded; a
+	// range that is already embedded is a no-op. A
+	// *types.EmbeddingUnconfiguredError means no embedding model is set and
+	// cannot be fixed by retrying. Any other error is retryable.
+	EmbedBatch(ctx context.Context, documentID uuid.UUID, from, to int) (int, error)
+	// Complete marks a Document completed once every Chunk has an embedding.
+	// One or more unembedded Chunks is a retryable error naming the count, so
+	// a Document is never completed with a missing vector. A
+	// *types.DocumentNotFoundError means the row is gone and cannot be fixed
+	// by retrying.
+	Complete(ctx context.Context, documentID uuid.UUID) error
 	// MarkFailed records that a Document's ingest failed with reason.
 	MarkFailed(ctx context.Context, documentID uuid.UUID, reason string) error
 }

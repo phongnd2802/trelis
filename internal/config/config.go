@@ -71,10 +71,12 @@ var defaults = map[string]any{
 	"neo4j.user":     "neo4j",
 	"neo4j.password": "",
 
-	"temporal.host":       "localhost",
-	"temporal.port":       7233,
-	"temporal.namespace":  "default",
-	"temporal.task_queue": "trelis-ingest",
+	"temporal.host":                        "localhost",
+	"temporal.port":                        7233,
+	"temporal.namespace":                   "default",
+	"temporal.task_queue":                  "trelis-ingest",
+	"temporal.model_task_queue":            "trelis-models",
+	"temporal.model_activities_per_second": 5.0,
 
 	"storage.max_file_size_mb":     50,
 	"storage.s3.endpoint":          "",
@@ -205,6 +207,18 @@ func (c *Config) validate() error {
 	port("temporal.port", c.Temporal.Port)
 	required("temporal.namespace", c.Temporal.Namespace)
 	required("temporal.task_queue", c.Temporal.TaskQueue)
+	required("temporal.model_task_queue", c.Temporal.ModelTaskQueue)
+	// Equal queues would let the ingest worker take model tasks it cannot run
+	// and throttle ordinary ingest with the model-call rate limit.
+	ingestQueue, modelQueue := strings.TrimSpace(c.Temporal.TaskQueue), strings.TrimSpace(c.Temporal.ModelTaskQueue)
+	if ingestQueue != "" && ingestQueue == modelQueue {
+		errs = append(errs, fmt.Errorf("temporal.model_task_queue must differ from temporal.task_queue, both are %q", modelQueue))
+	}
+	// Written as !(x > 0) so NaN, which compares false to everything, is
+	// rejected too.
+	if !(c.Temporal.ModelActivitiesPerSecond > 0) {
+		errs = append(errs, fmt.Errorf("temporal.model_activities_per_second must be greater than 0, got %v", c.Temporal.ModelActivitiesPerSecond))
+	}
 
 	if c.Storage.MaxFileSizeMB < 1 {
 		errs = append(errs, fmt.Errorf("storage.max_file_size_mb must be at least 1, got %d", c.Storage.MaxFileSizeMB))

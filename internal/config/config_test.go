@@ -184,6 +184,28 @@ func TestLoadDependencies(t *testing.T) {
 	if cfg.Temporal.TaskQueue != "trelis-ingest" {
 		t.Errorf("Temporal.TaskQueue = %q, want trelis-ingest", cfg.Temporal.TaskQueue)
 	}
+	if cfg.Temporal.ModelTaskQueue != "trelis-models" {
+		t.Errorf("Temporal.ModelTaskQueue = %q, want trelis-models", cfg.Temporal.ModelTaskQueue)
+	}
+	if cfg.Temporal.ModelActivitiesPerSecond != 5 {
+		t.Errorf("Temporal.ModelActivitiesPerSecond = %v, want 5", cfg.Temporal.ModelActivitiesPerSecond)
+	}
+}
+
+func TestTemporalModelQueueIsReadFromEnv(t *testing.T) {
+	t.Setenv("TRELIS_TEMPORAL_MODEL_TASK_QUEUE", "models-test")
+	t.Setenv("TRELIS_TEMPORAL_MODEL_ACTIVITIES_PER_SECOND", "2.5")
+
+	cfg, err := Load(writeConfig(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Temporal.ModelTaskQueue != "models-test" {
+		t.Errorf("Temporal.ModelTaskQueue = %q, want the env value models-test", cfg.Temporal.ModelTaskQueue)
+	}
+	if cfg.Temporal.ModelActivitiesPerSecond != 2.5 {
+		t.Errorf("Temporal.ModelActivitiesPerSecond = %v, want the env value 2.5", cfg.Temporal.ModelActivitiesPerSecond)
+	}
 }
 
 func TestTemporalTaskQueueIsReadFromEnv(t *testing.T) {
@@ -214,6 +236,12 @@ func TestLoadDependencyDefaults(t *testing.T) {
 	}
 	if cfg.Temporal.TaskQueue != "trelis-ingest" {
 		t.Errorf("default Temporal.TaskQueue = %q, want trelis-ingest", cfg.Temporal.TaskQueue)
+	}
+	if cfg.Temporal.ModelTaskQueue != "trelis-models" {
+		t.Errorf("default Temporal.ModelTaskQueue = %q, want trelis-models", cfg.Temporal.ModelTaskQueue)
+	}
+	if cfg.Temporal.ModelActivitiesPerSecond != 5 {
+		t.Errorf("default Temporal.ModelActivitiesPerSecond = %v, want 5", cfg.Temporal.ModelActivitiesPerSecond)
 	}
 	if cfg.Storage.MaxFileSize() != 50<<20 {
 		t.Errorf("default max file size = %d bytes, want 50 MB", cfg.Storage.MaxFileSize())
@@ -437,6 +465,10 @@ func TestLoadRejectsInvalidDependencies(t *testing.T) {
 		{"temporal port zero", map[string]string{"TRELIS_TEMPORAL_PORT": "0"}, "temporal.port"},
 		{"empty temporal namespace", map[string]string{"TRELIS_TEMPORAL_NAMESPACE": " "}, "temporal.namespace"},
 		{"empty temporal task queue", map[string]string{"TRELIS_TEMPORAL_TASK_QUEUE": " "}, "temporal.task_queue"},
+		{"empty temporal model task queue", map[string]string{"TRELIS_TEMPORAL_MODEL_TASK_QUEUE": " "}, "temporal.model_task_queue"},
+		{"model task queue same as ingest queue", map[string]string{"TRELIS_TEMPORAL_MODEL_TASK_QUEUE": " trelis-ingest "}, "temporal.model_task_queue"},
+		{"model activities per second zero", map[string]string{"TRELIS_TEMPORAL_MODEL_ACTIVITIES_PER_SECOND": "0"}, "temporal.model_activities_per_second"},
+		{"model activities per second negative", map[string]string{"TRELIS_TEMPORAL_MODEL_ACTIVITIES_PER_SECOND": "-1"}, "temporal.model_activities_per_second"},
 		{"empty bucket", map[string]string{"TRELIS_STORAGE_S3_BUCKET": " "}, "storage.s3.bucket"},
 		{"empty region", map[string]string{"TRELIS_STORAGE_S3_REGION": " "}, "storage.s3.region"},
 		{"endpoint not a URL", map[string]string{"TRELIS_STORAGE_S3_ENDPOINT": "localhost:9000"}, "storage.s3.endpoint"},

@@ -11,6 +11,17 @@ import (
 	"github.com/google/uuid"
 )
 
+const countChunksWithoutEmbedding = `-- name: CountChunksWithoutEmbedding :one
+SELECT count(*) FROM chunks WHERE document_id = $1 AND embedding IS NULL
+`
+
+func (q *Queries) CountChunksWithoutEmbedding(ctx context.Context, documentID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countChunksWithoutEmbedding, documentID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deleteChunksByDocument = `-- name: DeleteChunksByDocument :exec
 DELETE FROM chunks WHERE document_id = $1
 `
@@ -46,28 +57,50 @@ func (q *Queries) InsertChunk(ctx context.Context, arg InsertChunkParams) error 
 	return err
 }
 
-const listChunksByDocument = `-- name: ListChunksByDocument :many
-SELECT id, document_id, seq, content, context_header, start_offset, end_offset, created_at FROM chunks WHERE document_id = $1 ORDER BY seq
+const listUnembeddedChunksByDocument = `-- name: ListUnembeddedChunksByDocument :many
+SELECT id, seq, content, context_header, start_offset, end_offset
+FROM chunks
+WHERE document_id = $1
+  AND seq >= $2
+  AND seq < $3
+  AND embedding IS NULL
+ORDER BY seq
 `
 
-func (q *Queries) ListChunksByDocument(ctx context.Context, documentID uuid.UUID) ([]Chunk, error) {
-	rows, err := q.db.Query(ctx, listChunksByDocument, documentID)
+type ListUnembeddedChunksByDocumentParams struct {
+	DocumentID uuid.UUID
+	FromSeq    int32
+	ToSeq      int32
+}
+
+type ListUnembeddedChunksByDocumentRow struct {
+	ID            uuid.UUID
+	Seq           int32
+	Content       string
+	ContextHeader string
+	StartOffset   int32
+	EndOffset     int32
+}
+
+// One batch of embedding work: the Chunks of a seq range that the embed
+// activity has not written a vector for yet. Re-running a range, as a retry
+// does, skips the Chunks already done.
+func (q *Queries) ListUnembeddedChunksByDocument(ctx context.Context, arg ListUnembeddedChunksByDocumentParams) ([]ListUnembeddedChunksByDocumentRow, error) {
+	rows, err := q.db.Query(ctx, listUnembeddedChunksByDocument, arg.DocumentID, arg.FromSeq, arg.ToSeq)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []Chunk
+	var items []ListUnembeddedChunksByDocumentRow
 	for rows.Next() {
-		var i Chunk
+		var i ListUnembeddedChunksByDocumentRow
 		if err := rows.Scan(
 			&i.ID,
-			&i.DocumentID,
 			&i.Seq,
 			&i.Content,
 			&i.ContextHeader,
 			&i.StartOffset,
 			&i.EndOffset,
-			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -77,4 +110,28 @@ func (q *Queries) ListChunksByDocument(ctx context.Context, documentID uuid.UUID
 		return nil, err
 	}
 	return items, nil
+}
+
+const setChunkEmbedding = `-- name: SetChunkEmbedding :execrows
+UPDATE chunks
+SET embedding = $1::text::vector,
+    embedding_model = $2::text
+WHERE id = $3
+`
+
+type SetChunkEmbeddingParams struct {
+	Embedding      string
+	EmbeddingModel string
+	ID             uuid.UUID
+}
+
+// The vector goes in as its text form and is cast here, which is also what
+// keeps sqlc from having to map the vector type. execrows lets the caller
+// notice a Chunk that disappeared between listing and updating.
+func (q *Queries) SetChunkEmbedding(ctx context.Context, arg SetChunkEmbeddingParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setChunkEmbedding, arg.Embedding, arg.EmbeddingModel, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
