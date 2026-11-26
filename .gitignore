@@ -32,3 +32,5 @@ go.work.sum
 
 # Claude Code per-user settings
 /.claude/settings.local.json
+.agents/skills/
+.qwen/skills/
