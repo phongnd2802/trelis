@@ -12,12 +12,12 @@ type debugChat struct {
 	inner Chat
 }
 
-func (d *debugChat) ModelName() string { return d.inner.ModelName() }
+func (d *debugChat) GetModelName() string { return d.inner.GetModelName() }
 
-func (d *debugChat) Chat(ctx context.Context, messages []types.ChatMessage, opts *types.ChatOptions) (*types.ChatResponse, error) {
+func (d *debugChat) Chat(ctx context.Context, messages []Message, opts *ChatOptions) (*types.ChatResponse, error) {
 	return d.inner.Chat(ctx, messages, opts)
 }
 
-func (d *debugChat) ChatStream(ctx context.Context, messages []types.ChatMessage, opts *types.ChatOptions) (<-chan types.StreamingResponse, error) {
+func (d *debugChat) ChatStream(ctx context.Context, messages []Message, opts *ChatOptions) (<-chan types.StreamResponse, error) {
 	return d.inner.ChatStream(ctx, messages, opts)
 }

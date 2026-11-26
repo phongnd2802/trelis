@@ -5,6 +5,8 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+
+	"github.com/phongnd2802/trelis/internal/models/api"
 )
 
 // Models points each model role at its own OpenAI-compatible provider.
@@ -34,22 +36,12 @@ type Endpoint struct {
 	APIKey string `mapstructure:"api_key"`
 }
 
-// ChatProtocol is the wire protocol a chat role speaks.
-type ChatProtocol string
-
-const (
-	// ProtocolChatCompletions is POST {base_url}/chat/completions.
-	ProtocolChatCompletions ChatProtocol = "chat_completions"
-)
-
-// chatProtocols lists the valid protocols; Responses joins with #19.
-var chatProtocols = []ChatProtocol{ProtocolChatCompletions}
-
 // ChatRole is a role served by a chat model.
 type ChatRole struct {
 	Endpoint `mapstructure:",squash"`
-	// Protocol defaults to chat_completions.
-	Protocol ChatProtocol `mapstructure:"protocol"`
+	// Protocol is the wire protocol, in the model layer's vocabulary:
+	// openai-completions (default); openai-responses joins with #19.
+	Protocol api.API `mapstructure:"protocol"`
 }
 
 // chatRoles names every chat role by its key, for defaults and validation.
@@ -64,7 +56,7 @@ func (m *Models) chatRoles() map[string]*ChatRole {
 func init() {
 	for key := range (&Models{}).chatRoles() {
 		registerEndpoint(key)
-		defaults[key+".protocol"] = string(ProtocolChatCompletions)
+		defaults[key+".protocol"] = string(api.APIOpenAICompletions)
 	}
 }
 
@@ -85,8 +77,8 @@ func (e Endpoint) Configured() bool {
 func (m *Models) validate() []error {
 	var errs []error
 	for key, role := range m.chatRoles() {
-		if !slices.Contains(chatProtocols, role.Protocol) {
-			errs = append(errs, fmt.Errorf("%s.protocol must be one of %v, got %q", key, chatProtocols, role.Protocol))
+		if !role.Protocol.Known() {
+			errs = append(errs, fmt.Errorf("%s.protocol %q is not a protocol this build ships (want %s)", key, role.Protocol, api.APIOpenAICompletions))
 		}
 		errs = append(errs, role.validate(key)...)
 	}

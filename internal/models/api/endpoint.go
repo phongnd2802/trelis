@@ -1,83 +1,112 @@
-// Package api holds what the protocol clients (Chat Completions, Responses,
-// embeddings, rerank) share: the endpoint they call and how a failed call is
-// reported.
+// Derived from WeKnora (https://github.com/Tencent/WeKnora), internal/models/api/endpoint.go.
+// Copyright (C) 2026 Tencent. Licensed under the MIT License; see NOTICE.
+
 package api
 
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 )
 
-// AuthFunc authenticates a request; body is the encoded request body, for
-// schemes that sign it.
+// AuthFunc stamps credentials onto an outbound request. body is the exact
+// bytes being sent so signing vendors can hash them.
 type AuthFunc func(req *http.Request, body []byte)
 
-// Endpoint is one OpenAI-compatible provider a model role calls.
-type Endpoint struct {
-	// BaseURL is the provider's API root, e.g. https://api.openai.com/v1.
-	// Protocol clients append their path (/chat/completions, /embeddings ...).
-	BaseURL string
-	Model   string
-	Auth    AuthFunc
-	// Client defaults to http.DefaultClient.
-	Client *http.Client
-}
-
-// BearerAuth sends key as a bearer token, or nothing when key is empty
-// (local providers often need no key).
-func BearerAuth(key string) AuthFunc {
+// BearerAuth is the default: Authorization: Bearer <key>. An empty key sends
+// nothing (local deployments).
+func BearerAuth(apiKey string) AuthFunc {
 	return func(req *http.Request, _ []byte) {
-		if key != "" {
-			req.Header.Set("Authorization", "Bearer "+key)
+		if apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
 		}
 	}
 }
 
-// Post sends body as JSON to the base URL plus path. A non-2xx answer is
-// returned as *HTTPError with the response already closed; otherwise the
-// caller closes the response body.
-func (e Endpoint) Post(ctx context.Context, path string, body []byte) (*http.Response, error) {
-	url := strings.TrimRight(e.BaseURL, "/") + path
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+// Endpoint is everything a protocol client needs to reach one model.
+type Endpoint struct {
+	// BaseURL is the vendor root, e.g. https://api.openai.com/v1.
+	BaseURL string
+	// Model is the name sent on the wire.
+	Model string
+	Auth  AuthFunc
+	// Client is the HTTP client; nil uses HTTPClient.
+	Client *http.Client
+}
+
+// Resolve builds the request URL from the base URL and the protocol path.
+func (e Endpoint) Resolve(defaultPath string) string {
+	return strings.TrimRight(e.BaseURL, "/") + defaultPath
+}
+
+func (e Endpoint) httpClient() *http.Client {
+	if e.Client != nil {
+		return e.Client
+	}
+	return HTTPClient
+}
+
+// NewRequest prepares an authenticated JSON POST. The body is marshalled
+// once so signing vendors see exactly what is sent.
+func (e Endpoint) NewRequest(ctx context.Context, url string, body any, stream bool) (*http.Request, []byte, error) {
+	data, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("build request to %s: %w", url, err)
+		return nil, nil, fmt.Errorf("marshal request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return nil, nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if stream {
+		req.Header.Set("Accept", "text/event-stream")
+	}
 	if e.Auth != nil {
-		e.Auth(req, body)
+		e.Auth(req, data)
 	}
+	return req, data, nil
+}
 
-	client := e.Client
-	if client == nil {
-		client = http.DefaultClient
-	}
-	resp, err := client.Do(req)
+// Do sends the request and returns the response. Non-2xx responses are
+// turned into an error carrying the body so callers surface vendor messages.
+func (e Endpoint) Do(req *http.Request) (*http.Response, error) {
+	resp, err := e.httpClient().Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("call %s: %w", url, err)
+		return nil, &TransportError{Op: "send request", Err: err}
 	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		defer func() { _ = resp.Body.Close() }()
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
-		return nil, &HTTPError{URL: url, StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(msg))}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Body: string(body), Header: resp.Header}
 	}
 	return resp, nil
 }
 
-// maxErrorBody bounds how much of an error response is kept.
-const maxErrorBody = 2048
+// TransportError is a request that never got a whole answer: DNS, connect,
+// TLS, a reset or a timeout, while sending or while reading the reply. It is
+// the only failure worth sending again.
+type TransportError struct {
+	// Op is the phase that failed: "send request" or "read response".
+	Op  string
+	Err error
+}
 
-// HTTPError is a non-2xx answer from a provider. StatusCode lets callers
-// decide whether to retry (429, 5xx).
+func (e *TransportError) Error() string { return e.Op + ": " + e.Err.Error() }
+func (e *TransportError) Unwrap() error { return e.Err }
+
+// HTTPError is a non-2xx vendor reply.
 type HTTPError struct {
-	URL        string
 	StatusCode int
 	Body       string
+	// Header is the reply's headers, kept so a retry can honour the vendor's
+	// Retry-After on a 429 or 503.
+	Header http.Header
 }
 
 func (e *HTTPError) Error() string {
-	return fmt.Sprintf("%s answered %d: %s", e.URL, e.StatusCode, e.Body)
+	return fmt.Sprintf("API request failed with status %d: %s", e.StatusCode, e.Body)
 }

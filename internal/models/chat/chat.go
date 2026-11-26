@@ -1,7 +1,12 @@
-// Package chat is the client for the chat model roles (chat, extraction,
-// judge). Each role is built from its own config.ChatRole, so each can point
-// at a different OpenAI-compatible provider; the role's protocol picks the
-// wire client behind it.
+// Derived from WeKnora (https://github.com/Tencent/WeKnora), internal/models/chat/chat.go.
+// Trelis builds a chat role from its config.ChatRole instead of a model
+// catalog and database row.
+// Copyright (C) 2026 Tencent. Licensed under the MIT License; see NOTICE.
+
+// Package chat exposes the Chat interface used by the application layer and
+// builds the right protocol client for a configured chat role (chat,
+// extraction, judge). Every wire protocol lives under internal/models/api;
+// this package only glues a role's config to its protocol client.
 package chat
 
 import (
@@ -12,25 +17,40 @@ import (
 
 	"github.com/phongnd2802/trelis/internal/config"
 	"github.com/phongnd2802/trelis/internal/models/api"
-	"github.com/phongnd2802/trelis/internal/models/api/openaichat"
+	"github.com/phongnd2802/trelis/internal/models/api/openaicompletions"
 	"github.com/phongnd2802/trelis/internal/types"
 )
 
-// Chat is one chat model role. Every call reports the provider's token usage.
-type Chat interface {
-	// Chat waits for the whole answer.
-	Chat(ctx context.Context, messages []types.ChatMessage, opts *types.ChatOptions) (*types.ChatResponse, error)
-	// ChatStream answers with content deltas; the last event has Done set and
-	// carries the tool calls, usage and any error. The channel closes after
-	// it, or without it once ctx is cancelled.
-	ChatStream(ctx context.Context, messages []types.ChatMessage, opts *types.ChatOptions) (<-chan types.StreamingResponse, error)
+// Message and the other aliases below re-export the request model defined
+// in internal/models/api so callers only import chat.
+//
+//nolint:revive // ChatOptions is the name every caller uses.
+type (
+	Message      = api.Message
+	ToolCall     = api.ToolCall
+	FunctionCall = api.FunctionCall
+	Tool         = api.Tool
+	FunctionDef  = api.FunctionDef
+	ChatOptions  = api.Options
+)
 
-	ModelName() string
+// Chat is one chat model role.
+type Chat interface {
+	// Chat performs a non-streaming chat.
+	Chat(ctx context.Context, messages []Message, opts *ChatOptions) (*types.ChatResponse, error)
+
+	// ChatStream performs a streaming chat. The closing chunk has Done set
+	// and carries the tool calls and the usage; a broken stream closes with
+	// a ResponseTypeError chunk.
+	ChatStream(ctx context.Context, messages []Message, opts *ChatOptions) (<-chan types.StreamResponse, error)
+
+	// GetModelName returns the model name sent on the wire.
+	GetModelName() string
 }
 
-// New builds the client for one configured chat role (models.chat,
-// models.extraction or models.judge).
-func New(role config.ChatRole) (Chat, error) {
+// NewChat builds the protocol client for one configured chat role
+// (models.chat, models.extraction or models.judge).
+func NewChat(role config.ChatRole) (Chat, error) {
 	if strings.TrimSpace(role.BaseURL) == "" {
 		return nil, errors.New("chat: base URL is required")
 	}
@@ -42,40 +62,14 @@ func New(role config.ChatRole) (Chat, error) {
 		Model:   role.Model,
 		Auth:    api.BearerAuth(role.APIKey),
 	}
+
 	switch role.Protocol {
-	case config.ProtocolChatCompletions:
-		return &completionsChat{client: openaichat.New(endpoint), model: role.Model}, nil
+	case api.APIOpenAICompletions:
+		return openaicompletions.New(openaicompletions.Config{
+			Endpoint: endpoint,
+			Settings: api.DefaultOpenAICompletions(),
+		}), nil
 	default:
-		return nil, fmt.Errorf("chat: unknown protocol %q", role.Protocol)
+		return nil, fmt.Errorf("unsupported chat api %q for model %s", role.Protocol, role.Model)
 	}
-}
-
-type completionsChat struct {
-	client *openaichat.Client
-	model  string
-}
-
-func (c *completionsChat) ModelName() string { return c.model }
-
-func (c *completionsChat) Chat(ctx context.Context, messages []types.ChatMessage, opts *types.ChatOptions) (*types.ChatResponse, error) {
-	resp, err := c.client.Chat(ctx, messages, deref(opts))
-	if err != nil {
-		return nil, fmt.Errorf("chat %s: %w", c.model, err)
-	}
-	return resp, nil
-}
-
-func (c *completionsChat) ChatStream(ctx context.Context, messages []types.ChatMessage, opts *types.ChatOptions) (<-chan types.StreamingResponse, error) {
-	ch, err := c.client.ChatStream(ctx, messages, deref(opts))
-	if err != nil {
-		return nil, fmt.Errorf("chat %s: %w", c.model, err)
-	}
-	return ch, nil
-}
-
-func deref(opts *types.ChatOptions) types.ChatOptions {
-	if opts == nil {
-		return types.ChatOptions{}
-	}
-	return *opts
 }

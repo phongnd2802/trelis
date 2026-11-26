@@ -175,7 +175,7 @@ models:
     model: gpt-4o-mini
     api_key: sk-chat
   extraction:
-    protocol: chat_completions
+    protocol: openai-completions
     base_url: https://openrouter.ai/api/v1
     model: qwen/qwen3-32b
   judge:
@@ -191,11 +191,11 @@ func TestLoadModelRoles(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	want := Models{
-		Chat: ChatRole{Protocol: "chat_completions", Endpoint: Endpoint{
+		Chat: ChatRole{Protocol: "openai-completions", Endpoint: Endpoint{
 			BaseURL: "http://litellm:4000/v1", Model: "gpt-4o-mini", APIKey: "sk-chat"}},
-		Extraction: ChatRole{Protocol: "chat_completions", Endpoint: Endpoint{
+		Extraction: ChatRole{Protocol: "openai-completions", Endpoint: Endpoint{
 			BaseURL: "https://openrouter.ai/api/v1", Model: "qwen/qwen3-32b"}},
-		Judge: ChatRole{Protocol: "chat_completions", Endpoint: Endpoint{
+		Judge: ChatRole{Protocol: "openai-completions", Endpoint: Endpoint{
 			BaseURL: "https://api.openai.com/v1", Model: "gpt-4.1", APIKey: "sk-judge"}},
 	}
 	if cfg.Models != want {

@@ -1,0 +1,53 @@
+Trelis
+=======
+
+Parts of Trelis are copied near-verbatim from, or derived from, WeKnora
+(https://github.com/Tencent/WeKnora), reached through the Omnisc fork. Each
+such file starts with a header naming its WeKnora source.
+
+WeKnora
+-------
+Copyright (C) 2026 Tencent.  All rights reserved.
+
+Files (paths in this repository):
+
+  Copied near-verbatim:
+    internal/models/api/sse.go
+    internal/models/api/sse_test.go
+    internal/models/api/sse_framing_test.go
+    internal/models/api/stream_assembler_test.go
+
+  Derived (trimmed to the parts Trelis uses):
+    internal/types/chat.go
+    internal/models/api/types.go
+    internal/models/api/options.go
+    internal/models/api/endpoint.go
+    internal/models/api/transport.go
+    internal/models/api/usage.go
+    internal/models/api/compat_settings.go
+    internal/models/api/stream_assembler.go
+    internal/models/api/openaicompletions/client.go
+    internal/models/api/openaicompletions/request.go
+    internal/models/api/openaicompletions/stream_tool_index_test.go
+    internal/models/chat/chat.go
+
+WeKnora is licensed under the MIT License:
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

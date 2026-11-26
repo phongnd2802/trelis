@@ -32,7 +32,7 @@ temporal:
 # out of this file: set TRELIS_MODELS_<ROLE>_API_KEY instead.
 # models:
 #   chat:
-#     protocol: chat_completions   # POST {base_url}/chat/completions
+#     protocol: openai-completions   # POST {base_url}/chat/completions
 #     base_url: http://localhost:4000/v1
 #     model: gpt-4o-mini
 #   extraction:
