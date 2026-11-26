@@ -1,0 +1,17 @@
+# Handler, service and repository stay separate; repositories reach Postgres only through `db.Store`
+
+Trelis keeps Omnisc's layering: HTTP handlers in `internal/handler`, use cases in `internal/application/service`, and persistence in `internal/application/repository`. Contracts between the layers are declared in `internal/types/interfaces`. Repositories never hold a `*pgxpool.Pool` or call `sqlc.New` themselves. They depend on one interface, `db.Store` in `internal/db`, which wraps the sqlc-generated queries and owns transactions. A transaction travels in the context: a service runs a use case in `store.ExecTx(ctx, func(ctx) error)`, and every repository call made with that context runs in the same transaction, because a repository always gets its queries from `store.Querier(ctx)`. Only services start transactions; repositories never do. We chose this because the layering mirrors the system Trelis is rebuilt from, so its code and patterns port across with little translation. A single Store gives one place for opening, committing and rolling back transactions and for mapping Postgres errors, instead of repeating `pool.Begin`/`Rollback`, `sqlc.New` and constraint-code checks in every repository.
+
+## Considered Options
+
+- **Collapse service and repository into one concrete module per concept** (proposed in the 2026-11-26 architecture review). Rejected: the service and repository interfaces each have one adapter today and are partly pass-through, but keeping the layers is a deliberate choice for parity with Omnisc and for the room it leaves (use cases that span several repositories, a repository that changes storage), not an oversight. Future reviews should not re-suggest it.
+- **Repositories on `*pgxpool.Pool` with `sqlc.New` per call** (what the first Document repository did). Rejected: transaction handling and error mapping get copied into each repository.
+
+## Consequences
+
+- `sqlc.yaml` emits the `Querier` interface, and `db.Store` is built on it. The Postgres adapter is the only production adapter, so the Store is a seam for locality more than for substitution. Repository tests still run against real Postgres through `dbtest`.
+- Use cases that change several tables atomically compose repositories inside one `ExecTx`. For example, upload resolves Access List names through the Principal repository and then creates the Document. A nested `ExecTx` joins the outer transaction. The transaction rolls back when `fn` returns an error or panics.
+- `internal/db` provides `ErrNotFound`, `IsUniqueViolation` and `IsForeignKeyViolation`. Each repository still maps them to its own domain errors (`ErrDocumentNotFound`, `ErrDuplicateDocument`, ...). The Store does not translate errors itself.
+- The Store covers queries and transactions only. Migrations and the `/readyz` ping use the pool directly.
+- Principals, Groups and API keys follow the same layering, so there is no separate `auth` package. Their types live in `internal/types`, including `WithPrincipal` and `PrincipalFromContext`. Key generation and hashing live in `internal/utils`. `PrincipalRepository` (Principals, Groups, membership) and `APIKeyRepository` sit behind an `AuthService` (only `Authenticate`, used by the HTTP middleware) and a `PrincipalService` (the admin operations, used by the admin CLI and `/me`).
+- Every later repository (Chunks, Figures, Extractions, Tool Approvals) uses the same Store.
