@@ -2,14 +2,17 @@
 // Copyright (C) 2026 Tencent. Licensed under the MIT License; see NOTICE.
 
 // Package api holds the protocol-neutral request model shared by every wire
-// protocol implementation (OpenAI Chat Completions now, OpenAI Responses with
-// #19) plus the helpers those implementations share: the endpoint, SSE
-// reading, streaming tool-call assembly and usage decoding.
+// protocol implementation (OpenAI Chat Completions and OpenAI Responses)
+// plus the helpers those implementations share: the endpoint, SSE reading,
+// streaming tool-call assembly and usage decoding.
 //
 // Protocol packages live under api/<protocol>.
 package api
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"slices"
+)
 
 // API identifies a wire protocol. It is the value of a chat role's
 // `protocol` key and decides which protocol package talks to the endpoint.
@@ -19,16 +22,24 @@ const (
 	// APIOpenAICompletions is the OpenAI Chat Completions protocol, the
 	// lingua franca of almost every third-party vendor.
 	APIOpenAICompletions API = "openai-completions"
+
+	// APIOpenAIResponses is the OpenAI Responses protocol: the same models
+	// and tool calls as Chat Completions, over the request and event shapes
+	// POST /responses uses.
+	APIOpenAIResponses API = "openai-responses"
 )
 
+// KnownAPIs lists the protocols this build ships, in the order a message
+// should name them. Known and the config validation both read it, so the list
+// a rejected protocol is compared against and the list its error names cannot
+// drift apart.
+func KnownAPIs() []API {
+	return []API{APIOpenAICompletions, APIOpenAIResponses}
+}
+
 // Known reports whether the API value names a protocol this build ships.
-// APIOpenAIResponses joins with #19.
 func (a API) Known() bool {
-	switch a {
-	case APIOpenAICompletions:
-		return true
-	}
-	return false
+	return slices.Contains(KnownAPIs(), a)
 }
 
 // Tool represents a function/tool definition
