@@ -295,7 +295,7 @@ func (q *Queries) ListReadableDocuments(ctx context.Context, arg ListReadableDoc
 	return items, nil
 }
 
-const setDocumentParseStatus = `-- name: SetDocumentParseStatus :exec
+const setDocumentParseStatus = `-- name: SetDocumentParseStatus :execrows
 UPDATE documents
 SET parse_status = $1,
     parse_error = CASE
@@ -314,8 +314,11 @@ type SetDocumentParseStatusParams struct {
 
 // A failed parse keeps its reason; a pending, processing or completed
 // Document carries none, so the reason can neither go stale nor be set on a
-// Document that did not fail.
-func (q *Queries) SetDocumentParseStatus(ctx context.Context, arg SetDocumentParseStatusParams) error {
-	_, err := q.db.Exec(ctx, setDocumentParseStatus, arg.ParseStatus, arg.ParseError, arg.ID)
-	return err
+// Document that did not fail. execrows lets the caller notice a missing row.
+func (q *Queries) SetDocumentParseStatus(ctx context.Context, arg SetDocumentParseStatusParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setDocumentParseStatus, arg.ParseStatus, arg.ParseError, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

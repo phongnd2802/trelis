@@ -6,7 +6,7 @@ Status: **done** (built, tested, reachable), **partial** (code exists but nothin
 
 ## System at a glance
 
-- **One Go process**, `cmd/server`, serves the HTTP API and runs the admin CLI (`trelis admin ...`). The binary is `trelis` (`bin/trelis` from `make build`, `/trelis` in the image); in development `go run ./cmd/server` runs it. Ingest runs as a Temporal workflow (ADR-0005), served by a worker inside the same process.
+- **One Go process**, `cmd/server`, serves the HTTP API and runs the admin CLI (`trelis admin ...`). The binary is `trelis` (`bin/trelis` from `make build`, `/trelis` in the image); in development `go run ./cmd/server` runs it. Ingest runs as a Temporal workflow (ADR-0005), served by two workers inside the same process: the ingest work, and model calls on their own rate-limited queue.
 - **Stores** (`compose.yaml`, `compose.dev.yaml`):
   - Postgres (ParadeDB image, `pgvector` and `pg_search`): the source of truth (ADR-0002). Schema in `migrations/`, applied by goose on every start.
   - S3-compatible object storage (silo in dev): Source Files, later Figures (ADR-0006).
@@ -37,13 +37,13 @@ Status: **done** (built, tested, reachable), **partial** (code exists but nothin
 | Supported upload types | done | `internal/utils/import_filetypes.go` | `POST /documents` rejects other types | `internal/router/documents_test.go` | — |
 | Chunker: recursive tier, token limit, protected spans, validator | done | `internal/chunker/` | the ingest workflow (`internal/application/service/ingest.go`) | `internal/chunker/splitter_test.go`, `internal/chunker/strategy_test.go`, `internal/chunker/config_test.go` | #27 |
 | Chunker: heading tier, heuristic tier (Vietnamese legal), tables, parent-child | planned | — | — | — | #28, #29, #30 |
-| Ingest workflow on Temporal: parse a Source File, chunk it, store the Chunks | done | `internal/ingest/`, `internal/application/service/ingest.go`, `internal/application/repository/chunk.go`, `migrations/00006_chunks.sql` | `POST /documents` starts it; the worker runs in `cmd/server` | `internal/integration/ingest_test.go`, `internal/integration/ingest_anydoc_test.go` | ADR-0005, #21 |
-| Ingest: embedding, reconciler, cancel on delete, progress over SSE | planned | — | — | — | Week 1 (#2): #22, #26, #24, #23, #31 |
+| Ingest workflow on Temporal: parse a Source File, chunk it, embed every Chunk in batches, then complete | done | `internal/ingest/`, `internal/application/service/ingest.go`, `internal/application/repository/chunk.go`, `internal/models/embedding/`, `internal/types/interfaces/embedding.go`, `migrations/00006_chunks.sql`, `migrations/00007_chunk_embeddings.sql` | `POST /documents` starts it; the workers in `cmd/server` run it, embedding one request per batch on `temporal.model_task_queue` | `internal/ingest/workflow_test.go`, `internal/application/service/ingest_test.go`, `internal/integration/ingest_test.go`, `internal/integration/ingest_anydoc_test.go`, `internal/integration/ingest_embed_test.go` | ADR-0005, #21, #22 |
+| Ingest: reconciler, cancel on delete, progress over SSE | planned | — | — | — | Week 1 (#2): #26, #24, #23, #31 |
 | OCR fallback (Docling, VLM), image captions | planned | — | — | — | Week 7 (#8): #76, #77, #78, #79 |
 
 ## Model clients
 
-Each role (`models.chat`, `models.extraction`, `models.judge`, `models.embedding`, `models.rerank`) points at its own OpenAI-compatible provider; config in `internal/config/models.go`, documented in `config/trelis.yaml`. Every call logs one `model call` line (`internal/logger/modelcall.go`). None of the clients is called by the running service yet, so they are all **partial**.
+Each role (`models.chat`, `models.extraction`, `models.judge`, `models.embedding`, `models.rerank`) points at its own OpenAI-compatible provider; config in `internal/config/models.go`, documented in `config/trelis.yaml`. Every call logs one `model call` line (`internal/logger/modelcall.go`). The embedding client is the only one the running service calls, from the ingest embed-batch activities; the others are **partial**.
 
 | Feature | Status | Where | Tests | Decisions / issues |
 |---|---|---|---|---|
@@ -51,7 +51,7 @@ Each role (`models.chat`, `models.extraction`, `models.judge`, `models.embedding
 | Chat Completions protocol (streaming, tool calls) | partial | `internal/models/api/openaicompletions/` | `internal/models/api/openaicompletions/client_test.go` | #17 |
 | Responses protocol | partial | `internal/models/api/openairesponses/` | `internal/models/api/openairesponses/client_test.go`, `internal/models/api/openairesponses/golden_test.go` | #19 |
 | Shared wire code: retry with backoff and `Retry-After`, SSE reader, stream assembler, capped reads | partial | `internal/models/api/` | `internal/models/api/retry_test.go`, `internal/models/api/sse_test.go`, `internal/models/api/stream_assembler_test.go` | — |
-| Embeddings client (batching, dimension checks) | partial | `internal/models/embedding/` | `internal/models/embedding/embedding_test.go` | #16 |
+| Embeddings client (batching, dimension checks) | done | `internal/models/embedding/` | `internal/models/embedding/embedding_test.go` | #16, #22 |
 | Rerank client (Jina/Cohere schema) | partial | `internal/models/rerank/` | `internal/models/rerank/rerank_test.go` | #18 |
 | Fake OpenAI-compatible provider for tests | done | `internal/models/modeltest/` | its own tests | #15 |
 | Agent engine | partial (stub) | `internal/agent/engine.go` | — | Week 5 (#6): #66 |

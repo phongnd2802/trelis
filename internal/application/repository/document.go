@@ -96,15 +96,20 @@ func (r *documentRepository) GetDocumentByID(ctx context.Context, id uuid.UUID) 
 }
 
 // SetParseStatus sets a Document's parse status and, when it failed, the
-// reason it is shown with; any other status clears the reason.
+// reason it is shown with; any other status clears the reason. A missing row
+// is ErrDocumentNotFound, so a caller can tell a deleted Document from a lost
+// update.
 func (r *documentRepository) SetParseStatus(ctx context.Context, id uuid.UUID, status, parseError string) error {
-	err := r.store.Querier(ctx).SetDocumentParseStatus(ctx, sqlc.SetDocumentParseStatusParams{
+	rows, err := r.store.Querier(ctx).SetDocumentParseStatus(ctx, sqlc.SetDocumentParseStatusParams{
 		ID:          id,
 		ParseStatus: status,
 		ParseError:  parseError,
 	})
 	if err != nil {
 		return fmt.Errorf("set parse status of document %s: %w", id, err)
+	}
+	if rows == 0 {
+		return ErrDocumentNotFound
 	}
 	return nil
 }

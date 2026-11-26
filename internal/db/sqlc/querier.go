@@ -12,6 +12,7 @@ import (
 
 type Querier interface {
 	AddGroupMember(ctx context.Context, arg AddGroupMemberParams) error
+	CountChunksWithoutEmbedding(ctx context.Context, documentID uuid.UUID) (int64, error)
 	CountReadableDocuments(ctx context.Context, principalID uuid.UUID) (int64, error)
 	CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (CreateAPIKeyRow, error)
 	CreateDocument(ctx context.Context, arg CreateDocumentParams) (Document, error)
@@ -32,18 +33,25 @@ type Querier interface {
 	GrantDocumentToPrincipal(ctx context.Context, arg GrantDocumentToPrincipalParams) error
 	InsertChunk(ctx context.Context, arg InsertChunkParams) error
 	ListAPIKeys(ctx context.Context, principalID uuid.UUID) ([]ListAPIKeysRow, error)
-	ListChunksByDocument(ctx context.Context, documentID uuid.UUID) ([]Chunk, error)
 	ListDocumentGroups(ctx context.Context, documentID uuid.UUID) ([]string, error)
 	ListDocumentPrincipals(ctx context.Context, documentID uuid.UUID) ([]string, error)
 	ListPrincipalGroups(ctx context.Context, principalID uuid.UUID) ([]ListPrincipalGroupsRow, error)
 	// A page of the Documents a Principal can read, newest first.
 	ListReadableDocuments(ctx context.Context, arg ListReadableDocumentsParams) ([]Document, error)
+	// One batch of embedding work: the Chunks of a seq range that the embed
+	// activity has not written a vector for yet. Re-running a range, as a retry
+	// does, skips the Chunks already done.
+	ListUnembeddedChunksByDocument(ctx context.Context, arg ListUnembeddedChunksByDocumentParams) ([]ListUnembeddedChunksByDocumentRow, error)
 	// Revoking twice keeps the first revocation time.
 	RevokeAPIKey(ctx context.Context, id uuid.UUID) (int64, error)
+	// The vector goes in as its text form and is cast here, which is also what
+	// keeps sqlc from having to map the vector type. execrows lets the caller
+	// notice a Chunk that disappeared between listing and updating.
+	SetChunkEmbedding(ctx context.Context, arg SetChunkEmbeddingParams) (int64, error)
 	// A failed parse keeps its reason; a pending, processing or completed
 	// Document carries none, so the reason can neither go stale nor be set on a
-	// Document that did not fail.
-	SetDocumentParseStatus(ctx context.Context, arg SetDocumentParseStatusParams) error
+	// Document that did not fail. execrows lets the caller notice a missing row.
+	SetDocumentParseStatus(ctx context.Context, arg SetDocumentParseStatusParams) (int64, error)
 }
 
 var _ Querier = (*Queries)(nil)

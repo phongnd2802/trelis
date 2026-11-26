@@ -31,6 +31,10 @@ type Chunk struct {
 	// Rune just past the last one held in content
 	EndOffset int32
 	CreatedAt time.Time
+	// Vector of the Chunk text, produced by the model named in embedding_model; NULL until embedded
+	Embedding string
+	// Model that produced embedding; NULL while embedding is NULL
+	EmbeddingModel pgtype.Text
 }
 
 type Document struct {

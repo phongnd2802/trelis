@@ -34,3 +34,12 @@ type DocumentNotFoundError struct{}
 
 // Error returns the reason the workflow records in its history.
 func (e *DocumentNotFoundError) Error() string { return "the Document does not exist" }
+
+// EmbeddingUnconfiguredError means models.embedding names no provider, so a
+// Document cannot be embedded. Retrying cannot help until an operator sets
+// one, and the message is safe to store in the Document's parse_error.
+type EmbeddingUnconfiguredError struct{}
+
+// Error returns the reason shown beside a Document that failed ingest and
+// recorded in the workflow history.
+func (e *EmbeddingUnconfiguredError) Error() string { return "no embedding model is configured" }
