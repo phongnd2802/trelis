@@ -224,11 +224,18 @@ func toRuneSpans(text string, spans []span) []span {
 // insideSpan reports whether pos falls strictly inside one of the sorted
 // spans, so cutting the text at pos would split it.
 func insideSpan(spans []span, pos int) bool {
+	i := firstEndingAfter(spans, pos)
+	return i < len(spans) && spans[i].start < pos
+}
+
+// firstEndingAfter returns the index of the first of the sorted spans that
+// ends after pos, or len(spans).
+func firstEndingAfter(spans []span, pos int) int {
 	i, _ := slices.BinarySearchFunc(spans, pos, func(s span, p int) int {
 		if s.end <= p {
 			return -1
 		}
 		return 1
 	})
-	return i < len(spans) && spans[i].start < pos
+	return i
 }

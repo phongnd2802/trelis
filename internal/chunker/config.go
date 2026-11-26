@@ -32,8 +32,8 @@ type SplitterConfig struct {
 	// Separators are tried in order: a piece still over ChunkSize after
 	// splitting at one is split at the next.
 	Separators []string
-	// Strategy picks the tier chain: StrategyAuto (also the empty value)
-	// or StrategyRecursive.
+	// Strategy picks the tier chain: StrategyRecursive (also the empty
+	// value) or StrategyAuto.
 	Strategy string
 	// TokenLimit caps Chunks in approximate tokens, usually the embedding
 	// model's input limit. When set, ChunkSize is lowered to the rune
@@ -61,19 +61,31 @@ func defaultSeparators() []string {
 }
 
 // NormalizeSplitterConfig fills unset size, overlap and separator fields
-// with the defaults, the same way Split does, so callers that store or show
-// a config see what will run.
+// with the defaults and caps the overlap, the same way Split does, so
+// callers that store or show a config see what will run. Split further
+// lowers ChunkSize to fit TokenLimit, which can depend on the text.
 func NormalizeSplitterConfig(cfg SplitterConfig) SplitterConfig {
-	sizeUnset := cfg.ChunkSize <= 0
-	if sizeUnset {
+	if cfg.ChunkSize <= 0 {
+		// A config that sets neither size nor overlap wants both defaults;
+		// zero overlap next to an explicit size means no overlap.
 		cfg.ChunkSize = DefaultChunkSize
+		if cfg.ChunkOverlap == 0 {
+			cfg.ChunkOverlap = DefaultChunkOverlap
+		}
 	}
-	if cfg.ChunkOverlap < 0 || (cfg.ChunkOverlap == 0 && sizeUnset) {
+	if cfg.ChunkOverlap < 0 {
 		cfg.ChunkOverlap = DefaultChunkOverlap
 	}
 	if len(cfg.Separators) == 0 {
 		cfg.Separators = defaultSeparators()
 	}
+	return capOverlap(cfg)
+}
+
+// capOverlap keeps overlap at most half a Chunk: more makes most Chunks
+// near-copies of the previous one.
+func capOverlap(cfg SplitterConfig) SplitterConfig {
+	cfg.ChunkOverlap = min(cfg.ChunkOverlap, cfg.ChunkSize/2)
 	return cfg
 }
 
@@ -86,10 +98,7 @@ func ensureDefaults(cfg SplitterConfig, text string) SplitterConfig {
 			cfg.ChunkSize = budget
 		}
 	}
-	// Overlap above half a Chunk makes most Chunks near-copies of the
-	// previous one.
-	cfg.ChunkOverlap = min(cfg.ChunkOverlap, cfg.ChunkSize/2)
-	return cfg
+	return capOverlap(cfg)
 }
 
 // tokenLanguage is the language token estimates use: the first hint in

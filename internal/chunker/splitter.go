@@ -11,6 +11,15 @@ import (
 // budget instead, when lower.
 const maxProtectedSize = 7500
 
+// protectedLimit is the most runes a protected span of text may hold and
+// still be kept whole under cfg.
+func protectedLimit(cfg SplitterConfig, text string) int {
+	if cfg.TokenLimit > 0 {
+		return min(maxProtectedSize, CharsForTokenLimit(cfg.TokenLimit, tokenLanguage(cfg, text)))
+	}
+	return maxProtectedSize
+}
+
 // forceSplitLookback is how far back from a forced cut the splitter looks
 // for a line break or space to cut after instead.
 const forceSplitLookback = 200
@@ -33,10 +42,7 @@ func splitRecursive(text string, cfg SplitterConfig) []Chunk {
 		text:      text,
 		cfg:       cfg,
 		protected: protectedSpans(text),
-		hardMax:   maxProtectedSize,
-	}
-	if cfg.TokenLimit > 0 {
-		s.hardMax = min(s.hardMax, CharsForTokenLimit(cfg.TokenLimit, tokenLanguage(cfg, text)))
+		hardMax:   protectedLimit(cfg, text),
 	}
 	return s.merge(s.units())
 }
@@ -196,13 +202,13 @@ func (s *splitter) overlap(cur unit, nextRunes int) (unit, bool) {
 		pos[i], pos[j] = pos[j], pos[i]
 	}
 	pos = append(pos, cur.end)
-	window := len(pos) - 1         // runes in the window
-	minEnd := max(0, window-limit) // earliest rune index an overlap may start at
+	window := len(pos) - 1           // runes in the window
+	earliest := max(0, window-limit) // earliest rune index the overlap may start at
 
 	best, bestPriority := -1, 0
-	consider := func(startRune, endRune, priority int) {
-		if endRune < minEnd || endRune >= window ||
-			insideSpan(s.protected, pos[startRune]) ||
+	consider := func(endRune, priority int) {
+		if endRune < earliest || endRune >= window ||
+			insideSpan(s.protected, pos[endRune]) ||
 			strings.TrimSpace(s.text[pos[endRune]:cur.end]) == "" {
 			return
 		}
@@ -214,15 +220,15 @@ func (s *splitter) overlap(cur unit, nextRunes int) (unit, bool) {
 	for i := 0; i < window; i++ {
 		switch {
 		case i+1 < window && at(i) == "\n" && at(i+1) == "\n":
-			consider(i, i+2, 1)
+			consider(i+2, 1)
 		case i+3 < window && at(i) == "\r" && at(i+1) == "\n" && at(i+2) == "\r" && at(i+3) == "\n":
-			consider(i, i+4, 1)
+			consider(i+4, 1)
 		case at(i) == "\n" && (i == 0 || at(i-1) != "\n") && (i+1 == window || at(i+1) != "\n"):
-			consider(i, i+1, 2)
+			consider(i+1, 2)
 		case strings.Contains("。？！", at(i)):
-			consider(i, i+1, 3)
+			consider(i+1, 3)
 		case i+1 < window && strings.Contains(".?!", at(i)) && at(i+1) == " ":
-			consider(i, i+2, 3)
+			consider(i+2, 3)
 		}
 	}
 	if best < 0 {

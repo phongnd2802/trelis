@@ -63,6 +63,9 @@ func TestNormalizeSplitterConfigMatchesEnsureDefaults(t *testing.T) {
 	if kept := NormalizeSplitterConfig(SplitterConfig{ChunkSize: 256}); kept.ChunkOverlap != 0 {
 		t.Fatalf("explicit zero overlap became %d", kept.ChunkOverlap)
 	}
+	if capped := NormalizeSplitterConfig(SplitterConfig{ChunkSize: 100, ChunkOverlap: 90}); capped.ChunkOverlap != 50 {
+		t.Fatalf("overlap 90 on size 100 normalized to %d, want the 50 that runs", capped.ChunkOverlap)
+	}
 }
 
 func TestNormalizeLineEndings(t *testing.T) {
@@ -97,6 +100,9 @@ func TestDetectLanguage(t *testing.T) {
 		{"Điều 1. Phạm vi điều chỉnh của Luật thuế thu nhập cá nhân.", LangVietnamese},
 		{"个人所得税是对个人取得的各项所得征收的一种税。", LangChinese},
 		{"12345 !!!", LangMixed},
+		{"Le président a été élu à la majorité des voix.", LangEnglish},
+		{"La información está también disponible en español.", LangEnglish},
+		{"Luat thue thu nhap ca nhan khong dau.", LangEnglish},
 	}
 	for _, tt := range tests {
 		if got := DetectLanguage(tt.text); got != tt.want {

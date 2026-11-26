@@ -165,6 +165,15 @@ func TestSplitRespectsTheChunkSize(t *testing.T) {
 	}
 }
 
+func TestSplitBreaksCRLFParagraphs(t *testing.T) {
+	text := "one two three. four five six.\r\n\r\nseven eight nine. ten eleven twelve."
+	chunks := Split(text, recursiveCfg(40, 0))
+	want := []string{"one two three. four five six.\r\n\r\n", "seven eight nine. ten eleven twelve."}
+	if got := contents(chunks); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("chunks = %q, want %q", got, want)
+	}
+}
+
 func TestSplitPrefersHigherPrioritySeparators(t *testing.T) {
 	text := "one two three. four five six.\n\nseven eight nine. ten eleven twelve."
 	chunks := Split(text, recursiveCfg(40, 0))

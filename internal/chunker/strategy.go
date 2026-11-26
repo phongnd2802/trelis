@@ -52,13 +52,16 @@ func SplitWithDiagnostics(text string, cfg SplitterConfig) ([]Chunk, *Diagnostic
 }
 
 // resolveChain returns the tiers to try, in order, ending with the
-// recursive tier. StrategyAuto will consult the document profiler (#28);
-// until then every strategy runs the recursive tier alone.
+// recursive tier. An empty Strategy means recursive, so configs stored
+// before strategies existed keep their behaviour. StrategyAuto will consult
+// the document profiler (#28); until then it, too, runs the recursive tier
+// alone.
 func resolveChain(cfg SplitterConfig) []StrategyTier {
 	switch cfg.Strategy {
-	case StrategyRecursive, StrategyAuto, "":
+	case StrategyRecursive, "":
+	case StrategyAuto:
 	default:
-		slog.Warn("chunker: unknown strategy, using auto", "strategy", cfg.Strategy)
+		slog.Warn("chunker: unknown strategy, using recursive", "strategy", cfg.Strategy)
 	}
 	return []StrategyTier{TierRecursive}
 }
@@ -72,7 +75,7 @@ func runChain(text string, cfg SplitterConfig, chain []StrategyTier) ([]Chunk, *
 	for _, tier := range chain {
 		out = tierSplitters[tier](text, cfg)
 		diag.SelectedTier = tier
-		v := ValidateChunks(text, out, cfg.ChunkSize)
+		v := ValidateChunks(text, out, cfg)
 		if v.OK {
 			return out, diag
 		}

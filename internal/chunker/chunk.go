@@ -18,8 +18,9 @@ import (
 // Content is exactly the source text between Start and End, which are rune
 // offsets (so End-Start == utf8.RuneCountInString(Content)), the way
 // Postgres counts characters. Context that is not in the source at those
-// offsets, such as a heading breadcrumb, goes in ContextHeader so the
-// offsets stay exact.
+// offsets, such as a heading breadcrumb or the header row of a table that
+// continues from the previous Chunk, goes in ContextHeader so the offsets
+// stay exact.
 type Chunk struct {
 	Content       string
 	ContextHeader string

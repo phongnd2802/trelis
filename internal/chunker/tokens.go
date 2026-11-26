@@ -83,12 +83,13 @@ func DetectLanguage(text string) string {
 	}
 }
 
-// isVietnameseLetter reports whether r is one of the letters Vietnamese
-// adds to the Latin alphabet: đ, the vowels with a breve, circumflex or
-// horn, and every vowel with a tone mark (Latin Extended Additional).
+// isVietnameseLetter reports whether r is a letter only Vietnamese uses:
+// đ, ă, ơ, ư, or a vowel from the Latin Extended Additional block (ạ, ế,
+// ữ, ...), where most Vietnamese tone-marked vowels live. Accented letters
+// French or Spanish share, such as é or á, do not count.
 func isVietnameseLetter(r rune) bool {
 	switch unicode.ToLower(r) {
-	case 'đ', 'ă', 'â', 'ê', 'ô', 'ơ', 'ư', 'à', 'á', 'ã', 'è', 'é', 'ì', 'í', 'ò', 'ó', 'õ', 'ù', 'ú', 'ý', 'ĩ', 'ũ':
+	case 'đ', 'ă', 'ơ', 'ư':
 		return true
 	}
 	return r >= 0x1EA0 && r <= 0x1EF9

@@ -1,6 +1,7 @@
 package chunker
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -73,7 +74,7 @@ func TestTierFallThrough(t *testing.T) {
 			chain:    []StrategyTier{"empty", TierRecursive},
 			size:     200,
 			selected: TierRecursive,
-			rejected: []TierRejection{{"empty", "no chunks produced"}},
+			rejected: []TierRejection{{"empty", "no chunks"}},
 		},
 		{
 			name:     "a tier that does not split a large document falls through",
@@ -81,7 +82,7 @@ func TestTierFallThrough(t *testing.T) {
 			chain:    []StrategyTier{"whole", TierRecursive},
 			size:     200,
 			selected: TierRecursive,
-			rejected: []TierRejection{{"whole", "single chunk for large document"}},
+			rejected: []TierRejection{{"whole", "one chunk for a document"}},
 		},
 		{
 			name:     "a tier that breaks the position invariant falls through",
@@ -137,10 +138,35 @@ func TestTheLastTierIsReturnedEvenWhenRejected(t *testing.T) {
 	if diag.SelectedTier != TierRecursive {
 		t.Fatalf("selected %q, want recursive", diag.SelectedTier)
 	}
-	if len(diag.Rejected) != 1 || diag.Rejected[0].Reason != "too many tiny chunks" {
+	if len(diag.Rejected) != 1 || !strings.Contains(diag.Rejected[0].Reason, "fragmented") {
 		t.Fatalf("rejected = %v, want the recursive tier rejected for tiny chunks", diag.Rejected)
 	}
 	assertPositions(t, text, chunks)
+}
+
+func TestLargeProtectedSpansAreNotRejected(t *testing.T) {
+	var rows strings.Builder
+	rows.WriteString("| Bậc | Thuế suất |\n|---|---|\n")
+	for i := range 100 {
+		fmt.Fprintf(&rows, "| %d | %d%% |\n", i, i)
+	}
+	text := "Mở đầu.\n\n" + rows.String()
+	tests := []struct {
+		name string
+		cfg  SplitterConfig
+	}{
+		{"kept whole over twice the size", SplitterConfig{Strategy: StrategyRecursive}},
+		{"cut at the token limit", SplitterConfig{TokenLimit: 300, Languages: []string{LangEnglish}, Strategy: StrategyRecursive}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chunks, diag := SplitWithDiagnostics(text, tt.cfg)
+			if len(diag.Rejected) != 0 {
+				t.Fatalf("recursive output rejected: %v", diag.Rejected)
+			}
+			assertPositions(t, text, chunks)
+		})
+	}
 }
 
 func TestSplitAndDiagnosticsAgree(t *testing.T) {
@@ -181,19 +207,21 @@ func TestValidateChunks(t *testing.T) {
 		size   int
 		reason string // empty means OK
 	}{
-		{"empty", long, nil, 100, "no chunks produced"},
-		{"single chunk for a large document", long, []Chunk{chunkAt(long, 0, 0, 1000)}, 100, "single chunk for large document"},
+		{"empty", long, nil, 100, "no chunks"},
+		{"single chunk for a large document", long, []Chunk{chunkAt(long, 0, 0, 1000)}, 100, "one chunk for a document"},
 		{"reasonable output", long, evenly(long, 100), 100, ""},
-		{"a chunk over twice the size", long, append(evenly(long[:700], 100), chunkAt(long, 7, 700, 1000)), 100, "chunk exceeds 2x target size"},
+		{"a chunk over twice the size", long, append(evenly(long[:700], 100), chunkAt(long, 7, 700, 1000)), 100, "over twice the target size"},
 		{"a tiny tail is fine", long[:960], evenly(long[:960], 100), 100, ""},
-		{"fragmented output", long, evenly(long, 10), 100, "too many tiny chunks"},
-		{"all chunks far below the size", strings.Repeat("a", 600), evenly(strings.Repeat("a", 600), 60), 400, "all chunks far below target size"},
+		{"fragmented output", long, evenly(long, 10), 100, "fragmented"},
+		{"all chunks far below the size", strings.Repeat("a", 600), evenly(strings.Repeat("a", 600), 60), 400, "quarter of the target size"},
+		{"one chunk with offsets past the text", long, []Chunk{{Content: long, Start: 0, End: 5000}}, 100, "one chunk for a document"},
 		{"content not at its offsets", "xin chào", []Chunk{{Content: "chào", Start: 0, End: 4}}, 100, "is not the source text"},
 		{"a cut table", "a\n" + table, byLines("a\n"+table, SplitterConfig{}), 1000, "cuts a protected span"},
+		{"a lone protected span over twice the size", "Mở đầu.\n\n" + table, []Chunk{chunkAt("Mở đầu.\n\n"+table, 0, 0, 9), chunkAt("Mở đầu.\n\n"+table, 1, 9, 9+utf8.RuneCountInString(table))}, 60, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			v := ValidateChunks(tt.text, tt.chunks, tt.size)
+			v := ValidateChunks(tt.text, tt.chunks, ensureDefaults(SplitterConfig{ChunkSize: tt.size, ChunkOverlap: 0}, tt.text))
 			if tt.reason == "" {
 				if !v.OK {
 					t.Fatalf("rejected: %s", v.Reason)
