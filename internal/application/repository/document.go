@@ -8,10 +8,8 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/phongnd2802/trelis/internal/db"
 	"github.com/phongnd2802/trelis/internal/db/sqlc"
 	"github.com/phongnd2802/trelis/internal/types"
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
@@ -24,33 +22,22 @@ var (
 	// ErrDuplicateDocument means the owner already has a Document with that
 	// content hash.
 	ErrDuplicateDocument = errors.New("document with the same content already exists")
-	// ErrPrincipalNotFound means an Access List names no existing Principal.
-	ErrPrincipalNotFound = errors.New("principal not found")
-	// ErrGroupNotFound means an Access List names no existing Group.
-	ErrGroupNotFound = errors.New("group not found")
 )
 
-// uniqueViolation is Postgres's SQLSTATE for a unique constraint violation.
-const uniqueViolation = "23505"
-
 type documentRepository struct {
-	pool *pgxpool.Pool
+	store db.Store
 }
 
-// NewDocumentRepository returns a DocumentRepository on a migrated database.
-func NewDocumentRepository(pool *pgxpool.Pool) interfaces.DocumentRepository {
-	return &documentRepository{pool: pool}
+// NewDocumentRepository returns a DocumentRepository on store.
+func NewDocumentRepository(store db.Store) interfaces.DocumentRepository {
+	return &documentRepository{store: store}
 }
 
-// CreateDocument inserts doc and its Access List in one transaction.
-func (r *documentRepository) CreateDocument(ctx context.Context, doc *types.Document, accessList types.AccessList) error {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("create document: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	q := sqlc.New(tx)
-
+// CreateDocument inserts doc and grants it to its owner and to grants. It
+// starts no transaction of its own: call it inside the service's ExecTx so
+// a failed grant leaves no Document behind.
+func (r *documentRepository) CreateDocument(ctx context.Context, doc *types.Document, grants types.AccessGrants) error {
+	q := r.store.Querier(ctx)
 	row, err := q.CreateDocument(ctx, sqlc.CreateDocumentParams{
 		ID:        doc.ID,
 		OwnerID:   doc.OwnerID,
@@ -62,58 +49,31 @@ func (r *documentRepository) CreateDocument(ctx context.Context, doc *types.Docu
 		UploadID:  doc.UploadID,
 		ObjectKey: doc.ObjectKey,
 	})
-	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == uniqueViolation {
+	if db.IsUniqueViolation(err) {
 		return ErrDuplicateDocument
 	}
 	if err != nil {
 		return fmt.Errorf("create document %q: %w", doc.FileName, err)
 	}
-	if err := grant(ctx, q, doc.ID, doc.OwnerID, accessList); err != nil {
-		return err
+	// The owner is always on the Access List; granting twice is a no-op.
+	for _, p := range append([]uuid.UUID{doc.OwnerID}, grants.PrincipalIDs...) {
+		if err := q.GrantDocumentToPrincipal(ctx, sqlc.GrantDocumentToPrincipalParams{DocumentID: doc.ID, PrincipalID: p}); err != nil {
+			return fmt.Errorf("grant document to principal %s: %w", p, err)
+		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("create document %q: %w", doc.FileName, err)
+	for _, g := range grants.GroupIDs {
+		if err := q.GrantDocumentToGroup(ctx, sqlc.GrantDocumentToGroupParams{DocumentID: doc.ID, GroupID: g}); err != nil {
+			return fmt.Errorf("grant document to group %s: %w", g, err)
+		}
 	}
 	*doc = *fromRow(row)
 	return nil
 }
 
-// grant puts owner and everyone on list on the Document's Access List.
-func grant(ctx context.Context, q *sqlc.Queries, doc, owner uuid.UUID, list types.AccessList) error {
-	if err := q.GrantDocumentToPrincipal(ctx, sqlc.GrantDocumentToPrincipalParams{DocumentID: doc, PrincipalID: owner}); err != nil {
-		return fmt.Errorf("grant document to owner: %w", err)
-	}
-	for _, name := range list.Principals {
-		p, err := q.GetPrincipalByName(ctx, name)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("%w: %s", ErrPrincipalNotFound, name)
-		}
-		if err != nil {
-			return fmt.Errorf("principal %q: %w", name, err)
-		}
-		if err := q.GrantDocumentToPrincipal(ctx, sqlc.GrantDocumentToPrincipalParams{DocumentID: doc, PrincipalID: p.ID}); err != nil {
-			return fmt.Errorf("grant document to principal %q: %w", name, err)
-		}
-	}
-	for _, name := range list.Groups {
-		g, err := q.GetGroupByName(ctx, name)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("%w: %s", ErrGroupNotFound, name)
-		}
-		if err != nil {
-			return fmt.Errorf("group %q: %w", name, err)
-		}
-		if err := q.GrantDocumentToGroup(ctx, sqlc.GrantDocumentToGroupParams{DocumentID: doc, GroupID: g.ID}); err != nil {
-			return fmt.Errorf("grant document to group %q: %w", name, err)
-		}
-	}
-	return nil
-}
-
 // GetDocumentByOwnerAndHash finds the owner's upload of the same content.
 func (r *documentRepository) GetDocumentByOwnerAndHash(ctx context.Context, ownerID uuid.UUID, fileHash string) (*types.Document, error) {
-	row, err := sqlc.New(r.pool).GetDocumentByOwnerAndHash(ctx, sqlc.GetDocumentByOwnerAndHashParams{OwnerID: ownerID, FileHash: fileHash})
-	if errors.Is(err, pgx.ErrNoRows) {
+	row, err := r.store.Querier(ctx).GetDocumentByOwnerAndHash(ctx, sqlc.GetDocumentByOwnerAndHashParams{OwnerID: ownerID, FileHash: fileHash})
+	if errors.Is(err, db.ErrNotFound) {
 		return nil, ErrDocumentNotFound
 	}
 	if err != nil {
@@ -124,8 +84,8 @@ func (r *documentRepository) GetDocumentByOwnerAndHash(ctx context.Context, owne
 
 // GetReadableDocumentByID returns the Document if principalID can read it.
 func (r *documentRepository) GetReadableDocumentByID(ctx context.Context, principalID, id uuid.UUID) (*types.Document, error) {
-	row, err := sqlc.New(r.pool).GetReadableDocument(ctx, sqlc.GetReadableDocumentParams{ID: id, PrincipalID: principalID})
-	if errors.Is(err, pgx.ErrNoRows) {
+	row, err := r.store.Querier(ctx).GetReadableDocument(ctx, sqlc.GetReadableDocumentParams{ID: id, PrincipalID: principalID})
+	if errors.Is(err, db.ErrNotFound) {
 		return nil, ErrDocumentNotFound
 	}
 	if err != nil {
@@ -136,7 +96,7 @@ func (r *documentRepository) GetReadableDocumentByID(ctx context.Context, princi
 
 // ListPagedReadableDocuments returns one page and the total count.
 func (r *documentRepository) ListPagedReadableDocuments(ctx context.Context, principalID uuid.UUID, page *types.Pagination) ([]*types.Document, int64, error) {
-	q := sqlc.New(r.pool)
+	q := r.store.Querier(ctx)
 	total, err := q.CountReadableDocuments(ctx, principalID)
 	if err != nil {
 		return nil, 0, fmt.Errorf("count documents: %w", err)
@@ -158,7 +118,7 @@ func (r *documentRepository) ListPagedReadableDocuments(ctx context.Context, pri
 
 // GetAccessList returns the names on a Document's Access List, sorted.
 func (r *documentRepository) GetAccessList(ctx context.Context, id uuid.UUID) (*types.AccessList, error) {
-	q := sqlc.New(r.pool)
+	q := r.store.Querier(ctx)
 	principals, err := q.ListDocumentPrincipals(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("access list of %s: %w", id, err)

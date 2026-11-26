@@ -11,6 +11,8 @@ sql:
         package: sqlc
         out: internal/db/sqlc
         sql_package: pgx/v5
+        # Querier is what db.Store hands repositories (ADR-0007).
+        emit_interface: true
         overrides:
           - db_type: uuid
             go_type: github.com/google/uuid.UUID

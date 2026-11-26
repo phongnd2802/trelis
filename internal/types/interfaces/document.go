@@ -32,11 +32,11 @@ type DocumentService interface {
 
 // DocumentRepository persists Documents and their Access Lists.
 type DocumentRepository interface {
-	// CreateDocument inserts doc and grants it to its owner and to every name
-	// on accessList, all or nothing. An unknown name is ErrPrincipalNotFound
-	// or ErrGroupNotFound; the owner already holding that content is
+	// CreateDocument inserts doc and grants it to its owner and to grants.
+	// It starts no transaction: the caller runs it in one so a failed grant
+	// leaves nothing. The owner already holding that content is
 	// ErrDuplicateDocument.
-	CreateDocument(ctx context.Context, doc *types.Document, accessList types.AccessList) error
+	CreateDocument(ctx context.Context, doc *types.Document, grants types.AccessGrants) error
 	// GetDocumentByOwnerAndHash returns the owner's Document with that
 	// content hash, or ErrDocumentNotFound.
 	GetDocumentByOwnerAndHash(ctx context.Context, ownerID uuid.UUID, fileHash string) (*types.Document, error)
