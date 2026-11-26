@@ -1,4 +1,4 @@
-package fakeprovider
+package modeltest
 
 import (
 	"encoding/json"
@@ -99,8 +99,10 @@ type responseObject struct {
 	Usage     *responsesUsage `json:"usage"`
 }
 
-// responses answers POST /v1/responses.
-func (p *Provider) responses(w http.ResponseWriter, body []byte) (int, any) {
+// responses answers POST /v1/responses in the shape of
+// https://platform.openai.com/docs/api-reference/responses/object (and,
+// streamed, .../responses-streaming).
+func (p *FakeProvider) responses(w http.ResponseWriter, body []byte) (int, any) {
 	var req responsesRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		return badRequest(err)

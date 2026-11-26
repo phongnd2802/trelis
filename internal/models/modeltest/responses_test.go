@@ -1,11 +1,11 @@
-package fakeprovider_test
+package modeltest_test
 
 import (
 	"encoding/json"
 	"net/http"
 	"testing"
 
-	"github.com/phongnd2802/trelis/internal/fakeprovider"
+	"github.com/phongnd2802/trelis/internal/models/modeltest"
 )
 
 type outputItem struct {
@@ -34,11 +34,11 @@ type response struct {
 }
 
 func TestResponsesAnswersFromTheSameScriptAsChat(t *testing.T) {
-	p := fakeprovider.New(t)
-	p.Reply(fakeprovider.All(fakeprovider.LastRole("tool"), fakeprovider.Contains("be brief")), fakeprovider.Text("Sunny."))
-	p.Reply(fakeprovider.HasTool("weather"), fakeprovider.Reply{
+	p := modeltest.NewFakeProvider(t)
+	p.Reply(modeltest.All(modeltest.LastRole("tool"), modeltest.Contains("be brief")), modeltest.Text("Sunny."))
+	p.Reply(modeltest.HasTool("weather"), modeltest.Reply{
 		Text:      "Checking.",
-		ToolCalls: []fakeprovider.ToolCall{{ID: "call_1", Name: "weather", Arguments: `{"city":"Hanoi"}`}},
+		ToolCalls: []modeltest.ToolCall{{ID: "call_1", Name: "weather", Arguments: `{"city":"Hanoi"}`}},
 	})
 
 	body := map[string]any{
@@ -82,8 +82,8 @@ func TestResponsesAnswersFromTheSameScriptAsChat(t *testing.T) {
 }
 
 func TestToolCallHistoryMatchesTheSameOnBothEndpoints(t *testing.T) {
-	p := fakeprovider.New(t)
-	p.Reply(fakeprovider.Contains(`weather {"city":"Hue"}`), fakeprovider.Text("Rainy."))
+	p := modeltest.NewFakeProvider(t)
+	p.Reply(modeltest.Contains(`weather {"city":"Hue"}`), modeltest.Text("Rainy."))
 
 	chat := map[string]any{"model": "m", "messages": []map[string]any{
 		{"role": "user", "content": "Weather?"},
@@ -104,11 +104,11 @@ func TestToolCallHistoryMatchesTheSameOnBothEndpoints(t *testing.T) {
 }
 
 func TestResponsesStreamsTextAndFunctionCallEvents(t *testing.T) {
-	p := fakeprovider.New(t)
-	p.Reply(fakeprovider.Any(), fakeprovider.Reply{
+	p := modeltest.NewFakeProvider(t)
+	p.Reply(modeltest.Any(), modeltest.Reply{
 		Text:      "Let me check the weather for you.",
-		ToolCalls: []fakeprovider.ToolCall{{ID: "call_1", Name: "weather", Arguments: `{"city": "Hanoi", "unit": "C"}`}},
-		Usage:     fakeprovider.Usage{Input: 5, Output: 9},
+		ToolCalls: []modeltest.ToolCall{{ID: "call_1", Name: "weather", Arguments: `{"city": "Hanoi", "unit": "C"}`}},
+		Usage:     modeltest.Usage{Input: 5, Output: 9},
 	})
 	status, raw := post(t, p, "/responses", map[string]any{"model": "gpt-test", "input": "Weather?", "stream": true})
 	if status != http.StatusOK {

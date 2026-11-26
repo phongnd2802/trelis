@@ -1,4 +1,4 @@
-package fakeprovider_test
+package modeltest_test
 
 import (
 	"bytes"
@@ -7,11 +7,11 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/phongnd2802/trelis/internal/fakeprovider"
+	"github.com/phongnd2802/trelis/internal/models/modeltest"
 )
 
 // post sends body as JSON to the provider and returns the status and raw response.
-func post(t *testing.T, p *fakeprovider.Provider, path string, body any) (int, []byte) {
+func post(t *testing.T, p *modeltest.FakeProvider, path string, body any) (int, []byte) {
 	t.Helper()
 	b, err := json.Marshal(body)
 	if err != nil {
@@ -76,10 +76,44 @@ func chatBody(user string) map[string]any {
 	}
 }
 
+func TestScriptReplaysRepliesInOrderAcrossBothProtocols(t *testing.T) {
+	p := modeltest.NewFakeProvider(t)
+	p.Script(modeltest.Call("search", `{"q":"tax"}`), modeltest.Text("Done."))
+
+	_, raw := post(t, p, "/chat/completions", chatBody("Find the tax rules"))
+	if c := decode[chatCompletion](t, raw).Choices[0]; len(c.Message.ToolCalls) != 1 || c.Message.ToolCalls[0].Function.Name != "search" {
+		t.Errorf("first call = %s, want the search tool call", raw)
+	}
+	_, raw = post(t, p, "/responses", map[string]any{"model": "m", "input": "Find the tax rules"})
+	if out := decode[response](t, raw).Output; len(out) != 1 || out[0].Content[0].Text != "Done." {
+		t.Errorf("second call = %s, want Done.", raw)
+	}
+	if n := p.CallCount(modeltest.ChatCompletions) + p.CallCount(modeltest.Responses); n != 2 {
+		t.Errorf("call count = %d, want 2", n)
+	}
+}
+
+func TestScriptFallsBackToRulesThenFailsAnUnexpectedExtraCall(t *testing.T) {
+	rec := &recorder{TB: t}
+	p := modeltest.NewFakeProvider(rec)
+	p.Script(modeltest.Text("first"))
+
+	_, raw := post(t, p, "/chat/completions", chatBody("hi"))
+	if got := decode[chatCompletion](t, raw).Choices[0].Message.Content; got == nil || *got != "first" {
+		t.Errorf("scripted reply = %s", raw)
+	}
+	if status, _ := post(t, p, "/chat/completions", chatBody("hi")); status != http.StatusInternalServerError {
+		t.Errorf("extra call status = %d, want 500", status)
+	}
+	if len(rec.errors) != 1 {
+		t.Errorf("test errors = %q, want one for the extra call", rec.errors)
+	}
+}
+
 func TestChatCompletionsAnswersTheFirstMatchingScriptedReply(t *testing.T) {
-	p := fakeprovider.New(t)
-	p.Reply(fakeprovider.LastContains("capital of France"), fakeprovider.Text("Paris."))
-	p.Reply(fakeprovider.Any(), fakeprovider.Text("I don't know."))
+	p := modeltest.NewFakeProvider(t)
+	p.Reply(modeltest.LastContains("capital of France"), modeltest.Text("Paris."))
+	p.Reply(modeltest.Any(), modeltest.Text("I don't know."))
 
 	status, raw := post(t, p, "/chat/completions", chatBody("What is the capital of France?"))
 	if status != http.StatusOK {

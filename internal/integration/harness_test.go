@@ -24,7 +24,7 @@ import (
 	tcneo4j "github.com/testcontainers/testcontainers-go/modules/neo4j"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
-	"github.com/phongnd2802/trelis/internal/fakeprovider"
+	"github.com/phongnd2802/trelis/internal/models/modeltest"
 )
 
 // The images compose.dev.yaml runs; keep them in step.
@@ -41,9 +41,14 @@ const (
 	bootTimeout = 30 * time.Second
 )
 
+// configFile is the repo's config, which every Trelis process starts from;
+// the harness overrides keys through TRELIS_* env vars, as an operator would.
+const configFile = "../../config/trelis.yaml"
+
 // deps is what TestMain starts once for the whole package.
 var deps struct {
 	binary string
+	config string
 	pg     hostPort
 	neo4j  hostPort
 }
@@ -52,7 +57,7 @@ var deps struct {
 type hostPort struct{ host, port string }
 
 func TestMain(m *testing.M) {
-	code, err := run(m)
+	code, err := setUp(m)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "integration:", err)
 		os.Exit(1)
@@ -60,9 +65,9 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// run builds Trelis and starts the containers, runs the tests, then tears
-// everything down.
-func run(m *testing.M) (int, error) {
+// setUp builds Trelis and starts the containers, runs the tests, then
+// tears everything down.
+func setUp(m *testing.M) (int, error) {
 	ctx := context.Background()
 
 	dir, err := os.MkdirTemp("", "trelis-integration-")
@@ -70,10 +75,11 @@ func run(m *testing.M) (int, error) {
 		return 0, err
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
-	deps.binary = filepath.Join(dir, "trelis")
-	build := exec.Command("go", "build", "-tags", buildTags, "-o", deps.binary, "github.com/phongnd2802/trelis/cmd/server")
-	if out, err := build.CombinedOutput(); err != nil {
-		return 0, fmt.Errorf("build trelis: %w\n%s", err, out)
+	if deps.binary, err = buildBinary(dir); err != nil {
+		return 0, err
+	}
+	if deps.config, err = filepath.Abs(configFile); err != nil {
+		return 0, err
 	}
 
 	var (
@@ -114,6 +120,25 @@ func run(m *testing.M) (int, error) {
 	return m.Run(), nil
 }
 
+// buildBinary builds the Trelis server into dir, with the same tags as this
+// test binary, and returns its path. Built once per package, not per test.
+//
+// Adapted from Omnisc/WeKnora cli/acceptance/e2e/e2e_test.go,
+// Copyright (C) 2026 Tencent, MIT license; see NOTICE.
+func buildBinary(dir string) (string, error) {
+	out := filepath.Join(dir, "trelis")
+	// Repo layout: this test sits at internal/integration/, so the module
+	// root is two levels up.
+	cmd := exec.Command("go", "build", "-tags", buildTags, "-o", out, "./cmd/server")
+	cmd.Dir = filepath.Join("..", "..")
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("build trelis: %w", err)
+	}
+	return out, nil
+}
+
 // endpoint is where port of c is reachable from the host.
 func endpoint(ctx context.Context, c testcontainers.Container, port string) (hostPort, error) {
 	host, err := c.Host(ctx)
@@ -134,9 +159,10 @@ type trelis struct {
 	url string
 	// provider is the fake model provider this Trelis is meant to call. No
 	// model role is configurable yet; when roles land, point them at
-	// provider.URL() in config below.
-	provider *fakeprovider.Provider
-	config   string
+	// provider.URL() in trelisEnv.
+	provider *modeltest.FakeProvider
+	// env is the process environment of every command run as this Trelis.
+	env []string
 }
 
 // listening matches the log line Trelis prints once it accepts requests
@@ -148,10 +174,11 @@ var listening = regexp.MustCompile(`trelis listening addr=(\S+)`)
 // ends. Neo4j is shared by every test in the package.
 func start(t *testing.T) *trelis {
 	t.Helper()
-	tr := &trelis{provider: fakeprovider.New(t)}
-	tr.config = writeConfig(t, freshDatabase(t))
+	tr := &trelis{provider: modeltest.NewFakeProvider(t)}
+	tr.env = trelisEnv(freshDatabase(t))
 
-	cmd := exec.Command(deps.binary, "-config", tr.config)
+	cmd := exec.Command(deps.binary, "-config", deps.config)
+	cmd.Env = tr.env
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -226,49 +253,54 @@ func freshDatabase(t *testing.T) string {
 	return name
 }
 
-// writeConfig writes a Trelis config file for dbname and returns its path.
-// Temporal is left unreachable: the client connects lazily and nothing
-// under test uses it yet.
-func writeConfig(t *testing.T, dbname string) string {
-	t.Helper()
-	cfg := fmt.Sprintf(`server:
-  addr: "127.0.0.1:0"
-  shutdown_timeout: 5s
-postgres:
-  host: %q
-  port: %s
-  dbname: %q
-  user: %q
-  password: %q
-  sslmode: disable
-neo4j:
-  host: %q
-  port: %s
-  user: neo4j
-  password: %q
-temporal:
-  host: 127.0.0.1
-  port: 1
-  namespace: default
-`, deps.pg.host, deps.pg.port, dbname, pgUser, pgPassword, deps.neo4j.host, deps.neo4j.port, neo4jPassword)
-	path := filepath.Join(t.TempDir(), "trelis.yaml")
-	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
+// trelisEnv points the config at the containers and dbname through env
+// overrides. Temporal is left unreachable: the client connects lazily and
+// nothing under test uses it yet.
+func trelisEnv(dbname string) []string {
+	return append(os.Environ(),
+		"TRELIS_SERVER_ADDR=127.0.0.1:0",
+		"TRELIS_SERVER_SHUTDOWN_TIMEOUT=5s",
+		"TRELIS_POSTGRES_HOST="+deps.pg.host,
+		"TRELIS_POSTGRES_PORT="+deps.pg.port,
+		"TRELIS_POSTGRES_DBNAME="+dbname,
+		"TRELIS_POSTGRES_USER="+pgUser,
+		"TRELIS_POSTGRES_PASSWORD="+pgPassword,
+		"TRELIS_POSTGRES_SSLMODE=disable",
+		"TRELIS_NEO4J_HOST="+deps.neo4j.host,
+		"TRELIS_NEO4J_PORT="+deps.neo4j.port,
+		"TRELIS_NEO4J_USER=neo4j",
+		"TRELIS_NEO4J_PASSWORD="+neo4jPassword,
+		"TRELIS_TEMPORAL_HOST=127.0.0.1",
+		"TRELIS_TEMPORAL_PORT=1",
+	)
 }
 
 // admin runs `server admin <args>` against this Trelis's database, as an
 // operator would, and returns its trimmed stdout.
 func (tr *trelis) admin(t *testing.T, args ...string) string {
 	t.Helper()
-	cmd := exec.Command(deps.binary, append([]string{"-config", tr.config, "admin"}, args...)...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("admin %s: %v\n%s", strings.Join(args, " "), err, stderr.String())
+	stdout, err := run(deps.binary, tr.env, append([]string{"-config", deps.config, "admin"}, args...)...)
+	if err != nil {
+		t.Fatalf("%v", err)
 	}
-	return strings.TrimSpace(stdout.String())
+	return strings.TrimSpace(string(stdout))
+}
+
+// run executes the binary and returns its stdout. Errors include stderr +
+// exit code so failures are debuggable without re-running.
+//
+// From Omnisc/WeKnora cli/acceptance/e2e/e2e_test.go,
+// Copyright (C) 2026 Tencent, MIT license; see NOTICE.
+func run(bin string, env []string, args ...string) ([]byte, error) {
+	cmd := exec.Command(bin, args...)
+	cmd.Env = env
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return stdout.Bytes(), fmt.Errorf("%s %s: %v\nstderr:\n%s", filepath.Base(bin), strings.Join(args, " "), err, stderr.String())
+	}
+	return stdout.Bytes(), nil
 }
 
 // get sends GET path with key as the bearer token (none when empty). The

@@ -1,4 +1,4 @@
-package fakeprovider_test
+package modeltest_test
 
 import (
 	"encoding/json"
@@ -7,13 +7,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phongnd2802/trelis/internal/fakeprovider"
+	"github.com/phongnd2802/trelis/internal/models/modeltest"
 )
 
 func TestChatCompletionsReturnsScriptedToolCalls(t *testing.T) {
-	p := fakeprovider.New(t)
-	p.Reply(fakeprovider.LastRole("tool"), fakeprovider.Text("It is sunny."))
-	p.Reply(fakeprovider.HasTool("weather"), fakeprovider.Call("weather", `{"city":"Hanoi"}`))
+	p := modeltest.NewFakeProvider(t)
+	p.Reply(modeltest.LastRole("tool"), modeltest.Text("It is sunny."))
+	p.Reply(modeltest.HasTool("weather"), modeltest.Call("weather", `{"city":"Hanoi"}`))
 
 	body := chatBody("Weather in Hanoi?")
 	body["tools"] = []map[string]any{{"type": "function", "function": map[string]any{"name": "weather", "parameters": map[string]any{"type": "object"}}}}
@@ -41,8 +41,8 @@ func TestChatCompletionsReturnsScriptedToolCalls(t *testing.T) {
 }
 
 func TestChatCompletionsReadsContentParts(t *testing.T) {
-	p := fakeprovider.New(t)
-	p.Reply(fakeprovider.LastContains("second part"), fakeprovider.Text("ok"))
+	p := modeltest.NewFakeProvider(t)
+	p.Reply(modeltest.LastContains("second part"), modeltest.Text("ok"))
 	body := map[string]any{"model": "m", "messages": []map[string]any{{
 		"role":    "user",
 		"content": []map[string]any{{"type": "text", "text": "first part"}, {"type": "text", "text": "second part"}},
@@ -68,11 +68,11 @@ func events(t *testing.T, raw []byte) []string {
 }
 
 func TestChatCompletionsStreamsTextToolCallsAndUsage(t *testing.T) {
-	p := fakeprovider.New(t)
-	p.Reply(fakeprovider.Any(), fakeprovider.Reply{
+	p := modeltest.NewFakeProvider(t)
+	p.Reply(modeltest.Any(), modeltest.Reply{
 		Text:      "Let me check the weather for you.",
-		ToolCalls: []fakeprovider.ToolCall{{ID: "call_w", Name: "weather", Arguments: `{"city": "Hanoi", "unit": "C"}`}},
-		Usage:     fakeprovider.Usage{Input: 12, Output: 7},
+		ToolCalls: []modeltest.ToolCall{{ID: "call_w", Name: "weather", Arguments: `{"city": "Hanoi", "unit": "C"}`}},
+		Usage:     modeltest.Usage{Input: 12, Output: 7},
 	})
 	body := chatBody("Weather in Hanoi?")
 	body["stream"] = true
@@ -159,8 +159,8 @@ func (r *recorder) Errorf(format string, args ...any) {
 
 func TestAnUnscriptedGenerationRequestFailsTheTest(t *testing.T) {
 	rec := &recorder{TB: t}
-	p := fakeprovider.New(rec)
-	p.Reply(fakeprovider.LastContains("France"), fakeprovider.Text("Paris."))
+	p := modeltest.NewFakeProvider(rec)
+	p.Reply(modeltest.LastContains("France"), modeltest.Text("Paris."))
 
 	status, raw := post(t, p, "/chat/completions", chatBody("Capital of Spain?"))
 	if status != http.StatusInternalServerError {

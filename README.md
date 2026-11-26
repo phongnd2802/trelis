@@ -25,7 +25,8 @@ The integration tests in [internal/integration](internal/integration) build
 Trelis, start Postgres (ParadeDB) and Neo4j with
 [testcontainers](https://golang.testcontainers.org/), and drive each Trelis
 process only through its HTTP API. Models are never called: every test gets
-a fake OpenAI-compatible provider ([internal/fakeprovider](internal/fakeprovider))
+a fake OpenAI-compatible provider (`modeltest.FakeProvider` in
+[internal/models/modeltest](internal/models/modeltest))
 that serves Chat Completions, Responses, embeddings and rerank and answers
 from what the test scripted. The first run pulls the container images, so it
 takes a few minutes; later runs take about half a minute.

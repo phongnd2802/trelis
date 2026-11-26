@@ -1,4 +1,4 @@
-package fakeprovider_test
+package modeltest_test
 
 import (
 	"math"
@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/phongnd2802/trelis/internal/fakeprovider"
+	"github.com/phongnd2802/trelis/internal/models/modeltest"
 )
 
 type embeddingList struct {
@@ -24,7 +24,7 @@ type embeddingList struct {
 	} `json:"usage"`
 }
 
-func embed(t *testing.T, p *fakeprovider.Provider, body map[string]any) embeddingList {
+func embed(t *testing.T, p *modeltest.FakeProvider, body map[string]any) embeddingList {
 	t.Helper()
 	status, raw := post(t, p, "/embeddings", body)
 	if status != http.StatusOK {
@@ -34,13 +34,13 @@ func embed(t *testing.T, p *fakeprovider.Provider, body map[string]any) embeddin
 }
 
 func TestEmbeddingsAreDeterministicUnitVectorsPerInput(t *testing.T) {
-	p := fakeprovider.New(t)
+	p := modeltest.NewFakeProvider(t)
 	got := embed(t, p, map[string]any{"model": "emb", "input": []string{"Luật Đất đai", "Nghị định 43", "Luật Đất đai"}})
 	if got.Object != "list" || got.Model != "emb" || len(got.Data) != 3 {
 		t.Fatalf("response = %+v", got)
 	}
 	for i, d := range got.Data {
-		if d.Object != "embedding" || d.Index != i || len(d.Embedding) != fakeprovider.DefaultEmbeddingDims {
+		if d.Object != "embedding" || d.Index != i || len(d.Embedding) != modeltest.DefaultEmbeddingDims {
 			t.Errorf("data[%d] = %+v", i, d)
 		}
 		var norm float64
@@ -62,14 +62,14 @@ func TestEmbeddingsAreDeterministicUnitVectorsPerInput(t *testing.T) {
 	}
 
 	// A second provider gives the same vector for the same text.
-	single := embed(t, fakeprovider.New(t), map[string]any{"model": "emb", "input": "Luật Đất đai"})
+	single := embed(t, modeltest.NewFakeProvider(t), map[string]any{"model": "emb", "input": "Luật Đất đai"})
 	if !slices.Equal(single.Data[0].Embedding, got.Data[0].Embedding) {
 		t.Error("vectors differ across providers")
 	}
 }
 
 func TestEmbeddingDimsComeFromTheRequestOrTheProvider(t *testing.T) {
-	p := fakeprovider.New(t)
+	p := modeltest.NewFakeProvider(t)
 	if got := embed(t, p, map[string]any{"model": "emb", "input": "x", "dimensions": 3}); len(got.Data[0].Embedding) != 3 {
 		t.Errorf("with dimensions=3: len = %d", len(got.Data[0].Embedding))
 	}
@@ -80,7 +80,7 @@ func TestEmbeddingDimsComeFromTheRequestOrTheProvider(t *testing.T) {
 }
 
 func TestEmbeddingsCanBeBase64(t *testing.T) {
-	p := fakeprovider.New(t)
+	p := modeltest.NewFakeProvider(t)
 	p.EmbedAs("x", []float32{1, -0.5})
 	_, raw := post(t, p, "/embeddings", map[string]any{"model": "emb", "input": "x", "encoding_format": "base64"})
 	got := decode[struct {
@@ -95,7 +95,7 @@ func TestEmbeddingsCanBeBase64(t *testing.T) {
 }
 
 func TestEmbedAsPinsAVector(t *testing.T) {
-	p := fakeprovider.New(t)
+	p := modeltest.NewFakeProvider(t)
 	p.EmbedAs("tax", []float32{1, 0, 0})
 	got := embed(t, p, map[string]any{"model": "emb", "input": "tax"})
 	if !slices.Equal(got.Data[0].Embedding, []float64{1, 0, 0}) {
@@ -118,7 +118,7 @@ type rerankResponse struct {
 }
 
 func TestRerankScoresByWordOverlapBestFirst(t *testing.T) {
-	p := fakeprovider.New(t)
+	p := modeltest.NewFakeProvider(t)
 	status, raw := post(t, p, "/rerank", map[string]any{
 		"model": "rr",
 		"query": "land use tax",
@@ -152,7 +152,7 @@ func TestRerankScoresByWordOverlapBestFirst(t *testing.T) {
 }
 
 func TestRerankHonoursTopNAndPinnedScores(t *testing.T) {
-	p := fakeprovider.New(t)
+	p := modeltest.NewFakeProvider(t)
 	p.ScoreAs("tax", "weather report", 0.9)
 	_, raw := post(t, p, "/rerank", map[string]any{
 		"model": "rr", "query": "tax", "documents": []string{"tax law", "weather report", "other"}, "top_n": 2,
@@ -167,9 +167,9 @@ func TestRerankHonoursTopNAndPinnedScores(t *testing.T) {
 }
 
 func TestFailNextQueuesErrorsBeforeAnswering(t *testing.T) {
-	p := fakeprovider.New(t)
-	p.FailNext(fakeprovider.Embeddings, http.StatusTooManyRequests, 2)
-	p.FailNext(fakeprovider.Embeddings, http.StatusBadGateway, 1)
+	p := modeltest.NewFakeProvider(t)
+	p.FailNext(modeltest.Embeddings, http.StatusTooManyRequests, 2)
+	p.FailNext(modeltest.Embeddings, http.StatusBadGateway, 1)
 
 	body := map[string]any{"model": "emb", "input": "x"}
 	var statuses []int
@@ -183,13 +183,13 @@ func TestFailNextQueuesErrorsBeforeAnswering(t *testing.T) {
 	if want := []int{429, 429, 502, 200}; !slices.Equal(statuses, want) {
 		t.Errorf("statuses = %v, want %v", statuses, want)
 	}
-	if n := len(p.Requests(fakeprovider.Embeddings)); n != 4 {
+	if n := len(p.Requests(modeltest.Embeddings)); n != 4 {
 		t.Errorf("recorded %d embeddings requests, want 4", n)
 	}
-	if n := len(p.Requests(fakeprovider.Rerank)); n != 0 {
+	if n := len(p.Requests(modeltest.Rerank)); n != 0 {
 		t.Errorf("recorded %d rerank requests, want 0", n)
 	}
-	if got := p.Requests(fakeprovider.Embeddings)[0].Header.Get("Authorization"); got != "Bearer sk-test" {
+	if got := p.Requests(modeltest.Embeddings)[0].Header.Get("Authorization"); got != "Bearer sk-test" {
 		t.Errorf("recorded Authorization = %q", got)
 	}
 }

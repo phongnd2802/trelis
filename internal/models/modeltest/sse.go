@@ -1,4 +1,4 @@
-package fakeprovider
+package modeltest
 
 import (
 	"encoding/json"

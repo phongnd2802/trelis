@@ -1,4 +1,4 @@
-package fakeprovider
+package modeltest
 
 import (
 	"cmp"
@@ -15,9 +15,9 @@ import (
 
 // SetEmbeddingDims sets the length of the vectors [Embeddings] returns for
 // requests that do not ask for `dimensions` themselves.
-func (p *Provider) SetEmbeddingDims(n int) {
+func (p *FakeProvider) SetEmbeddingDims(n int) {
 	if n < 1 {
-		p.t.Fatalf("fakeprovider: SetEmbeddingDims(%d), want at least 1", n)
+		p.t.Fatalf("modeltest: SetEmbeddingDims(%d), want at least 1", n)
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -27,14 +27,14 @@ func (p *Provider) SetEmbeddingDims(n int) {
 // EmbedAs pins the vector [Embeddings] returns for text, so a test can
 // place texts near or far from each other. Other texts keep their hashed
 // vectors.
-func (p *Provider) EmbedAs(text string, vec []float32) {
+func (p *FakeProvider) EmbedAs(text string, vec []float32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.vectors[text] = slices.Clone(vec)
 }
 
 // ScoreAs pins the relevance [Rerank] gives document for query.
-func (p *Provider) ScoreAs(query, document string, score float64) {
+func (p *FakeProvider) ScoreAs(query, document string, score float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.scores[[2]string{query, document}] = score
@@ -71,9 +71,11 @@ func (t *texts) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// embeddings answers POST /v1/embeddings, as float arrays or, for
-// encoding_format base64, as little-endian float32 bytes.
-func (p *Provider) embeddings(_ http.ResponseWriter, body []byte) (int, any) {
+// embeddings answers POST /v1/embeddings in the shape of
+// https://platform.openai.com/docs/api-reference/embeddings/object, as
+// float arrays or, for encoding_format base64, as little-endian float32
+// bytes.
+func (p *FakeProvider) embeddings(_ http.ResponseWriter, body []byte) (int, any) {
 	var req struct {
 		Model          string `json:"model"`
 		Input          texts  `json:"input"`
@@ -144,8 +146,9 @@ func hashVector(text string, dims int) []float32 {
 	return vec
 }
 
-// rerank answers POST /v1/rerank in the Jina/Cohere v1 shape.
-func (p *Provider) rerank(_ http.ResponseWriter, body []byte) (int, any) {
+// rerank answers POST /v1/rerank in the Jina/Cohere v1 shape
+// (https://jina.ai/reranker/, https://docs.cohere.com/v1/reference/rerank).
+func (p *FakeProvider) rerank(_ http.ResponseWriter, body []byte) (int, any) {
 	var req struct {
 		Model           string `json:"model"`
 		Query           string `json:"query"`

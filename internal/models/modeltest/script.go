@@ -1,4 +1,4 @@
-package fakeprovider
+package modeltest
 
 import (
 	"fmt"
@@ -127,7 +127,7 @@ func Call(name, arguments string) Reply {
 
 // resolve fills in defaults for one answer to prompt: tool call ids and
 // token counts.
-func (p *Provider) resolve(prompt Prompt, r Reply) Reply {
+func (p *FakeProvider) resolve(prompt Prompt, r Reply) Reply {
 	calls := make([]ToolCall, len(r.ToolCalls))
 	for i, c := range r.ToolCalls {
 		if c.ID == "" {

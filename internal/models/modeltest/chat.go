@@ -1,4 +1,4 @@
-package fakeprovider
+package modeltest
 
 import (
 	"encoding/json"
@@ -142,8 +142,10 @@ func (r Reply) finishReason() *string {
 	return &reason
 }
 
-// chatCompletions answers POST /v1/chat/completions.
-func (p *Provider) chatCompletions(w http.ResponseWriter, body []byte) (int, any) {
+// chatCompletions answers POST /v1/chat/completions in the shape of
+// https://platform.openai.com/docs/api-reference/chat/object (and, streamed,
+// .../chat/streaming).
+func (p *FakeProvider) chatCompletions(w http.ResponseWriter, body []byte) (int, any) {
 	var req chatRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		return badRequest(err)
@@ -177,7 +179,7 @@ func (p *Provider) chatCompletions(w http.ResponseWriter, body []byte) (int, any
 // streamChat writes reply as chat.completion.chunk events: the role, the
 // text a few words at a time, each tool call's name then its arguments in
 // pieces, the finish reason, and usage when the request asked for it.
-func (p *Provider) streamChat(w http.ResponseWriter, req chatRequest, id string, reply Reply) {
+func (p *FakeProvider) streamChat(w http.ResponseWriter, req chatRequest, id string, reply Reply) {
 	s := newSSE(w)
 	chunk := func(c chatChoice) chatCompletion {
 		return chatCompletion{ID: id, Object: "chat.completion.chunk", Created: created, Model: req.Model, Choices: []chatChoice{c}}
@@ -208,11 +210,11 @@ func (p *Provider) streamChat(w http.ResponseWriter, req chatRequest, id string,
 
 // badRequest answers a body the provider cannot read.
 func badRequest(err error) (int, any) {
-	return http.StatusBadRequest, newError("fakeprovider: "+err.Error(), "invalid_request_error")
+	return http.StatusBadRequest, newError("modeltest: "+err.Error(), "invalid_request_error")
 }
 
 // unscripted answers a request no rule matched; the test has already been
 // failed by generate.
 func unscripted(prompt Prompt) (int, any) {
-	return http.StatusInternalServerError, newError("fakeprovider: no Reply rule matches this request:\n"+prompt.String(), "unscripted")
+	return http.StatusInternalServerError, newError("modeltest: unexpected extra call: the script is used up and no Reply rule matches this request:\n"+prompt.String(), "unscripted")
 }
