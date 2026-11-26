@@ -39,9 +39,12 @@ type Document struct {
 	FileSize int64 `json:"file_size"`
 	// File hash of the Document: hex SHA-256 of its content
 	FileHash string `json:"file_hash"`
-	// FilePath is where file storage keeps it (provider:// path). Not shown
-	// to clients: they never address storage directly.
-	FilePath string `json:"-"`
+	// UploadID names the upload the current Source File came from; each
+	// upload writes under its own key prefix (ADR-0006).
+	UploadID uuid.UUID `json:"-"`
+	// ObjectKey is the Source File's key in object storage. Not shown to
+	// clients: they read it through GET /documents/{id}/file, never the bucket.
+	ObjectKey string `json:"-"`
 	// Parse status of the Document
 	ParseStatus string `json:"parse_status"`
 	// Creation time of the Document

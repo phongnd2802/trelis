@@ -28,10 +28,18 @@ temporal:
   namespace: default
 
 storage:
-  # Uploaded files, relative to the working directory (compose mounts a
-  # volume at /data/files and sets TRELIS_STORAGE_LOCAL_DIR).
-  local_dir: data/files
   max_file_size_mb: 50
+  # Source Files live in one S3-compatible bucket (ADR-0006): silo from
+  # compose.dev.yaml here; AWS S3, R2, Ceph or Garage in production (leave
+  # endpoint empty for AWS). In production set create_bucket: false and the
+  # secret through TRELIS_STORAGE_S3_SECRET_ACCESS_KEY.
+  s3:
+    endpoint: http://localhost:9000
+    region: us-east-1
+    bucket: trelis
+    access_key_id: trelis
+    secret_access_key: trelis-dev-secret
+    create_bucket: true
 
 # Model roles. Each role points at its own OpenAI-compatible provider
 # (base_url, model, api_key); a role left empty is unconfigured. Keep keys

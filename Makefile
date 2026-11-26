@@ -14,7 +14,7 @@ help:
 	@echo "  dev          go run ./cmd/server with anydoc linked (ARGS=... passes flags)"
 	@echo "  test         unit tests that need no archive"
 	@echo "  test-linked  full tests against the linked anydoc archive"
-	@echo "  test-integration  HTTP API tests against Postgres and Neo4j in testcontainers (needs Docker)"
+	@echo "  test-integration  HTTP API tests against Postgres, Neo4j and silo (S3) in testcontainers (needs Docker)"
 	@echo "  vet          go vet both build variants (vet-lite / vet-linked for one)"
 	@echo "  lint         golangci-lint incl. gofmt, no archive (lint-linked: -tags anydoc)"
 	@echo "  dev-up       start only the dependencies (compose.dev.yaml) for \`make dev\`, and wait"

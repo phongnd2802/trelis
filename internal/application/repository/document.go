@@ -52,14 +52,15 @@ func (r *documentRepository) CreateDocument(ctx context.Context, doc *types.Docu
 	q := sqlc.New(tx)
 
 	row, err := q.CreateDocument(ctx, sqlc.CreateDocumentParams{
-		ID:       doc.ID,
-		OwnerID:  doc.OwnerID,
-		Title:    doc.Title,
-		FileName: doc.FileName,
-		FileType: doc.FileType,
-		FileSize: doc.FileSize,
-		FileHash: doc.FileHash,
-		FilePath: doc.FilePath,
+		ID:        doc.ID,
+		OwnerID:   doc.OwnerID,
+		Title:     doc.Title,
+		FileName:  doc.FileName,
+		FileType:  doc.FileType,
+		FileSize:  doc.FileSize,
+		FileHash:  doc.FileHash,
+		UploadID:  doc.UploadID,
+		ObjectKey: doc.ObjectKey,
 	})
 	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == uniqueViolation {
 		return ErrDuplicateDocument
@@ -186,7 +187,8 @@ func fromRow(r sqlc.Document) *types.Document {
 		FileType:    r.FileType,
 		FileSize:    r.FileSize,
 		FileHash:    r.FileHash,
-		FilePath:    r.FilePath,
+		UploadID:    r.UploadID,
+		ObjectKey:   r.ObjectKey,
 		ParseStatus: r.ParseStatus,
 		CreatedAt:   r.CreatedAt,
 		UpdatedAt:   r.UpdatedAt,

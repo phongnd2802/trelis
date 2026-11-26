@@ -19,17 +19,19 @@ type ApiKey struct {
 }
 
 type Document struct {
-	ID          uuid.UUID
-	OwnerID     uuid.UUID
-	Title       string
-	FileName    string
-	FileType    string
-	FileSize    int64
-	FileHash    string
-	FilePath    string
+	ID       uuid.UUID
+	OwnerID  uuid.UUID
+	Title    string
+	FileName string
+	FileType string
+	FileSize int64
+	FileHash string
+	// Key of the Source File in the bucket: documents/{id}/{upload_id}/source
+	ObjectKey   string
 	ParseStatus string
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+	UploadID    uuid.UUID
 }
 
 type DocumentGroup struct {

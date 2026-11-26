@@ -1,6 +1,6 @@
 -- name: CreateDocument :one
-INSERT INTO documents (id, owner_id, title, file_name, file_type, file_size, file_hash, file_path)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+INSERT INTO documents (id, owner_id, title, file_name, file_type, file_size, file_hash, upload_id, object_key)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 RETURNING *;
 
 -- name: GetDocumentByOwnerAndHash :one

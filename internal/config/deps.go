@@ -1,9 +1,12 @@
 package config
 
 import (
+	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"strconv"
+	"strings"
 )
 
 // Postgres is the Trelis database. Temporal keeps its own databases on the
@@ -60,13 +63,53 @@ func (t Temporal) HostPort() string {
 	return net.JoinHostPort(t.Host, strconv.Itoa(t.Port))
 }
 
-// Storage is where uploaded files are kept (the local FileService) and how
-// large one may be. Omnisc reads the same two settings from
-// LOCAL_STORAGE_BASE_DIR and MAX_FILE_SIZE_MB.
+// Storage is the object store Source Files are kept in (ADR-0006) and how
+// large one may be. Omnisc reads the size limit from MAX_FILE_SIZE_MB.
 type Storage struct {
-	// LocalDir is created at start if missing.
-	LocalDir      string `mapstructure:"local_dir"`
-	MaxFileSizeMB int64  `mapstructure:"max_file_size_mb"`
+	MaxFileSizeMB int64 `mapstructure:"max_file_size_mb"`
+	S3            S3    `mapstructure:"s3"`
+}
+
+// S3 configures the S3-compatible bucket (silo, a MinIO fork, in
+// development and CI; AWS S3, R2, Ceph or Garage in production).
+type S3 struct {
+	// Endpoint is the server's base URL, e.g. http://localhost:9000; empty
+	// means AWS S3 in Region.
+	Endpoint string `mapstructure:"endpoint"`
+	Region   string `mapstructure:"region"`
+	Bucket   string `mapstructure:"bucket"`
+	// AccessKeyID and SecretAccessKey go together; both empty uses the AWS
+	// default credential chain. Set the secret through
+	// TRELIS_STORAGE_S3_SECRET_ACCESS_KEY.
+	AccessKeyID     string `mapstructure:"access_key_id"`
+	SecretAccessKey string `mapstructure:"secret_access_key"`
+	// ForcePathStyle addresses buckets as {endpoint}/{bucket} even on AWS;
+	// every other endpoint is always addressed path-style.
+	ForcePathStyle bool `mapstructure:"force_path_style"`
+	// CreateBucket creates the bucket on start when it is missing; the
+	// development config turns it on. Off (the default), a missing bucket
+	// fails /readyz.
+	CreateBucket bool `mapstructure:"create_bucket"`
+}
+
+func (s S3) validate() []error {
+	var errs []error
+	if strings.TrimSpace(s.Bucket) == "" {
+		errs = append(errs, errors.New("storage.s3.bucket is required"))
+	}
+	if strings.TrimSpace(s.Region) == "" {
+		errs = append(errs, errors.New("storage.s3.region is required"))
+	}
+	if s.Endpoint != "" {
+		u, err := url.Parse(s.Endpoint)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			errs = append(errs, fmt.Errorf("storage.s3.endpoint must be an http(s) URL, got %q", s.Endpoint))
+		}
+	}
+	if (s.AccessKeyID == "") != (s.SecretAccessKey == "") {
+		errs = append(errs, errors.New("storage.s3.access_key_id and storage.s3.secret_access_key must be set together"))
+	}
+	return errs
 }
 
 // MaxFileSize is the upload limit in bytes.

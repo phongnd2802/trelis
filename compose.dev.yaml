@@ -7,6 +7,7 @@
 #   neo4j        http://localhost:7474   (bolt on 7687)
 #   postgres     localhost:5432          (databases: trelis, temporal, temporal_visibility)
 #   temporal     localhost:7233
+#   silo         http://localhost:9000   (S3 API; console http://localhost:9001)
 #
 # Integration tests that need Postgres are skipped unless you export
 #   TRELIS_TEST_POSTGRES_DSN=postgres://trelis:trelis@localhost:5432/trelis?sslmode=disable
@@ -113,6 +114,24 @@ services:
           || temporal operator namespace create -n default --retention 72h
     restart: "no"
 
+  # S3-compatible object storage for Source Files (ADR-0006). silo is a
+  # MinIO fork, so it keeps MinIO's MINIO_* env and /minio/health routes.
+  # Trelis creates its bucket on start (storage.s3.create_bucket).
+  silo:
+    image: docker.io/pgsty/silo:RELEASE.2026-11-12T00-00-00Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-trelis}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-trelis-dev-secret}
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
+    volumes: [s3data:/data]
+    healthcheck:
+      # Write quorum, so the bucket can be created once this passes.
+      test: ["CMD", "silo", "healthcheck", "cluster"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
   temporal-ui:
     image: temporalio/ui:2.58.1
     # Waiting on the namespace job (not just the server) means the UI opens
@@ -127,3 +146,4 @@ services:
 volumes:
   pgdata:
   neo4jdata:
+  s3data:

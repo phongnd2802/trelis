@@ -7,10 +7,12 @@
 // (run `server admin` for the list); they migrate Postgres and exit without
 // serving. Every HTTP route except /healthz and /readyz needs an API key.
 //
-// On start it applies pending Postgres migrations, creates storage.local_dir
-// for uploaded files, then serves. GET /readyz probes Postgres, file
-// storage, Neo4j and Temporal; Neo4j and Temporal are connected
-// lazily, so the service starts even while they are still coming up.
+// On start it applies pending Postgres migrations, then serves. When
+// storage.s3.create_bucket is set it creates the bucket Source Files go to,
+// retrying in the background while object storage is unreachable.
+// GET /readyz probes Postgres, object storage, Neo4j and Temporal; the last
+// three are reached lazily, so the service starts even while they are still
+// coming up.
 // SIGINT or SIGTERM stops accepting connections and drains in-flight
 // requests for up to server.shutdown_timeout before exiting.
 package main
@@ -39,6 +41,38 @@ import (
 	"github.com/phongnd2802/trelis/internal/handler"
 	"github.com/phongnd2802/trelis/internal/router"
 )
+
+// bucketRetry is how long ensureBucket waits between attempts.
+const bucketRetry = 2 * time.Second
+
+// ensureBucket creates the bucket if it is missing. The first attempt runs
+// before serving, so a reachable store has its bucket before any upload;
+// if it fails, Trelis serves anyway (storage shows down in /readyz, as a
+// Neo4j or Temporal still coming up does) and keeps trying until ctx ends.
+func ensureBucket(ctx context.Context, files *file.S3FileService) {
+	err := files.EnsureBucket(ctx)
+	if err == nil {
+		return
+	}
+	slog.Warn("storage: bucket not ready, retrying in the background", "err", err)
+	go func() {
+		t := time.NewTicker(bucketRetry)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			if err := files.EnsureBucket(ctx); err != nil {
+				slog.Debug("storage: bucket still not ready", "err", err)
+				continue
+			}
+			slog.Info("storage: bucket ready")
+			return
+		}
+	}()
+}
 
 // readyTimeout bounds each dependency probe behind /readyz.
 const readyTimeout = 2 * time.Second
@@ -100,10 +134,21 @@ func run(configPath string, args []string) error {
 	}
 	defer temporal.Close()
 
-	if err := os.MkdirAll(cfg.Storage.LocalDir, 0o755); err != nil {
+	s3 := cfg.Storage.S3
+	files, err := file.NewS3FileService(file.S3Options{
+		Endpoint:        s3.Endpoint,
+		Region:          s3.Region,
+		Bucket:          s3.Bucket,
+		AccessKeyID:     s3.AccessKeyID,
+		SecretAccessKey: s3.SecretAccessKey,
+		ForcePathStyle:  s3.ForcePathStyle,
+	})
+	if err != nil {
 		return fmt.Errorf("storage: %w", err)
 	}
-	files := file.NewLocalFileService(cfg.Storage.LocalDir)
+	if s3.CreateBucket {
+		ensureBucket(ctx, files)
+	}
 	docs := handler.NewDocumentHandler(
 		service.NewDocumentService(repository.NewDocumentRepository(pool), files),
 		cfg.Storage.MaxFileSize(),

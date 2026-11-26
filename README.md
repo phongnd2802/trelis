@@ -22,9 +22,11 @@ make test-integration  # the HTTP API end to end; needs Docker
 ```
 
 The integration tests in [internal/integration](internal/integration) build
-Trelis, start Postgres (ParadeDB) and Neo4j with
-[testcontainers](https://golang.testcontainers.org/), and drive each Trelis
-process only through its HTTP API. Models are never called: every test gets
+Trelis, start Postgres (ParadeDB), Neo4j and
+[silo](https://github.com/pgsty/silo) (S3-compatible object storage, a MinIO
+fork) with [testcontainers](https://golang.testcontainers.org/), and drive
+each Trelis process only through its HTTP API. Each test gets its own
+database and bucket. Models are never called: every test gets
 a fake OpenAI-compatible provider (`modeltest.FakeProvider` in
 [internal/models/modeltest](internal/models/modeltest))
 that serves Chat Completions, Responses, embeddings and rerank and answers
