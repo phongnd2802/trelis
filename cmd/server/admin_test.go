@@ -153,3 +153,28 @@ func TestAdminRevokeRejectsBadIDs(t *testing.T) {
 		t.Errorf("unknown ID: err = %v, want ErrAPIKeyNotFound", err)
 	}
 }
+
+func TestAdminErrorsKeepTheirWording(t *testing.T) {
+	s := newServices(t)
+	for _, args := range [][]string{{"principal", "create", "alice"}, {"group", "create", "tax"}} {
+		if _, err := runAdmin(t, s, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"principal", "create", "alice"}, `auth: already exists: principal "alice"`},
+		{[]string{"group", "create", "tax"}, `auth: already exists: group "tax"`},
+		{[]string{"group", "add-member", "nope", "alice"}, `auth: not found: group "nope"`},
+		{[]string{"group", "add-member", "tax", "ghost"}, `auth: not found: principal "ghost"`},
+		{[]string{"key", "create", "ghost"}, `auth: not found: principal "ghost"`},
+		{[]string{"key", "list", "ghost"}, `auth: not found: principal "ghost"`},
+		{[]string{"key", "revoke", "0190d2a8-0000-7000-8000-000000000001"}, "auth: not found: key 0190d2a8-0000-7000-8000-000000000001"},
+	} {
+		if _, err := runAdmin(t, s, tc.args...); err == nil || err.Error() != tc.want {
+			t.Errorf("admin %v: err = %v, want %q", tc.args, err, tc.want)
+		}
+	}
+}

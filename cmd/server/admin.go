@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/phongnd2802/trelis/internal/application/repository"
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
 
@@ -30,6 +31,52 @@ var errUsage = errors.New(adminUsage)
 
 // admin runs one operator command through s and writes its result to out.
 func admin(ctx context.Context, s interfaces.PrincipalService, args []string, out io.Writer) error {
+	return operatorErr(runCommand(ctx, s, args, out), args)
+}
+
+// operatorError is a domain error worded as operators have always seen it,
+// e.g. `auth: not found: principal "ghost"`, still matching the
+// repository's sentinel with errors.Is.
+type operatorError struct {
+	msg string
+	err error
+}
+
+func (e *operatorError) Error() string { return e.msg }
+func (e *operatorError) Unwrap() error { return e.err }
+
+// operatorErr rewords the repository's not-found and already-exists errors
+// for the names on the command line; other errors pass through.
+func operatorErr(err error, args []string) error {
+	if err == nil || len(args) < 3 {
+		return err
+	}
+	name := args[2]
+	if args[0] == "group" && args[1] == "add-member" && errors.Is(err, repository.ErrPrincipalNotFound) && len(args) > 3 {
+		name = args[3]
+	}
+	for _, m := range []struct {
+		sentinel   error
+		what, kind string
+	}{
+		{repository.ErrPrincipalNotFound, "not found", "principal"},
+		{repository.ErrGroupNotFound, "not found", "group"},
+		{repository.ErrAPIKeyNotFound, "not found", "key"},
+		{repository.ErrPrincipalExists, "already exists", "principal"},
+		{repository.ErrGroupExists, "already exists", "group"},
+	} {
+		if !errors.Is(err, m.sentinel) {
+			continue
+		}
+		if m.kind == "key" {
+			return &operatorError{fmt.Sprintf("auth: %s: key %s", m.what, name), err}
+		}
+		return &operatorError{fmt.Sprintf("auth: %s: %s %q", m.what, m.kind, name), err}
+	}
+	return err
+}
+
+func runCommand(ctx context.Context, s interfaces.PrincipalService, args []string, out io.Writer) error {
 	cmd, rest := "", args
 	if len(args) >= 2 {
 		cmd, rest = args[0]+" "+args[1], args[2:]

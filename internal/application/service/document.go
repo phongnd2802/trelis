@@ -38,16 +38,6 @@ func NewDocumentService(store db.Store, repo interfaces.DocumentRepository,
 	return &documentService{store: store, repo: repo, principals: principals, fileSvc: fileSvc}
 }
 
-// caller is the Principal a request was authenticated as. Every route behind
-// the router's authenticate middleware has one.
-func caller(ctx context.Context) (types.Principal, error) {
-	p, ok := types.PrincipalFromContext(ctx)
-	if !ok {
-		return types.Principal{}, errors.New("no authenticated principal in context")
-	}
-	return p, nil
-}
-
 // CreateDocumentFromFile creates a pending Document from an uploaded file.
 // The order follows Omnisc's CreateKnowledgeFromFile: check the type, hash
 // for deduplication, validate the name, save the file, then the record,
