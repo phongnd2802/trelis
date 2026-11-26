@@ -2,48 +2,60 @@ package chunker
 
 import (
 	"fmt"
-	"strings"
+	"unicode/utf8"
 )
 
-// Validator decides whether a tier's Chunks are good enough to keep. A
-// non-nil error rejects them, and the Chunker falls through to the next
-// tier. The error says why, for Result.Rejected.
-type Validator func(in Input, chunks []Chunk, size Sizer) error
+// tinyChunkRunes is the size under which a Chunk, other than the last,
+// counts as tiny.
+const tinyChunkRunes = 50
 
-// Validate is the default Validator. It rejects Chunks that
+// ValidationResult is ValidateChunks' verdict on one tier's output.
+type ValidationResult struct {
+	OK     bool
+	Reason string
+}
+
+// ValidateChunks decides whether a tier's Chunks for text are usable or the
+// chain should fall through to the next tier. It is deliberately lenient
+// about size, rejecting only output that is plainly broken:
 //
-//   - are empty, or whose Content is not text[Start:End];
-//   - are out of order or overlap;
-//   - leave out anything but whitespace;
-//   - start or end inside a protected span;
-//   - are over the size cap, unless the Chunk is one protected span that
-//     is over the cap on its own.
-func Validate(in Input, chunks []Chunk, size Sizer) error {
+//   - no Chunks;
+//   - a Chunk whose Content is not the source at its offsets, or that
+//     starts or ends inside a protected span;
+//   - one Chunk for text over twice chunkSize (the tier did not split);
+//   - more than a quarter of the Chunks (and more than two) tiny, the last
+//     one aside (the tier fragmented the text);
+//   - no Chunk reaching a quarter of chunkSize, for text over chunkSize;
+//   - a Chunk over twice chunkSize (the tier ignored its budget).
+func ValidateChunks(text string, chunks []Chunk, chunkSize int) ValidationResult {
 	if len(chunks) == 0 {
-		return fmt.Errorf("no chunks")
+		return ValidationResult{Reason: "no chunks produced"}
 	}
-	protected := spans(in.Protected)
-	prev := 0
-	for i, ch := range chunks {
-		if ch.Start < prev || ch.End > len(in.Text) || ch.Start >= ch.End {
-			return fmt.Errorf("chunk %d: offsets [%d,%d) are empty, out of order or out of range", i, ch.Start, ch.End)
+	runes := []rune(text)
+	protected := toRuneSpans(text, protectedSpans(text))
+	longest, tiny := 0, 0
+	for i, c := range chunks {
+		if c.Start < 0 || c.End > len(runes) || c.Start >= c.End || string(runes[c.Start:c.End]) != c.Content {
+			return ValidationResult{Reason: fmt.Sprintf("chunk %d is not the source text at [%d,%d)", i, c.Start, c.End)}
 		}
-		if in.Text[ch.Start:ch.End] != ch.Content {
-			return fmt.Errorf("chunk %d: Content is not the text at [%d,%d)", i, ch.Start, ch.End)
+		if insideSpan(protected, c.Start) || insideSpan(protected, c.End) {
+			return ValidationResult{Reason: fmt.Sprintf("chunk %d at [%d,%d) cuts a protected span", i, c.Start, c.End)}
 		}
-		if strings.TrimSpace(in.Text[prev:ch.Start]) != "" {
-			return fmt.Errorf("chunk %d: text before it at [%d,%d) is in no chunk", i, prev, ch.Start)
+		n := utf8.RuneCountInString(c.Content)
+		longest = max(longest, n)
+		if n < tinyChunkRunes && i < len(chunks)-1 {
+			tiny++
 		}
-		if protected.inside(ch.Start) || protected.inside(ch.End) {
-			return fmt.Errorf("chunk %d: [%d,%d) cuts a protected span", i, ch.Start, ch.End)
-		}
-		if !size.Fits(ch.Content) && !protected.only(in.Text, ch.Start, ch.End) {
-			return fmt.Errorf("chunk %d: %d tokens is over the cap of %d", i, size.Tokens(ch.Content), size.Limit())
-		}
-		prev = ch.End
 	}
-	if strings.TrimSpace(in.Text[prev:]) != "" {
-		return fmt.Errorf("text after the last chunk, from %d, is in no chunk", prev)
+	switch {
+	case len(chunks) == 1 && len(runes) > 2*chunkSize:
+		return ValidationResult{Reason: "single chunk for large document"}
+	case tiny > len(chunks)/4 && tiny > 2:
+		return ValidationResult{Reason: "too many tiny chunks"}
+	case longest < chunkSize/4 && len(runes) > chunkSize:
+		return ValidationResult{Reason: "all chunks far below target size"}
+	case longest > 2*chunkSize:
+		return ValidationResult{Reason: "chunk exceeds 2x target size"}
 	}
-	return nil
+	return ValidationResult{OK: true}
 }

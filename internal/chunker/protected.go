@@ -1,196 +1,234 @@
 package chunker
 
 import (
-	"sort"
+	"cmp"
+	"regexp"
+	"slices"
 	"strings"
 )
 
-// SpanKind names what a protected span holds.
-type SpanKind string
-
-const (
-	SpanTable SpanKind = "table"
-	SpanCode  SpanKind = "code"
-	SpanMath  SpanKind = "math"
-)
-
-// Span is a protected span: a byte range of the text that no Chunk
-// boundary may fall inside.
-type Span struct {
-	Kind  SpanKind
-	Start int
-	End   int
+// span is a half-open range of a text, in bytes unless a caller says runes.
+type span struct {
+	start, end int
 }
 
-// spans is the sorted, non-overlapping protected spans of one text.
-type spans []Span
+// linkOrImage matches a Markdown link or image on one line. The text and
+// destination are bounded and may not hold a line break (CommonMark
+// forbids one across a blank line), so a stray "[" left by OCR cannot pair
+// with a "](" paragraphs later and swallow everything in between.
+var linkOrImage = regexp.MustCompile(`!?\[[^\]\n]{0,200}\]\([^)\n]{1,500}\)`)
 
-// ProtectedSpans finds the tables, fenced code blocks and math blocks in
-// Markdown text, in order. A span runs over whole lines, less the
-// whitespace around it, the same as a Chunk. Anything inside a fenced code
-// block is code, even if it looks like a table or math. A fence or math
-// block that is never closed protects nothing, so one stray marker cannot
-// swallow the rest of a Document.
-func ProtectedSpans(text string) []Span {
-	lines := splitLines(text)
-	var out []Span
-	for i := 0; i < len(lines); {
-		if end, ok := matchFence(lines, i); ok {
-			out = appendSpan(out, text, SpanCode, lines[i].start, lines[end].end)
-			i = end + 1
-			continue
+// protectedSpans finds the parts of Markdown text no Chunk boundary may
+// fall inside, sorted and non-overlapping:
+//
+//   - fenced code blocks (``` or ~~~, closed by a fence of the same
+//     character at least as long), found first so nothing inside them
+//     counts as anything else;
+//   - tables: runs of lines that start and end with "|";
+//   - math: from "$$" to the next "$$";
+//   - inline code: a backtick run to the next run of the same length on
+//     the same line;
+//   - links and images.
+//
+// A fence, math block or inline code that is never closed protects
+// nothing, so one stray marker cannot swallow the rest of a Document.
+func protectedSpans(text string) []span {
+	fences := fencedCodeSpans(text)
+	var found []span
+	found = append(found, fences...)
+	from := 0
+	for _, f := range append(fences, span{len(text), len(text)}) {
+		found = append(found, spansOutsideCode(text, from, f.start)...)
+		from = f.end
+	}
+	// Earliest first; of two starting together, the longer wins.
+	slices.SortFunc(found, func(a, b span) int {
+		return cmp.Or(cmp.Compare(a.start, b.start), cmp.Compare(b.end, a.end))
+	})
+	out := found[:0]
+	end := 0
+	for _, s := range found {
+		if s.start >= end {
+			out = append(out, s)
+			end = s.end
 		}
-		if end, ok := matchMath(lines, i); ok {
-			out = appendSpan(out, text, SpanMath, lines[i].start, lines[end].end)
-			i = end + 1
-			continue
-		}
-		if end, ok := matchTable(lines, i); ok {
-			out = appendSpan(out, text, SpanTable, lines[i].start, lines[end].end)
-			i = end + 1
-			continue
-		}
-		i++
 	}
 	return out
 }
 
-// inside reports whether pos falls strictly inside a span, so that cutting
-// the text at pos would split it.
-func (ss spans) inside(pos int) bool {
-	i := sort.Search(len(ss), func(i int) bool { return ss[i].End > pos })
-	return i < len(ss) && ss[i].Start < pos
+// spansOutsideCode finds every protected span but fenced code in
+// text[from:to].
+func spansOutsideCode(text string, from, to int) []span {
+	var out []span
+	out = append(out, tableSpans(text, from, to)...)
+	out = append(out, mathSpans(text, from, to)...)
+	out = append(out, inlineCodeSpans(text, from, to)...)
+	for _, loc := range linkOrImage.FindAllStringIndex(text[from:to], -1) {
+		out = append(out, span{from + loc[0], from + loc[1]})
+	}
+	return out
 }
 
-// only reports whether [start,end) is, up to surrounding whitespace, a
-// single protected span.
-func (ss spans) only(text string, start, end int) bool {
-	start, end = trim(text, start, end)
-	i := sort.Search(len(ss), func(i int) bool { return ss[i].End > start })
-	return i < len(ss) && ss[i].Start == start && ss[i].End == end
-}
-
-func appendSpan(out []Span, text string, kind SpanKind, start, end int) []Span {
-	start, end = trim(text, start, end)
-	return append(out, Span{Kind: kind, Start: start, End: end})
-}
-
-type line struct {
-	start, end int // end excludes the line break
-	text       string
-}
-
-func splitLines(text string) []line {
-	var lines []line
-	for start := 0; start <= len(text); {
-		end := strings.IndexByte(text[start:], '\n')
+// lines calls fn with each line of text[from:to]: its start, and its end
+// before the line break.
+func lines(text string, from, to int, fn func(start, end int)) {
+	for start := from; start < to; {
+		end := strings.IndexByte(text[start:to], '\n')
 		if end < 0 {
-			lines = append(lines, line{start, len(text), text[start:]})
+			fn(start, to)
+			return
+		}
+		fn(start, start+end)
+		start += end + 1
+	}
+}
+
+// fencedCodeSpans finds fenced code blocks, from the opening fence to the
+// end of the closing one. Like CommonMark, a fence may be indented by up to
+// three spaces, and a backtick fence's info string may not hold a backtick
+// (such a line is inline code).
+func fencedCodeSpans(text string) []span {
+	var out []span
+	var open struct {
+		start  int
+		marker byte
+		length int
+	}
+	lines(text, 0, len(text), func(start, end int) {
+		line := strings.TrimSuffix(text[start:end], "\r")
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		if indent > 3 || indent == len(line) {
+			return
+		}
+		marker := line[indent]
+		if marker != '`' && marker != '~' {
+			return
+		}
+		run := len(line[indent:]) - len(strings.TrimLeft(line[indent:], string(marker)))
+		rest := line[indent+run:]
+		switch {
+		case run < 3:
+		case open.length == 0:
+			if marker == '`' && strings.Contains(rest, "`") {
+				return
+			}
+			open.start, open.marker, open.length = start+indent, marker, run
+		case marker == open.marker && run >= open.length && strings.TrimSpace(rest) == "":
+			out = append(out, span{open.start, start + indent + run})
+			open.length = 0
+		}
+	})
+	return out
+}
+
+// tableSpans finds runs of table rows in text[from:to]: lines that, without
+// surrounding whitespace, start and end with "|". A table is kept whole;
+// splitting a table too large for one Chunk at row boundaries, with its
+// header carried over, is a separate step (#30).
+func tableSpans(text string, from, to int) []span {
+	var out []span
+	open := false
+	lines(text, from, to, func(start, end int) {
+		row := strings.TrimSpace(text[start:end])
+		if len(row) < 2 || row[0] != '|' || row[len(row)-1] != '|' {
+			open = false
+			return
+		}
+		rowStart := start + strings.Index(text[start:end], "|")
+		rowEnd := start + strings.LastIndex(text[start:end], "|") + 1
+		if open {
+			out[len(out)-1].end = rowEnd
+		} else {
+			out = append(out, span{rowStart, rowEnd})
+			open = true
+		}
+	})
+	return out
+}
+
+// mathSpans pairs each "$$" in text[from:to] with the next one.
+func mathSpans(text string, from, to int) []span {
+	const delim = "$$"
+	var out []span
+	for i := from; ; {
+		open := strings.Index(text[i:to], delim)
+		if open < 0 {
+			return out
+		}
+		open += i
+		body := open + len(delim)
+		closing := strings.Index(text[body:to], delim)
+		if closing < 0 {
+			i = body
+			continue
+		}
+		end := body + closing + len(delim)
+		out = append(out, span{open, end})
+		i = end
+	}
+}
+
+// inlineCodeSpans finds inline code: a run of backticks, then text on the
+// same line, then a run of exactly as many backticks.
+func inlineCodeSpans(text string, from, to int) []span {
+	var out []span
+	for i := from; i < to; {
+		open := strings.IndexByte(text[i:to], '`')
+		if open < 0 {
 			break
 		}
-		end += start
-		lines = append(lines, line{start, end, text[start:end]})
-		start = end + 1
-	}
-	return lines
-}
-
-// matchFence reports whether lines[i] opens a fenced code block (three or
-// more backticks or tildes) and returns the index of its closing line: a
-// run of the same character, at least as long, and nothing else.
-func matchFence(lines []line, i int) (int, bool) {
-	open := strings.TrimSpace(lines[i].text)
-	if len(open) < 3 || (open[0] != '`' && open[0] != '~') {
-		return 0, false
-	}
-	marker := open[0]
-	n := len(open) - len(strings.TrimLeft(open, string(marker)))
-	if n < 3 || (marker == '`' && strings.ContainsRune(open[n:], '`')) {
-		// A backtick in a backtick fence's info string makes the line
-		// inline code, not a fence.
-		return 0, false
-	}
-	for j := i + 1; j < len(lines); j++ {
-		closing := strings.TrimSpace(lines[j].text)
-		if len(closing) >= n && strings.Trim(closing, string(marker)) == "" {
-			return j, true
+		open += i
+		n := len(text[open:to]) - len(strings.TrimLeft(text[open:to], "`"))
+		body := open + n
+		end := closingRun(text, body, to, n)
+		if end < 0 {
+			i = body
+			continue
 		}
+		out = append(out, span{open, end})
+		i = end
 	}
-	return 0, false
+	return out
 }
 
-// matchMath reports whether lines[i] holds a display math block ($$ or \[)
-// and returns the index of the line that closes it. The block is either
-// one line that opens and closes it, or an opener alone on its line through
-// the next line that ends with the closer, so prose that happens to start
-// with "$$" is not taken for math.
-func matchMath(lines []line, i int) (int, bool) {
-	open := strings.TrimSpace(lines[i].text)
-	var opener, closer string
-	switch {
-	case strings.HasPrefix(open, "$$"):
-		opener, closer = "$$", "$$"
-	case strings.HasPrefix(open, `\[`):
-		opener, closer = `\[`, `\]`
-	default:
-		return 0, false
-	}
-	if len(open) > len(opener) {
-		return i, strings.HasSuffix(open[len(opener):], closer)
-	}
-	for j := i + 1; j < len(lines); j++ {
-		if strings.HasSuffix(strings.TrimSpace(lines[j].text), closer) {
-			return j, true
+// closingRun returns the end of the first run of exactly n backticks in
+// text[from:to] before a line break, after at least one other byte, or -1.
+func closingRun(text string, from, to, n int) int {
+	for j := from; j < to && text[j] != '\n'; {
+		if text[j] != '`' {
+			j++
+			continue
 		}
-	}
-	return 0, false
-}
-
-// matchTable reports whether a pipe table starts at lines[i] and returns
-// the index of its last row. A table is a header row followed by a
-// delimiter row (as in GFM), or at least two rows that start with a pipe;
-// it runs until the first line without a pipe.
-func matchTable(lines []line, i int) (int, bool) {
-	if i+1 >= len(lines) || !strings.Contains(lines[i].text, "|") {
-		return 0, false
-	}
-	header := isDelimiterRow(lines[i+1].text)
-	pipeRows := startsWithPipe(lines[i].text) && startsWithPipe(lines[i+1].text)
-	if !header && !pipeRows {
-		return 0, false
-	}
-	end := i + 1
-	for end+1 < len(lines) && isTableRow(lines[end+1].text, header) {
-		end++
-	}
-	return end, true
-}
-
-func isTableRow(s string, header bool) bool {
-	if header {
-		return strings.Contains(s, "|") && strings.TrimSpace(s) != ""
-	}
-	return startsWithPipe(s)
-}
-
-func startsWithPipe(s string) bool {
-	return strings.HasPrefix(strings.TrimSpace(s), "|")
-}
-
-// isDelimiterRow reports whether s is a GFM table delimiter row, such as
-// "|---|:--:|" or "--- | ---".
-func isDelimiterRow(s string) bool {
-	s = strings.TrimSpace(s)
-	if !strings.Contains(s, "|") {
-		return false
-	}
-	s = strings.TrimPrefix(strings.TrimSuffix(s, "|"), "|")
-	for _, c := range strings.Split(s, "|") {
-		c = strings.TrimSpace(c)
-		c = strings.TrimSuffix(strings.TrimPrefix(c, ":"), ":")
-		if c == "" || strings.Trim(c, "-") != "" {
-			return false
+		k := j
+		for k < to && text[k] == '`' {
+			k++
 		}
+		if k-j == n && j > from {
+			return k
+		}
+		j = k
 	}
-	return true
+	return -1
+}
+
+// toRuneSpans converts byte spans of text, sorted by start, to rune spans.
+func toRuneSpans(text string, spans []span) []span {
+	idx := runeIndex{text: text}
+	out := make([]span, len(spans))
+	for i, s := range spans {
+		out[i] = span{idx.runeOffset(s.start), idx.runeOffset(s.end)}
+	}
+	return out
+}
+
+// insideSpan reports whether pos falls strictly inside one of the sorted
+// spans, so cutting the text at pos would split it.
+func insideSpan(spans []span, pos int) bool {
+	i, _ := slices.BinarySearchFunc(spans, pos, func(s span, p int) int {
+		if s.end <= p {
+			return -1
+		}
+		return 1
+	})
+	return i < len(spans) && spans[i].start < pos
 }
