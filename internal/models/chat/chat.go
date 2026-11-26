@@ -16,6 +16,7 @@ import (
 	"github.com/phongnd2802/trelis/internal/config"
 	"github.com/phongnd2802/trelis/internal/models/api"
 	"github.com/phongnd2802/trelis/internal/models/api/openaicompletions"
+	"github.com/phongnd2802/trelis/internal/models/api/openairesponses"
 	"github.com/phongnd2802/trelis/internal/types"
 )
 
@@ -60,6 +61,11 @@ func NewChat(role config.ChatRole) (Chat, error) {
 		return openaicompletions.New(openaicompletions.Config{
 			Endpoint: endpoint,
 			Settings: api.DefaultOpenAICompletions(),
+		}), nil
+	case api.APIOpenAIResponses:
+		return openairesponses.New(openairesponses.Config{
+			Endpoint: endpoint,
+			Settings: api.DefaultOpenAIResponses(),
 		}), nil
 	default:
 		return nil, fmt.Errorf("unsupported chat api %q for model %s", role.Protocol, role.Model)

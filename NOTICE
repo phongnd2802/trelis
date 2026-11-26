@@ -63,6 +63,8 @@ Files and parts (paths in this repository):
     internal/models/api/openaicompletions/request.go
     internal/models/api/openaicompletions/stream_tool_index_test.go
     internal/models/api/openaicompletions/content_parts_test.go
+    internal/models/api/openairesponses/client.go
+    internal/models/api/openairesponses/request.go
     internal/models/chat/chat.go
 
 WeKnora is licensed under the MIT License:

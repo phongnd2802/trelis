@@ -11,6 +11,7 @@ import (
 
 	"github.com/phongnd2802/trelis/internal/config"
 	"github.com/phongnd2802/trelis/internal/models/api"
+	"github.com/phongnd2802/trelis/internal/models/modeltest"
 )
 
 // The wire protocol is tested in internal/models/api/openaicompletions; these
@@ -73,6 +74,47 @@ func TestNewChat_EachRoleCallsItsOwnProvider(t *testing.T) {
 	}
 	if chatRole.GetModelName() != "gen-model" || judgeRole.GetModelName() != "judge-model" {
 		t.Errorf("GetModelName = %q / %q", chatRole.GetModelName(), judgeRole.GetModelName())
+	}
+}
+
+func TestNewChat_SwitchesProtocolWithTheRoleConfig(t *testing.T) {
+	p := modeltest.NewFakeProvider(t)
+	p.Reply(modeltest.Any(), modeltest.Text("ok"))
+	msgs := []Message{{Role: "user", Content: "cùng một câu hỏi"}}
+
+	// The caller does not change; only the role's protocol does.
+	ask := func(protocol api.API) string {
+		r := role(p.URL(), "m", "k")
+		r.Protocol = protocol
+		c, err := NewChat(r)
+		if err != nil {
+			t.Fatalf("NewChat(%s): %v", protocol, err)
+		}
+		resp, err := c.Chat(context.Background(), msgs, nil)
+		if err != nil {
+			t.Fatalf("Chat(%s): %v", protocol, err)
+		}
+		return resp.Content
+	}
+
+	if got := ask(api.APIOpenAIResponses); got != "ok" {
+		t.Errorf("Responses Chat = %q, want ok", got)
+	}
+	if n := p.CallCount(modeltest.Responses); n != 1 {
+		t.Errorf("provider saw %d responses requests, want 1", n)
+	}
+	if n := p.CallCount(modeltest.ChatCompletions); n != 0 {
+		t.Errorf("provider saw %d chat completions requests, want 0", n)
+	}
+
+	if got := ask(api.APIOpenAICompletions); got != "ok" {
+		t.Errorf("Completions Chat = %q, want ok", got)
+	}
+	if n := p.CallCount(modeltest.ChatCompletions); n != 1 {
+		t.Errorf("provider saw %d chat completions requests, want 1", n)
+	}
+	if n := p.CallCount(modeltest.Responses); n != 1 {
+		t.Errorf("provider saw %d responses requests, want 1 still", n)
 	}
 }
 

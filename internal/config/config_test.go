@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/phongnd2802/trelis/internal/models/api"
 )
 
 func writeConfig(t *testing.T, body string) string {
@@ -288,6 +290,36 @@ func TestLoadModelRolesFromEnvOnly(t *testing.T) {
 	}
 	if cfg.Models.Judge.Configured() {
 		t.Errorf("Models.Judge = %+v, want unconfigured", cfg.Models.Judge)
+	}
+}
+
+func TestLoadResponsesProtocolFromEnv(t *testing.T) {
+	t.Setenv("TRELIS_MODELS_CHAT_BASE_URL", "http://localhost:4000/v1")
+	t.Setenv("TRELIS_MODELS_CHAT_MODEL", "local")
+	t.Setenv("TRELIS_MODELS_CHAT_PROTOCOL", "openai-responses")
+
+	cfg, err := Load(writeConfig(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Models.Chat.Protocol != api.APIOpenAIResponses {
+		t.Errorf("Models.Chat.Protocol = %q, want %q", cfg.Models.Chat.Protocol, api.APIOpenAIResponses)
+	}
+}
+
+// The rejection has to say which protocols this build does ship, or an
+// operator cannot tell a typo from an unsupported provider.
+func TestLoadRejectsUnknownProtocolNamingBoth(t *testing.T) {
+	t.Setenv("TRELIS_MODELS_CHAT_PROTOCOL", "grpc")
+
+	_, err := Load(writeConfig(t, modelsYAML))
+	if err == nil {
+		t.Fatal("Load succeeded, want an error")
+	}
+	for _, want := range []string{string(api.APIOpenAICompletions), string(api.APIOpenAIResponses)} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
 	}
 }
 

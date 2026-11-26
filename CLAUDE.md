@@ -19,7 +19,7 @@ When running `/implement` (`mattpocock-skills:implement`), follow that skill's s
 The daemon listens on `http://127.0.0.1:4170` (loopback, no token). Don't send `X-Qwen-Client-Id`: an unregistered id is rejected.
 
 1. Check `qwen daemon status` lists a running daemon for this repo. If none, ask the user to run `qwen serve` in the repo; don't start it yourself.
-2. Get the session: `POST /session` with `{"cwd": "<repo root>"}` returns `sessionId` (the workspace shares one session). Set `POST /session/$ID/approval-mode` `{"mode":"auto"}`. Tell the user the id so they can watch with `qwen attach --session $ID` or the Web Shell at `http://127.0.0.1:4170/`.
+2. Start a **new session for every new ticket**: `POST /session` with `{"cwd": "<repo root>", "sessionScope": "thread"}` returns a fresh `sessionId` (without `sessionScope` the daemon hands back the workspace's shared session). Keep that id for the ticket's fix rounds; don't reuse it for another ticket. Set `POST /session/$ID/approval-mode` `{"mode":"auto"}`. Tell the user the id so they can watch with `qwen attach --session $ID` or the Web Shell at `http://127.0.0.1:4170/`.
 3. Before every prompt, check `GET /session/$ID/status` is idle (`hasActivePrompt: false`, `pendingPromptCount: 0`), then send it straight away without asking the user. If the session is busy, wait for it to go idle.
 4. Send the brief or the findings: build `{"prompt":[{"type":"text","text":"..."}]}` with `jq --rawfile` and `POST /session/$ID/prompt`. It returns at once with a `promptId`.
 5. Wait with Monitor until status shows no active or pending prompt. If `isWaitingForPermission` or `isWaitingForUserQuestion` is true, tell the user. Never vote on a permission yourself. To stop a run: `POST /session/$ID/cancel`.

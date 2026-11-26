@@ -44,7 +44,7 @@ type Endpoint struct {
 type ChatRole struct {
 	Endpoint `mapstructure:",squash"`
 	// Protocol is the wire protocol, in the model layer's vocabulary:
-	// openai-completions (default); openai-responses joins with #19.
+	// openai-completions (default) or openai-responses.
 	Protocol api.API `mapstructure:"protocol"`
 }
 
@@ -128,9 +128,16 @@ func (e Endpoint) APIEndpoint(role string) (api.Endpoint, error) {
 
 func (m *Models) validate() []error {
 	var errs []error
+	// The list comes from the model layer, so the protocols Known accepts and
+	// the ones this message names cannot drift apart.
+	protocols := make([]string, 0, len(api.KnownAPIs()))
+	for _, known := range api.KnownAPIs() {
+		protocols = append(protocols, string(known))
+	}
 	for key, role := range m.chatRoles() {
 		if !role.Protocol.Known() {
-			errs = append(errs, fmt.Errorf("%s.protocol %q is not a protocol this build ships (want %s)", key, role.Protocol, api.APIOpenAICompletions))
+			errs = append(errs, fmt.Errorf("%s.protocol %q is not a protocol this build ships (want %s)",
+				key, role.Protocol, strings.Join(protocols, " or ")))
 		}
 		errs = append(errs, role.validate(key)...)
 	}

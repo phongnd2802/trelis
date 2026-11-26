@@ -47,6 +47,7 @@ storage:
 # models:
 #   chat:
 #     protocol: openai-completions   # POST {base_url}/chat/completions
+#     # protocol: openai-responses   # POST {base_url}/responses instead
 #     base_url: http://localhost:4000/v1
 #     model: gpt-4o-mini
 #   extraction:
