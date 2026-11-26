@@ -1,10 +1,12 @@
-// Command server runs the Trelis HTTP service.
+// Command server builds the trelis binary (bin/trelis from make build,
+// /trelis in the image; `go run ./cmd/server` in development), which runs the
+// Trelis HTTP service.
 //
-//	server -config config/trelis.yaml
-//	server -config config/trelis.yaml admin <command>
+//	trelis -config config/trelis.yaml
+//	trelis -config config/trelis.yaml admin <command>
 //
 // The admin commands create Principals, Groups, memberships and API keys
-// (run `server admin` for the list); they migrate Postgres and exit without
+// (run `trelis admin` for the list); they migrate Postgres and exit without
 // serving. Every HTTP route except /healthz and /readyz needs an API key.
 //
 // On start it applies pending Postgres migrations, then serves. When
@@ -145,6 +147,7 @@ func run(configPath string, args []string) (err error) {
 	if err != nil {
 		return err
 	}
+	// CI's compose smoke test greps this record for "applied":0.
 	logger.Ctx(ctx).Info("postgres migrated", zap.Int("applied", applied))
 	dbStore := db.NewStore(pool)
 	principalRepo, keyRepo := repository.NewPrincipalRepository(dbStore), repository.NewAPIKeyRepository(dbStore)
@@ -205,6 +208,8 @@ func run(configPath string, args []string) (err error) {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.Server.Addr, err)
 	}
+	// The integration harness reads addr from this record (listeningAddr);
+	// keep the message and the field name.
 	logger.Ctx(ctx).Info("trelis listening", zap.String("addr", ln.Addr().String()), zap.String("config", configPath))
 
 	if err := router.Serve(ctx, ln, router.New(ready, service.NewAuthService(principalRepo, keyRepo),

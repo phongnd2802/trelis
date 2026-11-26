@@ -30,7 +30,7 @@ import (
 //	@securityDefinitions.apikey	bearerAuth
 //	@in							header
 //	@name						Authorization
-//	@description				Paste "Bearer <key>", with a key from `admin key create <principal>` (`go run ./cmd/server admin key create <principal>` in dev).
+//	@description				Paste "Bearer <key>", with a key from `trelis admin key create <principal>` (`go run ./cmd/server admin key create <principal>` in dev).
 func New(ready Readiness, authn interfaces.AuthService,
 	principals *handler.PrincipalHandler, docs *handler.DocumentHandler, swagger bool,
 ) http.Handler {

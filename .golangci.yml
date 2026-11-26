@@ -18,10 +18,17 @@ linters:
       forbid:
         - pattern: ^fmt\.Print(f|ln)?$
           msg: library code logs through internal/logger (zap); only cmd/ prints to stdout
+        - pattern: ^zap\.(L|S)$
+          msg: log through logger.Ctx(ctx) so the record keeps its request fields; zap.L() only where no ctx exists (mark it //nolint:forbidigo with the reason)
   exclusions:
     rules:
       - path: ^cmd/
         linters: [forbidigo]
+        text: fmt\.Print
+      # The logger package itself owns the global fallback.
+      - path: ^internal/logger/
+        linters: [forbidigo]
+        text: zap\.
       - path: _test\.go$
         linters: [forbidigo, depguard]
 
