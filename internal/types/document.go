@@ -62,6 +62,13 @@ type AccessList struct {
 	Groups     []string `json:"groups"`
 }
 
+// AccessGrants is an Access List resolved to IDs, in the order its names
+// were given.
+type AccessGrants struct {
+	PrincipalIDs []uuid.UUID
+	GroupIDs     []uuid.UUID
+}
+
 // DuplicateDocumentError means the owner already uploaded a file with the
 // same content; Document is that earlier upload.
 type DuplicateDocumentError struct {

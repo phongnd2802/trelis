@@ -149,8 +149,10 @@ func run(configPath string, args []string) error {
 	if s3.CreateBucket {
 		ensureBucket(ctx, files)
 	}
+	dbStore := db.NewStore(pool)
 	docs := handler.NewDocumentHandler(
-		service.NewDocumentService(repository.NewDocumentRepository(pool), files),
+		service.NewDocumentService(dbStore,
+			repository.NewDocumentRepository(dbStore), repository.NewPrincipalRepository(dbStore), files),
 		cfg.Storage.MaxFileSize(),
 	)
 

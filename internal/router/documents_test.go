@@ -14,6 +14,7 @@ import (
 	"github.com/phongnd2802/trelis/internal/application/service"
 	"github.com/phongnd2802/trelis/internal/application/service/file/filetest"
 	"github.com/phongnd2802/trelis/internal/auth"
+	"github.com/phongnd2802/trelis/internal/db"
 	"github.com/phongnd2802/trelis/internal/db/dbtest"
 	"github.com/phongnd2802/trelis/internal/handler"
 )
@@ -48,7 +49,9 @@ func newServer(t *testing.T, principals ...string) *server {
 		c.keys[name] = key
 	}
 	c.files = filetest.NewMemory()
-	docs := service.NewDocumentService(repository.NewDocumentRepository(pool), c.files)
+	store := db.NewStore(pool)
+	docs := service.NewDocumentService(store,
+		repository.NewDocumentRepository(store), repository.NewPrincipalRepository(store), c.files)
 	c.h = New(Readiness{}, c.auth, handler.NewDocumentHandler(docs, testMaxFileSize))
 	return c
 }

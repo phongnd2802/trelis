@@ -15,22 +15,28 @@ import (
 
 	"github.com/phongnd2802/trelis/internal/application/repository"
 	"github.com/phongnd2802/trelis/internal/auth"
+	"github.com/phongnd2802/trelis/internal/db"
 	werrors "github.com/phongnd2802/trelis/internal/errors"
 	"github.com/phongnd2802/trelis/internal/types"
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
 	secutils "github.com/phongnd2802/trelis/internal/utils"
 )
 
-// documentService implements DocumentService over a repository and file
-// storage.
+// documentService implements DocumentService over the Document and
+// Principal repositories and file storage. It owns the transactions its use
+// cases need (ADR-0007).
 type documentService struct {
-	repo    interfaces.DocumentRepository
-	fileSvc interfaces.FileService
+	store      db.Store
+	repo       interfaces.DocumentRepository
+	principals interfaces.PrincipalRepository
+	fileSvc    interfaces.FileService
 }
 
 // NewDocumentService returns the Document use cases.
-func NewDocumentService(repo interfaces.DocumentRepository, fileSvc interfaces.FileService) interfaces.DocumentService {
-	return &documentService{repo: repo, fileSvc: fileSvc}
+func NewDocumentService(store db.Store, repo interfaces.DocumentRepository,
+	principals interfaces.PrincipalRepository, fileSvc interfaces.FileService,
+) interfaces.DocumentService {
+	return &documentService{store: store, repo: repo, principals: principals, fileSvc: fileSvc}
 }
 
 // caller is the Principal a request was authenticated as. Every route behind
@@ -102,8 +108,16 @@ func (s *documentService) CreateDocumentFromFile(ctx context.Context,
 	}
 	doc.ObjectKey = key
 
-	// Save the Document record after the file is safely stored.
-	if err := s.repo.CreateDocument(ctx, doc, accessList); err != nil {
+	// Save the Document and its Access List after the file is safely stored,
+	// in one transaction, so an unknown name leaves no Document behind.
+	err = s.store.ExecTx(ctx, func(ctx context.Context) error {
+		grants, err := s.principals.ResolveNames(ctx, accessList)
+		if err != nil {
+			return err
+		}
+		return s.repo.CreateDocument(ctx, doc, grants)
+	})
+	if err != nil {
 		if deleteErr := s.fileSvc.DeleteFile(context.WithoutCancel(ctx), key); deleteErr != nil {
 			slog.ErrorContext(ctx, "delete source file after document creation failed", "key", key, "err", deleteErr)
 		}

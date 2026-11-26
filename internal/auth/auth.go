@@ -12,10 +12,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/phongnd2802/trelis/internal/db"
 	"github.com/phongnd2802/trelis/internal/db/sqlc"
 )
 
@@ -154,7 +153,7 @@ func (s *Store) RevokeKey(ctx context.Context, id uuid.UUID) error {
 // or ErrUnauthenticated if it belongs to none or has been revoked.
 func (s *Store) Authenticate(ctx context.Context, key string) (Principal, error) {
 	row, err := s.q.GetPrincipalByKeyHash(ctx, hashKey(key))
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, db.ErrNotFound) {
 		return Principal{}, ErrUnauthenticated
 	}
 	if err != nil {
@@ -173,18 +172,15 @@ func (s *Store) Authenticate(ctx context.Context, key string) (Principal, error)
 
 // createErr wraps a failed insert, as ErrExists when the name is taken.
 func createErr(kind, name string, err error) error {
-	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == uniqueViolation {
+	if db.IsUniqueViolation(err) {
 		return fmt.Errorf("%w: %s %q", ErrExists, kind, name)
 	}
 	return fmt.Errorf("auth: create %s %q: %w", kind, name, err)
 }
 
-// uniqueViolation is Postgres's SQLSTATE for a unique constraint violation.
-const uniqueViolation = "23505"
-
 // lookupErr wraps a failed by-name lookup, as ErrNotFound when nothing matched.
 func lookupErr(kind, name string, err error) error {
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, db.ErrNotFound) {
 		return fmt.Errorf("%w: %s %q", ErrNotFound, kind, name)
 	}
 	return fmt.Errorf("auth: %s %q: %w", kind, name, err)
