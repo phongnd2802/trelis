@@ -29,6 +29,7 @@ type Config struct {
 	Postgres Postgres `mapstructure:"postgres"`
 	Neo4j    Neo4j    `mapstructure:"neo4j"`
 	Temporal Temporal `mapstructure:"temporal"`
+	Models   Models   `mapstructure:"models"`
 }
 
 // Server configures the HTTP listener.
@@ -150,6 +151,8 @@ func (c *Config) validate() error {
 	required("temporal.host", c.Temporal.Host)
 	port("temporal.port", c.Temporal.Port)
 	required("temporal.namespace", c.Temporal.Namespace)
+
+	errs = append(errs, c.Models.validate()...)
 
 	return errors.Join(errs...)
 }

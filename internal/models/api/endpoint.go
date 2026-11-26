@@ -1,15 +1,112 @@
+// Derived from WeKnora (https://github.com/Tencent/WeKnora), internal/models/api/endpoint.go.
+// Copyright (C) 2026 Tencent. Licensed under the MIT License; see NOTICE.
+
 package api
 
-import "net/http"
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+)
 
+// AuthFunc stamps credentials onto an outbound request. body is the exact
+// bytes being sent so signing vendors can hash them.
 type AuthFunc func(req *http.Request, body []byte)
 
+// BearerAuth is the default: Authorization: Bearer <key>. An empty key sends
+// nothing (local deployments).
+func BearerAuth(apiKey string) AuthFunc {
+	return func(req *http.Request, _ []byte) {
+		if apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+		}
+	}
+}
+
+// Endpoint is everything a protocol client needs to reach one model.
 type Endpoint struct {
+	// BaseURL is the vendor root, e.g. https://api.openai.com/v1.
 	BaseURL string
-	URL     string
-	Model   string
-	ModelID string
-	Auth    AuthFunc
-	Headers map[string]string
-	Client  *http.Client
+	// Model is the name sent on the wire.
+	Model string
+	Auth  AuthFunc
+	// Client is the HTTP client; nil uses HTTPClient.
+	Client *http.Client
+}
+
+// Resolve builds the request URL from the base URL and the protocol path.
+func (e Endpoint) Resolve(defaultPath string) string {
+	return strings.TrimRight(e.BaseURL, "/") + defaultPath
+}
+
+func (e Endpoint) httpClient() *http.Client {
+	if e.Client != nil {
+		return e.Client
+	}
+	return HTTPClient
+}
+
+// NewRequest prepares an authenticated JSON POST. The body is marshalled
+// once so signing vendors see exactly what is sent.
+func (e Endpoint) NewRequest(ctx context.Context, url string, body any, stream bool) (*http.Request, []byte, error) {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return nil, nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if stream {
+		req.Header.Set("Accept", "text/event-stream")
+	}
+	if e.Auth != nil {
+		e.Auth(req, data)
+	}
+	return req, data, nil
+}
+
+// Do sends the request and returns the response. Non-2xx responses are
+// turned into an error carrying the body so callers surface vendor messages.
+func (e Endpoint) Do(req *http.Request) (*http.Response, error) {
+	resp, err := e.httpClient().Do(req)
+	if err != nil {
+		return nil, &TransportError{Op: "send request", Err: err}
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Body: string(body), Header: resp.Header}
+	}
+	return resp, nil
+}
+
+// TransportError is a request that never got a whole answer: DNS, connect,
+// TLS, a reset or a timeout, while sending or while reading the reply. It is
+// the only failure worth sending again.
+type TransportError struct {
+	// Op is the phase that failed: "send request" or "read response".
+	Op  string
+	Err error
+}
+
+func (e *TransportError) Error() string { return e.Op + ": " + e.Err.Error() }
+func (e *TransportError) Unwrap() error { return e.Err }
+
+// HTTPError is a non-2xx vendor reply.
+type HTTPError struct {
+	StatusCode int
+	Body       string
+	// Header is the reply's headers, kept so a retry can honour the vendor's
+	// Retry-After on a 429 or 503.
+	Header http.Header
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("API request failed with status %d: %s", e.StatusCode, e.Body)
 }

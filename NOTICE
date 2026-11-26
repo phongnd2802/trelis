@@ -1,24 +1,49 @@
 Trelis
 =======
 
-Parts of Trelis are copied near-verbatim from Omnisc, a fork of WeKnora
-(https://github.com/Tencent/WeKnora), under the MIT terms of its license,
-reproduced below. Each such part says so in a comment where it appears.
+Parts of Trelis are copied near-verbatim from, or derived from, WeKnora
+(https://github.com/Tencent/WeKnora), reached through the Omnisc fork, under
+the MIT terms of its license, reproduced below. Each such file or part says
+so in a header or comment where it appears.
 
-  internal/integration/harness_test.go
-    run, buildBinary
-    from cli/acceptance/e2e/e2e_test.go (run, buildBinary)
-
-  internal/models/modeltest/fake_provider.go
-    the "Build tag is intentionally absent" paragraph of the package doc
-    from cli/internal/testutil/xdg.go; the scripted replay (Script) and its
-    "unexpected extra call" failure, from scriptedTemplateChatModel in
-    internal/application/service/wiki_page_rewrite_continuation_test.go
-
---------------------------------------------------------------------
 WeKnora
-
+-------
 Copyright (C) 2026 Tencent.  All rights reserved.
+
+Files and parts (paths in this repository):
+
+  Copied near-verbatim:
+    internal/models/api/sse.go
+    internal/models/api/sse_test.go
+    internal/models/api/sse_framing_test.go
+    internal/models/api/stream_assembler_test.go
+    internal/integration/harness_test.go
+      run, buildBinary
+      from cli/acceptance/e2e/e2e_test.go (run, buildBinary)
+    internal/models/modeltest/fake_provider.go
+      the "Build tag is intentionally absent" paragraph of the package doc
+      from cli/internal/testutil/xdg.go; the scripted replay (Script) and its
+      "unexpected extra call" failure, from scriptedTemplateChatModel in
+      internal/application/service/wiki_page_rewrite_continuation_test.go
+
+  Derived (trimmed to the parts Trelis uses):
+    internal/types/chat.go
+    internal/models/api/types.go
+    internal/models/api/options.go
+    internal/models/api/endpoint.go
+    internal/models/api/transport.go
+    internal/models/api/usage.go
+    internal/models/api/compat_settings.go
+    internal/models/api/stream_assembler.go
+    internal/models/api/special_tokens.go
+    internal/models/api/special_tokens_test.go
+    internal/models/api/openaicompletions/client.go
+    internal/models/api/openaicompletions/request.go
+    internal/models/api/openaicompletions/stream_tool_index_test.go
+    internal/models/api/openaicompletions/content_parts_test.go
+    internal/models/chat/chat.go
+
+WeKnora is licensed under the MIT License:
 
 Permission is hereby granted, free of charge, to any person obtaining
 a copy of this software and associated documentation files (the
