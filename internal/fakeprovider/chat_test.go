@@ -22,6 +22,9 @@ func TestChatCompletionsReturnsScriptedToolCalls(t *testing.T) {
 	if c.FinishReason != "tool_calls" || c.Message.Content != nil || len(c.Message.ToolCalls) != 1 {
 		t.Fatalf("choice = %s, want one tool call and null content", raw)
 	}
+	if !strings.Contains(string(raw), `"content":null`) {
+		t.Errorf("answer %s leaves content out instead of null", raw)
+	}
 	call := c.Message.ToolCalls[0]
 	if call.ID == "" || call.Type != "function" || call.Function.Name != "weather" || call.Function.Arguments != `{"city":"Hanoi"}` {
 		t.Errorf("tool call = %+v", call)

@@ -36,11 +36,13 @@ func (c *content) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// chatRequest is the part of a Chat Completions request the provider reads.
 type chatRequest struct {
 	Model    string `json:"model"`
 	Messages []struct {
-		Role    string  `json:"role"`
-		Content content `json:"content"`
+		Role      string         `json:"role"`
+		Content   content        `json:"content"`
+		ToolCalls []chatToolCall `json:"tool_calls"`
 	} `json:"messages"`
 	Tools []struct {
 		Function struct {
@@ -53,10 +55,18 @@ type chatRequest struct {
 	} `json:"stream_options"`
 }
 
+// prompt reduces r to what a Match sees.
 func (r chatRequest) prompt() Prompt {
 	p := Prompt{Endpoint: ChatCompletions, Model: r.Model}
 	for _, m := range r.Messages {
-		p.Messages = append(p.Messages, Message{Role: m.Role, Text: string(m.Content)})
+		if m.Content != "" || len(m.ToolCalls) == 0 {
+			p.Messages = append(p.Messages, Message{Role: m.Role, Text: string(m.Content)})
+		}
+		// One Message per call, as a Responses function_call input item
+		// becomes, so a rule matches the same history on both endpoints.
+		for _, c := range m.ToolCalls {
+			p.Messages = append(p.Messages, Message{Role: m.Role, Text: c.Function.Name + " " + c.Function.Arguments})
+		}
 	}
 	for _, t := range r.Tools {
 		p.Tools = append(p.Tools, t.Function.Name)
@@ -64,11 +74,13 @@ func (r chatRequest) prompt() Prompt {
 	return p
 }
 
+// chatFunction is a tool call's function, in a request or an answer.
 type chatFunction struct {
 	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments"`
 }
 
+// chatToolCall is one tool call; Index is set only in stream deltas.
 type chatToolCall struct {
 	Index    *int         `json:"index,omitempty"`
 	ID       string       `json:"id,omitempty"`
@@ -76,25 +88,38 @@ type chatToolCall struct {
 	Function chatFunction `json:"function"`
 }
 
+// chatMessage is the assistant message of a non-streamed answer; content
+// is null when the model only calls tools.
 type chatMessage struct {
+	Role      string         `json:"role"`
+	Content   *string        `json:"content"`
+	ToolCalls []chatToolCall `json:"tool_calls,omitempty"`
+}
+
+// chatDelta is the part of the assistant message one stream chunk adds.
+type chatDelta struct {
 	Role      string         `json:"role,omitempty"`
 	Content   *string        `json:"content,omitempty"`
 	ToolCalls []chatToolCall `json:"tool_calls,omitempty"`
 }
 
+// chatChoice carries a Message in an answer or a Delta in a stream chunk.
 type chatChoice struct {
 	Index        int          `json:"index"`
 	Message      *chatMessage `json:"message,omitempty"`
-	Delta        *chatMessage `json:"delta,omitempty"`
+	Delta        *chatDelta   `json:"delta,omitempty"`
 	FinishReason *string      `json:"finish_reason"`
 }
 
+// chatUsage is Chat Completions token accounting.
 type chatUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
 }
 
+// chatCompletion is an answer or, with Object chat.completion.chunk, one
+// stream chunk.
 type chatCompletion struct {
 	ID      string       `json:"id"`
 	Object  string       `json:"object"`
@@ -105,9 +130,10 @@ type chatCompletion struct {
 }
 
 func (r Reply) chatUsage() *chatUsage {
-	return &chatUsage{PromptTokens: r.Usage.Input, CompletionTokens: r.Usage.Output, TotalTokens: r.Usage.Input + r.Usage.Output}
+	return &chatUsage{PromptTokens: r.Usage.Input, CompletionTokens: r.Usage.Output, TotalTokens: r.Usage.total()}
 }
 
+// finishReason is tool_calls when r calls a tool, else stop.
 func (r Reply) finishReason() *string {
 	reason := "stop"
 	if len(r.ToolCalls) > 0 {
@@ -116,6 +142,7 @@ func (r Reply) finishReason() *string {
 	return &reason
 }
 
+// chatCompletions answers POST /v1/chat/completions.
 func (p *Provider) chatCompletions(w http.ResponseWriter, body []byte) (int, any) {
 	var req chatRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -156,39 +183,36 @@ func (p *Provider) streamChat(w http.ResponseWriter, req chatRequest, id string,
 		return chatCompletion{ID: id, Object: "chat.completion.chunk", Created: created, Model: req.Model, Choices: []chatChoice{c}}
 	}
 	empty := ""
-	s.data(chunk(chatChoice{Delta: &chatMessage{Role: "assistant", Content: &empty}}))
+	s.data(chunk(chatChoice{Delta: &chatDelta{Role: "assistant", Content: &empty}}))
 	for _, piece := range pieces(reply.Text) {
-		s.data(chunk(chatChoice{Delta: &chatMessage{Content: &piece}}))
+		s.data(chunk(chatChoice{Delta: &chatDelta{Content: &piece}}))
 	}
 	for i, c := range reply.ToolCalls {
-		s.data(chunk(chatChoice{Delta: &chatMessage{ToolCalls: []chatToolCall{{
+		s.data(chunk(chatChoice{Delta: &chatDelta{ToolCalls: []chatToolCall{{
 			Index: &i, ID: c.ID, Type: "function", Function: chatFunction{Name: c.Name},
 		}}}}))
 		for _, piece := range pieces(c.Arguments) {
-			s.data(chunk(chatChoice{Delta: &chatMessage{ToolCalls: []chatToolCall{{
+			s.data(chunk(chatChoice{Delta: &chatDelta{ToolCalls: []chatToolCall{{
 				Index: &i, Function: chatFunction{Arguments: piece},
 			}}}}))
 		}
 	}
-	s.data(chunk(chatChoice{Delta: &chatMessage{}, FinishReason: reply.finishReason()}))
+	s.data(chunk(chatChoice{Delta: &chatDelta{}, FinishReason: reply.finishReason()}))
 	if req.StreamOptions.IncludeUsage {
-		s.data(chatCompletion{ID: id, Object: "chat.completion.chunk", Created: created, Model: req.Model, Choices: []chatChoice{}, Usage: reply.chatUsage()})
+		last := chunk(chatChoice{})
+		last.Choices, last.Usage = []chatChoice{}, reply.chatUsage()
+		s.data(last)
 	}
 	s.raw("[DONE]")
 }
 
+// badRequest answers a body the provider cannot read.
 func badRequest(err error) (int, any) {
-	var b errorBody
-	b.Error.Message = "fakeprovider: " + err.Error()
-	b.Error.Type = "invalid_request_error"
-	return http.StatusBadRequest, b
+	return http.StatusBadRequest, newError("fakeprovider: "+err.Error(), "invalid_request_error")
 }
 
 // unscripted answers a request no rule matched; the test has already been
 // failed by generate.
 func unscripted(prompt Prompt) (int, any) {
-	var b errorBody
-	b.Error.Message = "fakeprovider: no Reply rule matches this request:\n" + prompt.String()
-	b.Error.Type = "unscripted"
-	return http.StatusInternalServerError, b
+	return http.StatusInternalServerError, newError("fakeprovider: no Reply rule matches this request:\n"+prompt.String(), "unscripted")
 }

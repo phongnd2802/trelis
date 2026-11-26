@@ -3,8 +3,10 @@ package fakeprovider
 import (
 	"cmp"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"slices"
@@ -14,6 +16,9 @@ import (
 // SetEmbeddingDims sets the length of the vectors [Embeddings] returns for
 // requests that do not ask for `dimensions` themselves.
 func (p *Provider) SetEmbeddingDims(n int) {
+	if n < 1 {
+		p.t.Fatalf("fakeprovider: SetEmbeddingDims(%d), want at least 1", n)
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.dims = n
@@ -66,23 +71,30 @@ func (t *texts) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// embeddings answers POST /v1/embeddings, as float arrays or, for
+// encoding_format base64, as little-endian float32 bytes.
 func (p *Provider) embeddings(_ http.ResponseWriter, body []byte) (int, any) {
 	var req struct {
-		Model      string `json:"model"`
-		Input      texts  `json:"input"`
-		Dimensions int    `json:"dimensions"`
+		Model          string `json:"model"`
+		Input          texts  `json:"input"`
+		Dimensions     int    `json:"dimensions"`
+		EncodingFormat string `json:"encoding_format"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		return badRequest(err)
 	}
 	type embedding struct {
-		Object    string    `json:"object"`
-		Index     int       `json:"index"`
-		Embedding []float32 `json:"embedding"`
+		Object    string `json:"object"`
+		Index     int    `json:"index"`
+		Embedding any    `json:"embedding"`
 	}
 	data := make([]embedding, len(req.Input))
 	tokens := 0
 	p.mu.Lock()
+	if req.Dimensions < 0 {
+		p.mu.Unlock()
+		return badRequest(fmt.Errorf("dimensions %d must be positive", req.Dimensions))
+	}
 	dims := cmp.Or(req.Dimensions, p.dims)
 	for i, text := range req.Input {
 		vec, ok := p.vectors[text]
@@ -90,6 +102,9 @@ func (p *Provider) embeddings(_ http.ResponseWriter, body []byte) (int, any) {
 			vec = hashVector(text, dims)
 		}
 		data[i] = embedding{Object: "embedding", Index: i, Embedding: vec}
+		if req.EncodingFormat == "base64" {
+			data[i].Embedding = base64Floats(vec)
+		}
 		tokens += countTokens(text)
 	}
 	p.mu.Unlock()
@@ -99,6 +114,15 @@ func (p *Provider) embeddings(_ http.ResponseWriter, body []byte) (int, any) {
 		"data":   data,
 		"usage":  map[string]int{"prompt_tokens": tokens, "total_tokens": tokens},
 	}
+}
+
+// base64Floats encodes vec the way OpenAI's encoding_format base64 does.
+func base64Floats(vec []float32) string {
+	b := make([]byte, 0, 4*len(vec))
+	for _, x := range vec {
+		b = binary.LittleEndian.AppendUint32(b, math.Float32bits(x))
+	}
+	return base64.StdEncoding.EncodeToString(b)
 }
 
 // hashVector is a unit vector of length dims derived from text alone.
@@ -120,6 +144,7 @@ func hashVector(text string, dims int) []float32 {
 	return vec
 }
 
+// rerank answers POST /v1/rerank in the Jina/Cohere v1 shape.
 func (p *Provider) rerank(_ http.ResponseWriter, body []byte) (int, any) {
 	var req struct {
 		Model           string `json:"model"`

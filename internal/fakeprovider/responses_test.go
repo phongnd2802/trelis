@@ -81,6 +81,28 @@ func TestResponsesAnswersFromTheSameScriptAsChat(t *testing.T) {
 	}
 }
 
+func TestToolCallHistoryMatchesTheSameOnBothEndpoints(t *testing.T) {
+	p := fakeprovider.New(t)
+	p.Reply(fakeprovider.Contains(`weather {"city":"Hue"}`), fakeprovider.Text("Rainy."))
+
+	chat := map[string]any{"model": "m", "messages": []map[string]any{
+		{"role": "user", "content": "Weather?"},
+		{"role": "assistant", "content": nil, "tool_calls": []map[string]any{{"id": "c1", "type": "function", "function": map[string]any{"name": "weather", "arguments": `{"city":"Hue"}`}}}},
+		{"role": "tool", "tool_call_id": "c1", "content": "rain"},
+	}}
+	responses := map[string]any{"model": "m", "input": []map[string]any{
+		{"role": "user", "content": "Weather?"},
+		{"type": "function_call", "call_id": "c1", "name": "weather", "arguments": `{"city":"Hue"}`},
+		{"type": "function_call_output", "call_id": "c1", "output": "rain"},
+	}}
+	if status, raw := post(t, p, "/chat/completions", chat); status != http.StatusOK {
+		t.Errorf("chat: %d %s", status, raw)
+	}
+	if status, raw := post(t, p, "/responses", responses); status != http.StatusOK {
+		t.Errorf("responses: %d %s", status, raw)
+	}
+}
+
 func TestResponsesStreamsTextAndFunctionCallEvents(t *testing.T) {
 	p := fakeprovider.New(t)
 	p.Reply(fakeprovider.Any(), fakeprovider.Reply{

@@ -14,7 +14,11 @@ func TestMeReturnsTheCallingPrincipalAndItsGroups(t *testing.T) {
 	aliceID := tr.admin(t, "principal", "create", "alice")
 	legalID := tr.admin(t, "group", "create", "legal")
 	tr.admin(t, "group", "add-member", "legal", "alice")
-	_, key, _ := strings.Cut(tr.admin(t, "key", "create", "alice"), "\t")
+	out := tr.admin(t, "key", "create", "alice")
+	_, key, ok := strings.Cut(out, "\t")
+	if !ok {
+		t.Fatalf("key create printed %q, want <id>\\t<key>", out)
+	}
 
 	resp := tr.get(t, "/me", key)
 	if resp.StatusCode != http.StatusOK {
@@ -41,6 +45,8 @@ func TestMeReturnsTheCallingPrincipalAndItsGroups(t *testing.T) {
 
 func TestReadinessSeesPostgresAndNeo4j(t *testing.T) {
 	tr := start(t)
+	// Not ready as a whole (no Temporal in the harness yet), so only the
+	// per-dependency checks are asserted, not the status code.
 	var ready struct {
 		Checks map[string]struct{ Status string } `json:"checks"`
 	}

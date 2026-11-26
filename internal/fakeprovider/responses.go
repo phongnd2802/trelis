@@ -5,6 +5,7 @@ import (
 	"net/http"
 )
 
+// responsesRequest is the part of a Responses request the provider reads.
 type responsesRequest struct {
 	Model        string          `json:"model"`
 	Instructions string          `json:"instructions"`
@@ -26,6 +27,7 @@ type inputItem struct {
 	Output    string  `json:"output"`
 }
 
+// prompt reduces r to what a Match sees.
 func (r responsesRequest) prompt() (Prompt, error) {
 	p := Prompt{Endpoint: Responses, Model: r.Model}
 	if r.Instructions != "" {
@@ -59,12 +61,14 @@ func (r responsesRequest) prompt() (Prompt, error) {
 	return p, nil
 }
 
+// outputText is the text part of an output message.
 type outputText struct {
 	Type        string `json:"type"`
 	Text        string `json:"text"`
 	Annotations []any  `json:"annotations"`
 }
 
+// outputItem is an output message or function call.
 type outputItem struct {
 	Type      string       `json:"type"`
 	ID        string       `json:"id"`
@@ -76,12 +80,15 @@ type outputItem struct {
 	Arguments *string      `json:"arguments,omitempty"`
 }
 
+// responsesUsage is Responses token accounting.
 type responsesUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
 	TotalTokens  int `json:"total_tokens"`
 }
 
+// responseObject is a whole response, as answered or as carried by
+// response.created and response.completed.
 type responseObject struct {
 	ID        string          `json:"id"`
 	Object    string          `json:"object"`
@@ -92,6 +99,7 @@ type responseObject struct {
 	Usage     *responsesUsage `json:"usage"`
 }
 
+// responses answers POST /v1/responses.
 func (p *Provider) responses(w http.ResponseWriter, body []byte) (int, any) {
 	var req responsesRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -109,7 +117,7 @@ func (p *Provider) responses(w http.ResponseWriter, body []byte) (int, any) {
 
 	resp := responseObject{
 		ID: p.nextID("resp"), Object: "response", CreatedAt: created, Status: "completed", Model: req.Model,
-		Usage: &responsesUsage{InputTokens: reply.Usage.Input, OutputTokens: reply.Usage.Output, TotalTokens: reply.Usage.Input + reply.Usage.Output},
+		Usage: &responsesUsage{InputTokens: reply.Usage.Input, OutputTokens: reply.Usage.Output, TotalTokens: reply.Usage.total()},
 	}
 	if reply.Text != "" {
 		resp.Output = append(resp.Output, outputItem{

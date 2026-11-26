@@ -1,7 +1,8 @@
 // Package fakeprovider is an OpenAI-compatible model provider for tests. It
 // serves Chat Completions, Responses, embeddings and rerank over real HTTP,
 // so Trelis's model clients are exercised end to end, and it answers
-// deterministically: the same request always gets the same answer.
+// deterministically: the same request always gets the same content. Only
+// response and tool call ids are counters, so they depend on request order.
 //
 // Chat Completions and Responses share one script. A test registers
 // [Provider.Reply] rules; each request gets the reply of the first rule
@@ -51,11 +52,13 @@ type Provider struct {
 	seq      int
 }
 
+// rule is one Reply registration.
 type rule struct {
 	match Match
 	reply Reply
 }
 
+// failure is n queued answers with status.
 type failure struct {
 	status int
 	n      int
@@ -195,13 +198,20 @@ type errorBody struct {
 	} `json:"error"`
 }
 
-func writeError(w http.ResponseWriter, status int, msg string) {
+// newError is an error body with msg and typ.
+func newError(msg, typ string) errorBody {
 	var b errorBody
-	b.Error.Message = msg
-	b.Error.Type = strings.ReplaceAll(strings.ToLower(http.StatusText(status)), " ", "_")
-	writeJSON(w, status, b)
+	b.Error.Message, b.Error.Type = msg, typ
+	return b
 }
 
+// writeError answers status with msg, typed after the status text
+// (too_many_requests, bad_gateway, ...).
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, newError(msg, strings.ReplaceAll(strings.ToLower(http.StatusText(status)), " ", "_")))
+}
+
+// writeJSON answers status with body as JSON.
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

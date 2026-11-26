@@ -79,6 +79,21 @@ func TestEmbeddingDimsComeFromTheRequestOrTheProvider(t *testing.T) {
 	}
 }
 
+func TestEmbeddingsCanBeBase64(t *testing.T) {
+	p := fakeprovider.New(t)
+	p.EmbedAs("x", []float32{1, -0.5})
+	_, raw := post(t, p, "/embeddings", map[string]any{"model": "emb", "input": "x", "encoding_format": "base64"})
+	got := decode[struct {
+		Data []struct {
+			Embedding string `json:"embedding"`
+		} `json:"data"`
+	}](t, raw)
+	// 1.0 and -0.5 as little-endian float32: 00 00 80 3f, 00 00 00 bf.
+	if len(got.Data) != 1 || got.Data[0].Embedding != "AACAPwAAAL8=" {
+		t.Errorf("embedding = %s, want AACAPwAAAL8=", raw)
+	}
+}
+
 func TestEmbedAsPinsAVector(t *testing.T) {
 	p := fakeprovider.New(t)
 	p.EmbedAs("tax", []float32{1, 0, 0})

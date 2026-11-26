@@ -13,7 +13,9 @@ type Prompt struct {
 	Model    string
 	// Messages are in request order. A Responses `instructions` string is a
 	// leading system Message; a tool result (a Chat Completions `tool`
-	// message or a Responses `function_call_output`) has Role "tool".
+	// message or a Responses `function_call_output`) has Role "tool", and
+	// each tool call carried back in the history is an assistant Message
+	// with the text "<name> <arguments>".
 	Messages []Message
 	// Tools are the names of the functions the request offers.
 	Tools []string
@@ -112,6 +114,8 @@ type Usage struct {
 	Input  int
 	Output int
 }
+
+func (u Usage) total() int { return u.Input + u.Output }
 
 // Text is a Reply that only says s.
 func Text(s string) Reply { return Reply{Text: s} }

@@ -12,6 +12,7 @@ type sse struct {
 	w http.ResponseWriter
 }
 
+// newSSE starts a 200 event stream on w.
 func newSSE(w http.ResponseWriter) sse {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")

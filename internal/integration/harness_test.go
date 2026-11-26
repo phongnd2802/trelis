@@ -44,11 +44,11 @@ const (
 // deps is what TestMain starts once for the whole package.
 var deps struct {
 	binary string
-	pgHost string
-	pgPort string
+	pg     hostPort
 	neo4j  hostPort
 }
 
+// hostPort is where a container port is reachable from the host.
 type hostPort struct{ host, port string }
 
 func TestMain(m *testing.M) {
@@ -105,26 +105,26 @@ func run(m *testing.M) (int, error) {
 		return 0, fmt.Errorf("start neo4j: %w", neo4jErr)
 	}
 
-	if deps.pgHost, deps.pgPort, err = endpoint(ctx, pg, "5432/tcp"); err != nil {
+	if deps.pg, err = endpoint(ctx, pg, "5432/tcp"); err != nil {
 		return 0, err
 	}
-	if deps.neo4j.host, deps.neo4j.port, err = endpoint(ctx, graph, "7687/tcp"); err != nil {
+	if deps.neo4j, err = endpoint(ctx, graph, "7687/tcp"); err != nil {
 		return 0, err
 	}
 	return m.Run(), nil
 }
 
 // endpoint is where port of c is reachable from the host.
-func endpoint(ctx context.Context, c testcontainers.Container, port string) (string, string, error) {
+func endpoint(ctx context.Context, c testcontainers.Container, port string) (hostPort, error) {
 	host, err := c.Host(ctx)
 	if err != nil {
-		return "", "", err
+		return hostPort{}, err
 	}
 	mapped, err := c.MappedPort(ctx, port)
 	if err != nil {
-		return "", "", err
+		return hostPort{}, err
 	}
-	return host, mapped.Port(), nil
+	return hostPort{host: host, port: mapped.Port()}, nil
 }
 
 // trelis is one running Trelis process with its own Postgres database and
@@ -139,7 +139,9 @@ type trelis struct {
 	config   string
 }
 
-// listening matches the log line Trelis prints once it accepts requests.
+// listening matches the log line Trelis prints once it accepts requests
+// (the default slog text format). The port is only known from it, since
+// Trelis listens on 127.0.0.1:0.
 var listening = regexp.MustCompile(`trelis listening addr=(\S+)`)
 
 // start boots Trelis on a fresh, empty database and stops it when the test
@@ -167,7 +169,10 @@ func start(t *testing.T) *trelis {
 			line := sc.Text()
 			_, _ = fmt.Fprintln(&logs, line)
 			if m := listening.FindStringSubmatch(line); m != nil {
-				addr <- m[1]
+				select {
+				case addr <- m[1]:
+				default: // only the first one is read
+				}
 			}
 		}
 		_, _ = io.Copy(io.Discard, stderr)
@@ -206,7 +211,7 @@ func start(t *testing.T) *trelis {
 func freshDatabase(t *testing.T) string {
 	t.Helper()
 	ctx := context.Background()
-	conn, err := pgx.Connect(ctx, fmt.Sprintf("postgres://%s:%s@%s:%s/trelis?sslmode=disable", pgUser, pgPassword, deps.pgHost, deps.pgPort))
+	conn, err := pgx.Connect(ctx, fmt.Sprintf("postgres://%s:%s@%s:%s/trelis?sslmode=disable", pgUser, pgPassword, deps.pg.host, deps.pg.port))
 	if err != nil {
 		t.Fatalf("connect to postgres: %v", err)
 	}
@@ -245,7 +250,7 @@ temporal:
   host: 127.0.0.1
   port: 1
   namespace: default
-`, deps.pgHost, deps.pgPort, dbname, pgUser, pgPassword, deps.neo4j.host, deps.neo4j.port, neo4jPassword)
+`, deps.pg.host, deps.pg.port, dbname, pgUser, pgPassword, deps.neo4j.host, deps.neo4j.port, neo4jPassword)
 	path := filepath.Join(t.TempDir(), "trelis.yaml")
 	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
