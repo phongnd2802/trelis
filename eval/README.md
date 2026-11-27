@@ -7,10 +7,10 @@ Principal's API key, so every run exercises the same path a real client takes.
 It never imports Go code, reads Postgres or calls the admin CLI; results are
 versioned files, not server state.
 
-The current skeleton fetches the MultiHop-RAG Benchmark Corpus, ingests a
-subset as Documents, waits for ingest to finish, and reads and writes Golden
-Sets. Retrieval metrics, the record/replay proxy and stratified sampling come
-in later tickets.
+The harness fetches the MultiHop-RAG Benchmark Corpus, ingests a subset as
+Documents, waits for ingest to finish, reads and writes Golden Sets, and
+scores Ablation Runs under Retrieval Configs with Recall@5, Recall@10, MRR and
+nDCG@10. The record/replay proxy comes in a later ticket.
 
 Terms are the ones in [GLOSSARY.md](../GLOSSARY.md): Corpus, Benchmark
 Corpus, Document, Principal, Access List, Golden Set, Slice.
@@ -71,12 +71,13 @@ assumes the commands run from the repository root. From inside `eval/`, use
 `uv run trelis-eval ... --data-dir data/multihop-rag`.
 
 The ingest command loads the Benchmark Corpus, takes the first `--questions`
-Golden questions, includes every Benchmark Document they cite as evidence,
-adds `--extra-docs` deterministic distractors chosen with `--seed`, uploads
-each as a Document, and polls `GET /documents/{id}` until every Document is
-`completed` or `failed`, or `--timeout` seconds pass. It needs
-`models.embedding` configured on the Trelis side: without it, uploads parse
-but every Document fails with `no embedding model is configured`. It writes:
+Golden questions (or a stratified sample, see below), includes every Benchmark
+Document they cite as evidence, adds `--extra-docs` deterministic distractors
+chosen with `--seed`, uploads each as a Document, and polls
+`GET /documents/{id}` until every Document is `completed` or `failed`, or
+`--timeout` seconds pass. It needs `models.embedding` configured on the Trelis
+side: without it, uploads parse but every Document fails with
+`no embedding model is configured`. It writes:
 
 - `subset-golden.jsonl`: the Golden Set for the selected questions.
 - `manifest.jsonl`: one record per Benchmark Document, mapping `source_id`
@@ -94,6 +95,25 @@ Principal answers 409 with the earlier Document, recorded with
 `--groups` on a re-run does not change the existing Document's Access List:
 those fields apply only when the Document is first created.
 
+### Stratified subset
+
+`--sample stratified` allocates `--questions` across the questions'
+`question_type` Slices in proportion to the whole Benchmark Corpus, using the
+largest remainder method and then sampling each Slice with `--seed`. The
+default is `--sample first`, which keeps the earlier first-questions behaviour.
+
+For the full 2,556-question MultiHop-RAG set, 500 questions allocate as
+comparison 167, inference 160, temporal 114 and null 59:
+
+```sh
+uv run --project eval trelis-eval multihop ingest \
+  --sample stratified --questions 500 --seed 1
+```
+
+The written `subset-golden.jsonl` is the sample; the evidence Documents and
+`--extra-docs` distractors are selected exactly as for the first-questions
+subset.
+
 Other commands:
 
 ```sh
@@ -108,6 +128,40 @@ uv run --project eval trelis-eval golden validate eval/data/multihop-rag/subset-
 `--base-url` overrides the Trelis URL; without it the harness uses
 `TRELIS_BASE_URL`, then `http://localhost:8080`. The Golden Set format is
 documented in [docs/golden-set.md](docs/golden-set.md).
+
+## Run a retrieval ablation
+
+After an ingest has completed, score the subset Golden Set under one or more
+Retrieval Configs:
+
+```sh
+uv run --project eval trelis-eval retrieval run \
+  --golden eval/data/multihop-rag/subset-golden.jsonl \
+  --manifest eval/data/multihop-rag/manifest.jsonl
+```
+
+Pass `--config` more than once to compare configs in one command, for example
+`--config dense --config bm25+dense` once the server implements `bm25` (#33).
+Each value is Retrieval Techniques joined with `+`; techniques are sorted, so
+`dense+bm25` and `bm25+dense` are the same config, and that canonical name is
+also the results file name. The default is one `dense` config. `--top-k` must
+be between 10 and 100; the header records it, and MRR is MRR@top-k in effect.
+
+The command runs the configs one after another, writes
+`eval/runs/<run-id>/<config-name>.jsonl`, and prints one line per Ablation Run
+with `scored`/`skipped`/`error` counts, the four metric means and the p50/p95
+latency, followed by the file path. The run id defaults to a UTC timestamp
+`YYYYMMDDTHHMMSSZ` and is shared by every config of one command; `--run-id`
+fixes it. The command refuses to replace an existing results file, so a reused
+run id must be one that has not run yet.
+
+`recall@5`, `recall@10`, `mrr` and `ndcg@10` are Document-level, and the JSONL
+schema is documented in [docs/metrics.md](docs/metrics.md). `eval/runs/` is
+gitignored. The command exits 1 when a config aborted or scored no questions. A
+400 or 503 aborts that config at once (no file is written) and the command
+continues with the next one; any other request error is recorded on the
+question and excluded from the means, not scored as zero. Errors alone do not
+change the exit code.
 
 ## Tests
 

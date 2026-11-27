@@ -7,7 +7,12 @@ import httpx
 import pytest
 
 from trelis_eval.cli import main
-from trelis_eval.golden import load_golden_set
+from trelis_eval.golden import (
+    Evidence,
+    GoldenQuestion,
+    load_golden_set,
+    write_golden_set,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -249,3 +254,419 @@ def test_multihop_golden_writes_the_full_golden_set(tmp_path, capsys):
 
     assert len(load_golden_set(out)) == 4
     assert "4 Golden questions" in capsys.readouterr().out
+
+
+def test_multihop_ingest_stratified_uses_the_sample_and_its_evidence(tmp_path, monkeypatch, capsys):
+    server = IngestServer()
+
+    code, golden_out, manifest_out = run_ingest(
+        tmp_path,
+        monkeypatch,
+        httpx.MockTransport(server),
+        "--sample",
+        "stratified",
+    )
+
+    assert code == 0
+    golden = load_golden_set(golden_out)
+    assert [question.id for question in golden] == ["mhr-0000", "mhr-0001"]
+    manifest = [json.loads(line) for line in manifest_out.read_text(encoding="utf-8").splitlines()]
+    assert "https://example.com/alpha" in {record["source_id"] for record in manifest}
+    assert "https://example.com/beta" in {record["source_id"] for record in manifest}
+    assert "4" in capsys.readouterr().out
+
+
+def retrieval_question(question_id, source_ids):
+    return GoldenQuestion(
+        id=question_id,
+        question=f"Question {question_id}?",
+        expected_answer="An answer.",
+        evidence=tuple(Evidence(source_id=source_id, fact="f") for source_id in source_ids),
+        slices=("inference_query", "hops-1"),
+    )
+
+
+def retrieval_chunk(document_id, chunk_id):
+    return {
+        "chunk_id": chunk_id,
+        "document_id": document_id,
+        "seq": 0,
+        "content": "The retrieved content.",
+        "context_header": "# Header",
+        "score": 0.9,
+        "scores": {"dense": 0.9},
+    }
+
+
+class RetrievalServer:
+    """A MockTransport handler for POST /retrieve."""
+
+    def __init__(
+        self,
+        results_by_query,
+        *,
+        failing_queries=(),
+        failure_status=400,
+        trace=(),
+    ):
+        self.results_by_query = results_by_query
+        self.failing_queries = set(failing_queries)
+        self.failure_status = failure_status
+        self.trace = list(trace)
+        self.requests = []
+
+    def __call__(self, request):
+        body = json.loads(request.content)
+        self.requests.append(body)
+        if body["query"] in self.failing_queries:
+            code = 1010 if self.failure_status == 400 else 1000
+            return httpx.Response(
+                self.failure_status,
+                json={
+                    "success": False,
+                    "error": {"code": code, "message": "request failed", "details": None},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "results": self.results_by_query.get(body["query"], []),
+                    "trace": self.trace,
+                },
+            },
+        )
+
+
+def write_retrieval_inputs(tmp_path, questions, records):
+    golden_path = tmp_path / "golden.jsonl"
+    write_golden_set(golden_path, questions)
+    manifest_path = tmp_path / "manifest.jsonl"
+    manifest_path.write_text(
+        ("\n".join(json.dumps(record) for record in records) + "\n") if records else "",
+        encoding="utf-8",
+    )
+    return golden_path, manifest_path
+
+
+def completed_record(source_id, document_id):
+    return {
+        "source_id": source_id,
+        "document_id": document_id,
+        "file_name": "a.md",
+        "status": "completed",
+        "duplicate": False,
+        "error": "",
+    }
+
+
+def run_retrieval(tmp_path, monkeypatch, transport, *extra):
+    monkeypatch.setenv("TRELIS_API_KEY", "test-key")
+    monkeypatch.setenv("TRELIS_BASE_URL", "http://trelis.test")
+    questions = [
+        retrieval_question("mhr-0000", ["https://example.com/a"]),
+        retrieval_question("mhr-0001", ["https://example.com/a"]),
+    ]
+    golden_path, manifest_path = write_retrieval_inputs(
+        tmp_path,
+        questions,
+        [completed_record("https://example.com/a", "doc-a")],
+    )
+    out_dir = tmp_path / "runs"
+    code = main(
+        [
+            "retrieval",
+            "run",
+            "--golden",
+            str(golden_path),
+            "--manifest",
+            str(manifest_path),
+            "--out-dir",
+            str(out_dir),
+            "--run-id",
+            "20260101T000000Z",
+            *extra,
+        ],
+        transport=transport,
+    )
+    return code, out_dir
+
+
+def test_retrieval_run_writes_one_file_per_config_under_one_run_id(tmp_path, monkeypatch, capsys):
+    server = RetrievalServer(
+        {
+            "Question mhr-0000?": [retrieval_chunk("doc-a", "chunk-1")],
+            "Question mhr-0001?": [retrieval_chunk("doc-a", "chunk-2")],
+        }
+    )
+
+    code, out_dir = run_retrieval(
+        tmp_path,
+        monkeypatch,
+        httpx.MockTransport(server),
+        "--config",
+        "dense",
+        "--config",
+        "bm25+dense",
+    )
+
+    assert code == 0
+    run_dir = out_dir / "20260101T000000Z"
+    assert sorted(path.name for path in run_dir.iterdir()) == [
+        "bm25+dense.jsonl",
+        "dense.jsonl",
+    ]
+    lines = [
+        json.loads(line)
+        for line in (run_dir / "dense.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert lines[0]["run_id"] == "20260101T000000Z"
+    assert lines[0]["config"] == {"name": "dense", "techniques": ["dense"]}
+    assert lines[0]["golden_set"]["questions"] == 2
+    assert lines[-1]["counts"] == {"scored": 2, "skipped": 0, "error": 0}
+    assert "test-key" not in (run_dir / "dense.jsonl").read_text(encoding="utf-8")
+    output = capsys.readouterr().out
+    assert "dense: scored=2 skipped=0 error=0" in output
+    assert "bm25+dense: scored=2 skipped=0 error=0" in output
+    assert str(run_dir / "dense.jsonl") in output
+    assert str(run_dir / "bm25+dense.jsonl") in output
+
+
+def test_retrieval_run_defaults_to_one_dense_config(tmp_path, monkeypatch):
+    server = RetrievalServer(
+        {
+            "Question mhr-0000?": [retrieval_chunk("doc-a", "chunk-1")],
+            "Question mhr-0001?": [retrieval_chunk("doc-a", "chunk-2")],
+        }
+    )
+
+    code, out_dir = run_retrieval(tmp_path, monkeypatch, httpx.MockTransport(server))
+
+    assert code == 0
+    assert [path.name for path in (out_dir / "20260101T000000Z").iterdir()] == ["dense.jsonl"]
+
+
+def test_retrieval_run_rejects_bad_config_syntax_before_calling_trelis(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("TRELIS_API_KEY", "test-key")
+    golden_path, manifest_path = write_retrieval_inputs(
+        tmp_path,
+        [retrieval_question("mhr-0000", ["https://example.com/a"])],
+        [completed_record("https://example.com/a", "doc-a")],
+    )
+
+    def should_not_be_called(request):
+        pytest.fail("a malformed --config must fail before any request")
+
+    code = main(
+        [
+            "retrieval",
+            "run",
+            "--golden",
+            str(golden_path),
+            "--manifest",
+            str(manifest_path),
+            "--out-dir",
+            str(tmp_path / "runs"),
+            "--config",
+            "dense+",
+        ],
+        transport=httpx.MockTransport(should_not_be_called),
+    )
+
+    assert code == 1
+    assert "invalid retrieval config" in capsys.readouterr().err
+
+
+def test_retrieval_run_rejects_two_configs_with_the_same_canonical_name(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("TRELIS_API_KEY", "test-key")
+    golden_path, manifest_path = write_retrieval_inputs(
+        tmp_path,
+        [retrieval_question("mhr-0000", ["https://example.com/a"])],
+        [completed_record("https://example.com/a", "doc-a")],
+    )
+
+    def should_not_be_called(request):
+        pytest.fail("duplicate configs must fail before any request")
+
+    code = main(
+        [
+            "retrieval",
+            "run",
+            "--golden",
+            str(golden_path),
+            "--manifest",
+            str(manifest_path),
+            "--out-dir",
+            str(tmp_path / "runs"),
+            "--config",
+            "dense+bm25",
+            "--config",
+            "bm25+dense",
+        ],
+        transport=httpx.MockTransport(should_not_be_called),
+    )
+
+    assert code == 1
+    assert "more than once" in capsys.readouterr().err
+
+
+def test_retrieval_run_exits_one_when_no_question_was_scored(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("TRELIS_API_KEY", "test-key")
+    golden_path, manifest_path = write_retrieval_inputs(
+        tmp_path,
+        [
+            GoldenQuestion(
+                id="mhr-0000",
+                question="Unanswerable?",
+                expected_answer="Insufficient information.",
+                evidence=(),
+                slices=("null_query", "hops-0"),
+            )
+        ],
+        [],
+    )
+    out_dir = tmp_path / "runs"
+
+    def should_not_be_called(request):
+        pytest.fail("a null query needs no request")
+
+    code = main(
+        [
+            "retrieval",
+            "run",
+            "--golden",
+            str(golden_path),
+            "--manifest",
+            str(manifest_path),
+            "--out-dir",
+            str(out_dir),
+            "--run-id",
+            "run-1",
+        ],
+        transport=httpx.MockTransport(should_not_be_called),
+    )
+
+    assert code == 1
+    lines = [
+        json.loads(line)
+        for line in (out_dir / "run-1" / "dense.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert lines[1]["status"] == "skipped"
+    assert lines[-1]["counts"] == {"scored": 0, "skipped": 1, "error": 0}
+    assert "scored=0 skipped=1 error=0" in capsys.readouterr().out
+
+
+def test_retrieval_run_exits_zero_and_prints_the_first_question_error(
+    tmp_path, monkeypatch, capsys
+):
+    server = RetrievalServer(
+        {"Question mhr-0000?": [retrieval_chunk("doc-a", "chunk-1")]},
+        failing_queries={"Question mhr-0001?"},
+        failure_status=500,
+    )
+
+    code, out_dir = run_retrieval(tmp_path, monkeypatch, httpx.MockTransport(server))
+
+    assert code == 0
+    lines = [
+        json.loads(line)
+        for line in (out_dir / "20260101T000000Z" / "dense.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert lines[2]["status"] == "error"
+    assert "HTTP 500" in lines[2]["error"]
+    assert lines[-1]["counts"] == {"scored": 1, "skipped": 0, "error": 1}
+    output = capsys.readouterr().out
+    assert "error=1" in output
+    assert "first_error=" in output
+    assert "HTTP 500" in output
+
+
+@pytest.mark.parametrize("top_k", ["0", "9", "101"])
+def test_retrieval_run_requires_top_k_between_10_and_100(tmp_path, monkeypatch, capsys, top_k):
+    def should_not_be_called(request):
+        pytest.fail("an invalid top_k must fail before any request")
+
+    code, _ = run_retrieval(
+        tmp_path,
+        monkeypatch,
+        httpx.MockTransport(should_not_be_called),
+        "--top-k",
+        top_k,
+    )
+
+    assert code == 1
+    assert "between 10 and 100" in capsys.readouterr().err
+
+
+def test_retrieval_run_refuses_to_overwrite_an_existing_results_file(tmp_path, monkeypatch, capsys):
+    existing = tmp_path / "runs" / "20260101T000000Z" / "dense.jsonl"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("earlier run\n", encoding="utf-8")
+
+    def should_not_be_called(request):
+        pytest.fail("an existing results file must fail before any request")
+
+    code, _ = run_retrieval(
+        tmp_path,
+        monkeypatch,
+        httpx.MockTransport(should_not_be_called),
+    )
+
+    assert code == 1
+    assert str(existing) in capsys.readouterr().err
+    assert existing.read_text(encoding="utf-8") == "earlier run\n"
+
+
+def test_retrieval_run_aborts_one_config_and_continues_with_the_next(tmp_path, monkeypatch, capsys):
+    requests = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if "bm25" in body["retrieval_config"]["techniques"]:
+            return httpx.Response(
+                400,
+                json={
+                    "success": False,
+                    "error": {
+                        "code": 1010,
+                        "message": 'retrieval technique "bm25" is not implemented',
+                        "details": None,
+                    },
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "results": [retrieval_chunk("doc-a", f"chunk-{len(requests)}")],
+                    "trace": [],
+                },
+            },
+        )
+
+    code, out_dir = run_retrieval(
+        tmp_path,
+        monkeypatch,
+        httpx.MockTransport(handler),
+        "--config",
+        "bm25",
+        "--config",
+        "dense",
+    )
+
+    assert code == 1
+    run_dir = out_dir / "20260101T000000Z"
+    assert [path.name for path in run_dir.iterdir()] == ["dense.jsonl"]
+    output = capsys.readouterr().out
+    assert "config bm25: aborted:" in output
+    assert "dense: scored=2 skipped=0 error=0" in output
+    assert len(requests) == 3

@@ -1,9 +1,18 @@
 """Tests for the public HTTP API client, using MockTransport (no server)."""
 
+import json
+
 import httpx
 import pytest
 
-from trelis_eval.client import Document, TrelisClient, TrelisError
+from trelis_eval.client import (
+    Document,
+    RetrievalAnswer,
+    RetrievedChunk,
+    TraceStep,
+    TrelisClient,
+    TrelisError,
+)
 
 BASE_URL = "http://trelis.test"
 API_KEY = "test-key-never-logged"
@@ -167,3 +176,183 @@ def test_a_malformed_success_envelope_is_an_error():
 
     with pytest.raises(TrelisError, match="malformed response envelope"):
         make_client(handler).get_document("doc-1")
+
+
+def retrieval_data():
+    return {
+        "results": [
+            {
+                "chunk_id": "chunk-1",
+                "document_id": "doc-1",
+                "seq": 0,
+                "content": "The Alpha Mission launched in 2024.",
+                "context_header": "# Alpha Mission Launches",
+                "score": 0.75,
+                "scores": {"dense": 0.75},
+            },
+            {
+                "chunk_id": "chunk-2",
+                "document_id": "doc-2",
+                "seq": 3,
+                "content": "The Beta Probe returned in 2024.",
+                "context_header": "",
+                "score": 0.5,
+                "scores": {"dense": 0.5},
+            },
+        ],
+        "trace": [
+            {
+                "step": "embed_query",
+                "technique": "dense",
+                "duration_ms": 4,
+                "model": "text-embedding-3-small",
+            },
+            {"step": "search", "technique": "dense", "duration_ms": 6, "candidates": 2},
+        ],
+    }
+
+
+def test_retrieve_posts_the_query_top_k_and_techniques_and_parses_the_answer():
+    seen = {}
+
+    def handler(request):
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"success": True, "data": retrieval_data()})
+
+    answer = make_client(handler).retrieve("Which missions?", 5, ["dense", "bm25"])
+
+    assert seen == {
+        "method": "POST",
+        "url": f"{BASE_URL}/retrieve",
+        "body": {
+            "query": "Which missions?",
+            "top_k": 5,
+            "retrieval_config": {"techniques": ["dense", "bm25"]},
+        },
+    }
+    assert answer == RetrievalAnswer(
+        results=(
+            RetrievedChunk(
+                chunk_id="chunk-1",
+                document_id="doc-1",
+                seq=0,
+                content="The Alpha Mission launched in 2024.",
+                context_header="# Alpha Mission Launches",
+                score=0.75,
+                scores={"dense": 0.75},
+            ),
+            RetrievedChunk(
+                chunk_id="chunk-2",
+                document_id="doc-2",
+                seq=3,
+                content="The Beta Probe returned in 2024.",
+                context_header="",
+                score=0.5,
+                scores={"dense": 0.5},
+            ),
+        ),
+        trace=(
+            TraceStep(
+                step="embed_query",
+                technique="dense",
+                duration_ms=4,
+                model="text-embedding-3-small",
+                candidates=None,
+            ),
+            TraceStep(
+                step="search",
+                technique="dense",
+                duration_ms=6,
+                model=None,
+                candidates=2,
+            ),
+        ),
+    )
+
+
+def test_retrieve_reports_an_unimplemented_technique_as_the_validation_error():
+    def handler(request):
+        return httpx.Response(
+            400,
+            json={
+                "success": False,
+                "error": {
+                    "code": 1010,
+                    "message": 'retrieval technique "bm25" is not implemented',
+                    "details": None,
+                },
+            },
+        )
+
+    with pytest.raises(TrelisError) as caught:
+        make_client(handler).retrieve("Which?", 10, ["bm25"])
+
+    assert caught.value.status == 400
+    assert caught.value.code == 1010
+    assert "bm25" in caught.value.message
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"results": "nope", "trace": []},
+        {"results": [{"chunk_id": 1}], "trace": []},
+        {
+            "results": [
+                {
+                    "chunk_id": "chunk-1",
+                    "document_id": "doc-1",
+                    "seq": 0,
+                    "content": "text",
+                    "context_header": "",
+                    "score": "high",
+                    "scores": {},
+                }
+            ],
+            "trace": [],
+        },
+        {
+            "results": [
+                {
+                    "chunk_id": "chunk-1",
+                    "document_id": "doc-1",
+                    "seq": 0,
+                    "content": "text",
+                    "context_header": "",
+                    "score": 1.0,
+                    "scores": [],
+                }
+            ],
+            "trace": [],
+        },
+        {"results": [], "trace": [{"step": "search", "duration_ms": "slow"}]},
+    ],
+)
+def test_retrieve_rejects_a_malformed_answer(data):
+    def handler(request):
+        return httpx.Response(200, json={"success": True, "data": data})
+
+    with pytest.raises(TrelisError, match="malformed retrieval answer"):
+        make_client(handler).retrieve("Which?", 10, ["dense"])
+
+
+def test_retrieve_accepts_a_trace_step_without_optional_fields():
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "results": [],
+                    "trace": [{"step": "search", "duration_ms": 1}],
+                },
+            },
+        )
+
+    answer = make_client(handler).retrieve("Which?", 10, ["dense"])
+
+    assert answer.trace == (
+        TraceStep(step="search", technique=None, duration_ms=1, model=None, candidates=None),
+    )

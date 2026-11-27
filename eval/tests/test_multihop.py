@@ -1,6 +1,7 @@
 """Tests for the MultiHop-RAG loader, subset selection and upload bodies."""
 
 import json
+import random
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from trelis_eval.multihop import (
     load_corpus,
     load_questions,
     select_subset,
+    stratified_sample,
     to_golden_set,
 )
 
@@ -56,6 +58,125 @@ def test_load_questions_reads_evidence_and_a_null_query():
     ]
     assert questions[2].question_type == "null_query"
     assert questions[2].evidence == ()
+
+
+def make_stratified_pool(counts):
+    """Build one Golden question per count, in a stable id order."""
+    golden = []
+    index = 0
+    for question_type, count in counts.items():
+        for _ in range(count):
+            golden.append(
+                GoldenQuestion(
+                    id=f"q-{index:05d}",
+                    question=f"Question {index}?",
+                    expected_answer="A",
+                    evidence=(Evidence(source_id=f"https://example.com/{index}", fact="f"),),
+                    slices=(question_type, "hops-1"),
+                )
+            )
+            index += 1
+    return golden
+
+
+def question_types(questions):
+    return sorted(
+        slice_name
+        for question in questions
+        for slice_name in question.slices
+        if not slice_name.startswith("hops-")
+    )
+
+
+def test_stratified_sample_follows_the_multihop_rag_question_type_split():
+    # The published 2,556 questions split 856 / 816 / 583 / 301; the largest
+    # remainder method gives 167 / 160 / 114 / 59 for a 500-question sample.
+    golden = make_stratified_pool(
+        {
+            "comparison_query": 856,
+            "inference_query": 816,
+            "temporal_query": 583,
+            "null_query": 301,
+        }
+    )
+
+    sample = stratified_sample(golden, 500, seed=1)
+
+    assert len(sample) == 500
+    counts = {
+        name: question_types(sample).count(name)
+        for name in (
+            "comparison_query",
+            "inference_query",
+            "temporal_query",
+            "null_query",
+        )
+    }
+    assert counts == {
+        "comparison_query": 167,
+        "inference_query": 160,
+        "temporal_query": 114,
+        "null_query": 59,
+    }
+    assert [question.id for question in sample] == sorted(question.id for question in sample)
+
+
+def test_stratified_sample_breaks_remainder_ties_by_slice_name():
+    golden = make_stratified_pool({"d_type": 1, "b_type": 1, "a_type": 1, "c_type": 1})
+
+    sample = stratified_sample(golden, 2, seed=4)
+
+    assert question_types(sample) == ["a_type", "b_type"]
+
+
+def test_stratified_sample_is_deterministic_for_a_seed():
+    golden = make_stratified_pool({"comparison_query": 20, "inference_query": 20})
+
+    first = stratified_sample(golden, 10, seed=7)
+    second = stratified_sample(golden, 10, seed=7)
+
+    assert [question.id for question in first] == [question.id for question in second]
+    assert len({question.id for question in first}) == 10
+
+
+def test_stratified_sample_uses_one_random_stream_across_slices():
+    golden = make_stratified_pool({"a_type": 3, "b_type": 3})
+    rng = random.Random(5)
+    expected = rng.sample(["q-00000", "q-00001", "q-00002"], 2) + rng.sample(
+        ["q-00003", "q-00004", "q-00005"], 2
+    )
+
+    sample = stratified_sample(golden, 4, seed=5)
+
+    assert [question.id for question in sample] == sorted(expected)
+
+
+def test_stratified_sample_rejects_a_sample_larger_than_the_pool():
+    golden = make_stratified_pool({"comparison_query": 2, "inference_query": 1})
+
+    with pytest.raises(ValueError, match="only 3"):
+        stratified_sample(golden, 4, seed=1)
+
+
+def test_stratified_sample_rejects_a_question_without_one_question_type_slice():
+    no_type = GoldenQuestion(
+        id="q1",
+        question="Who?",
+        expected_answer="A",
+        evidence=(),
+        slices=("hops-0",),
+    )
+    two_types = replace(no_type, id="q2", slices=("comparison_query", "inference_query"))
+
+    for question in (no_type, two_types):
+        with pytest.raises(ValueError, match=question.id):
+            stratified_sample([question], 1, seed=1)
+
+
+def test_stratified_sample_of_zero_questions_is_empty():
+    golden = make_stratified_pool({"comparison_query": 1})
+
+    assert stratified_sample(golden, 0, seed=1) == []
 
 
 def test_load_corpus_names_the_file_index_and_field(tmp_path):
