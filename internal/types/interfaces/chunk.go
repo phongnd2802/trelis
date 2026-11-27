@@ -43,4 +43,13 @@ type ChunkSearcher interface {
 	// another model, are skipped because their vectors may not even share a
 	// dimension with the query's.
 	SearchDense(ctx context.Context, documentIDs []uuid.UUID, queryVector []float32, model string, topK int) ([]*types.ChunkMatch, error)
+
+	// SearchBM25 returns up to topK Chunks from any of documentIDs that match
+	// query, most relevant by pg_search's BM25 score first, ties broken by
+	// Chunk ID. The query is tokenized like the indexed text, so diacritics
+	// are optional and punctuation is only a separator; a query whose tokens
+	// match nothing returns an empty slice, not an error. documentIDs limits
+	// the search itself, so a Chunk of another Document never takes a top-K
+	// place.
+	SearchBM25(ctx context.Context, documentIDs []uuid.UUID, query string, topK int) ([]*types.ChunkMatch, error)
 }

@@ -24,7 +24,7 @@ func NewChunkRepository(store db.Store) interfaces.ChunkRepository {
 }
 
 // NewChunkSearcher returns the read side of the Chunk repository: the dense
-// search the retrieval service runs.
+// and BM25 searches the retrieval service runs.
 func NewChunkSearcher(store db.Store) interfaces.ChunkSearcher {
 	return &chunkRepository{store: store}
 }
@@ -134,18 +134,51 @@ func (r *chunkRepository) SearchDense(ctx context.Context, documentIDs []uuid.UU
 	}
 	matches := make([]*types.ChunkMatch, 0, len(rows))
 	for _, row := range rows {
-		matches = append(matches, &types.ChunkMatch{
-			Chunk: &types.Chunk{
-				ID:            row.ID,
-				DocumentID:    row.DocumentID,
-				Seq:           int(row.Seq),
-				Content:       row.Content,
-				ContextHeader: row.ContextHeader,
-			},
-			Score: row.Score,
-		})
+		matches = append(matches, newChunkMatch(row.ID, row.DocumentID, row.Seq,
+			row.Content, row.ContextHeader, row.Score))
 	}
 	return matches, nil
+}
+
+// SearchBM25 returns the Chunks of documentIDs that match query, most
+// relevant by pg_search's BM25 score first, ties broken by Chunk ID. The
+// readable-ID filter travels into the BM25 index query, so pg_search applies
+// it before its top-K: a Chunk the caller cannot read can neither come back
+// nor push a readable Chunk out of the answer (ADR-0004). The query is a
+// match-style query tokenized with the field, not a Tantivy query string, so
+// a caller's punctuation cannot error or change its meaning.
+func (r *chunkRepository) SearchBM25(ctx context.Context, documentIDs []uuid.UUID,
+	query string, topK int,
+) ([]*types.ChunkMatch, error) {
+	rows, err := r.store.Querier(ctx).SearchBM25Chunks(ctx, sqlc.SearchBM25ChunksParams{
+		DocumentIds: documentIDs,
+		Query:       query,
+		TopK:        int32(topK),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("search bm25 chunks of %d documents: %w", len(documentIDs), err)
+	}
+	matches := make([]*types.ChunkMatch, 0, len(rows))
+	for _, row := range rows {
+		matches = append(matches, newChunkMatch(row.ID, row.DocumentID, row.Seq,
+			row.Content, row.ContextHeader, row.Score))
+	}
+	return matches, nil
+}
+
+// newChunkMatch builds a match from the scalar fields the dense and BM25 rows
+// share; their generated row types differ but carry the same six columns.
+func newChunkMatch(id, documentID uuid.UUID, seq int32, content, contextHeader string, score float64) *types.ChunkMatch {
+	return &types.ChunkMatch{
+		Chunk: &types.Chunk{
+			ID:            id,
+			DocumentID:    documentID,
+			Seq:           int(seq),
+			Content:       content,
+			ContextHeader: contextHeader,
+		},
+		Score: score,
+	}
 }
 
 // vectorText renders vector in pgvector's text form, [0.1,0.2], which the

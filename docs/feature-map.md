@@ -27,13 +27,14 @@ Status: **done** (built, tested, reachable), **partial** (code exists but nothin
 | Duplicate upload detection (same caller, same content → 409 with the earlier Document) | done | `internal/application/service/document.go` | `POST /documents` | `internal/router/documents_test.go` | #20 |
 | Source Files in object storage, downloaded through Trelis | done | `internal/application/service/file/`, `migrations/00005_object_storage.sql` | `GET /documents/{id}/file`; `storage.s3.*` | `internal/router/download_test.go` | ADR-0006, #105 |
 | Figures (images taken out of a Document) | planned | — | — | — | #106 |
-| Access control end to end (every retrieval path filtered by the Access List, Leakage tests) | planned | — | — | — | #32 (the dense retrieval path already applies it), Week 5 (#6), #82 |
+| Access control end to end (every retrieval path filtered by the Access List, Leakage tests) | planned | — | — | — | #32 (the dense and BM25 retrieval paths already apply it), Week 5 (#6), #82 |
 
 ## Retrieval
 
 | Feature | Status | Where | Entry points | Tests | Decisions / issues |
 |---|---|---|---|---|---|
 | Dense retrieval-only: rank the caller's readable Chunks by cosine similarity, with a score per Retrieval Technique and a step trace | done | `internal/application/service/retrieval.go`, `internal/handler/retrieval.go`, `internal/types/retrieval.go`, `internal/application/repository/chunk.go`, `internal/application/repository/document.go`, `internal/db/queries/chunks.sql`, `internal/db/queries/documents.sql` | `POST /retrieve` | `internal/types/retrieval_test.go`, `internal/application/service/retrieval_test.go`, `internal/router/retrieve_test.go`, `internal/application/repository/chunk_test.go`, `internal/application/repository/document_test.go`, `internal/integration/retrieve_test.go` | ADR-0004, ADR-0007, #32 |
+| BM25 retrieval-only: rank the caller's readable Chunks by pg_search's BM25 score at Vietnamese syllable level, with a diacritics-free field so "thue tncn" finds "thuế TNCN"; no embedding model needed | done | `internal/application/service/retrieval.go`, `internal/handler/retrieval.go`, `internal/types/retrieval.go`, `internal/application/repository/chunk.go`, `internal/db/queries/chunks.sql`, `migrations/00008_bm25_chunks.sql` | `POST /retrieve` with `retrieval_config.techniques: ["bm25"]` | `internal/types/retrieval_test.go`, `internal/application/service/retrieval_test.go`, `internal/router/retrieve_test.go`, `internal/application/repository/chunk_test.go`, `internal/integration/retrieve_test.go` | ADR-0004, ADR-0007, [ADR-0009](adr/0009-bm25-over-a-shared-pg-search-index.md), #33 |
 
 ## Ingest
 
@@ -104,7 +105,7 @@ the admin CLI. Setup and the fetch → ingest walkthrough are in `eval/README.md
 
 One line per roadmap milestone (#1); the issues hold the detail.
 
-- **Retrieval** (hybrid BM25 + vector, RRF fusion, rerank, query techniques): dense retrieval-only is [done](#retrieval) (#32); the rest is Week 2 (#3), Week 3 (#4).
+- **Retrieval** (hybrid BM25 + vector, RRF fusion, rerank, query techniques): dense retrieval-only and BM25 alone are [done](#retrieval) (#32, #33); the rest is Week 2 (#3), Week 3 (#4).
 - **Pipeline Answer** with citations, generation graders: Week 3 (#4), #42.
 - **GraphRAG**: Extractions, cross-document Entity Resolution, Neo4j projection, graph read API: Week 4 (#5), ADR-0003, #56, #60, #61.
 - **Agent Answer, tools, MCP server**: Week 5 (#6), #66, #67, #69, #70.

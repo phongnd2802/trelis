@@ -19,3 +19,7 @@ Omnisc grants access per knowledge base (tenant roles owner/admin/contributor/vi
 - **Show the merged Wiki Page to anyone who can read at least one source.** Rejected: that is Leakage by construction.
 
 The rule we adopted makes the Wiki less useful to Principals with narrow access, and we accept that.
+
+## Corpus statistics
+
+BM25 ranks over one shared index, so a Restricted Document can shift a readable Chunk's score and ranking even though it is never returned; the side channel and its bounds are in ADR-0009.

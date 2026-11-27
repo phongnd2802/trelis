@@ -17,6 +17,10 @@ const (
 	// RetrievalTechniqueDense ranks Chunks by the cosine similarity between
 	// their embedding and the query's.
 	RetrievalTechniqueDense RetrievalTechnique = "dense"
+	// RetrievalTechniqueBM25 ranks Chunks by pg_search's BM25 score over their
+	// text at Vietnamese syllable level, plus a diacritics-free copy so a
+	// query typed without diacritics still matches.
+	RetrievalTechniqueBM25 RetrievalTechnique = "bm25"
 )
 
 // RetrievalTopKDefault is how many Chunks a request that leaves top_k out
@@ -33,7 +37,7 @@ const RetrievalQueryMaxRunes = 2000
 // KnownRetrievalTechniques returns the Retrieval Techniques this build
 // implements, in the order an error message names them.
 func KnownRetrievalTechniques() []RetrievalTechnique {
-	return []RetrievalTechnique{RetrievalTechniqueDense}
+	return []RetrievalTechnique{RetrievalTechniqueDense, RetrievalTechniqueBM25}
 }
 
 // Known reports whether this build implements the technique. A technique a
@@ -71,9 +75,11 @@ func DefaultRetrievalConfig() *RetrievalConfig {
 	return &RetrievalConfig{Techniques: []RetrievalTechnique{RetrievalTechniqueDense}}
 }
 
-// Validate rejects an empty list, a technique this build does not implement
-// and a technique listed twice. The message names the offending technique
-// and the ones a caller can use.
+// Validate rejects an empty list, a technique this build does not implement,
+// a technique listed twice and more than one technique. The message names the
+// offending technique and the ones a caller can use, except for the
+// more-than-one rule, which names no technique because every listed one is
+// valid on its own.
 func (c *RetrievalConfig) Validate() error {
 	if c == nil || len(c.Techniques) == 0 {
 		return fmt.Errorf("retrieval_config.techniques must name at least one technique (known techniques: %s)",
@@ -89,6 +95,11 @@ func (c *RetrievalConfig) Validate() error {
 			return fmt.Errorf("retrieval technique %q is listed more than once", technique)
 		}
 		seen[technique] = struct{}{}
+	}
+	if len(c.Techniques) > 1 {
+		// #34's RRF fusion runs several techniques in one request; until it
+		// lands, running two would need a way to combine their scores here.
+		return fmt.Errorf("only one retrieval technique per request is supported until fusion lands")
 	}
 	return nil
 }

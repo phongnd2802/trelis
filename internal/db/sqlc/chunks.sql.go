@@ -112,6 +112,82 @@ func (q *Queries) ListUnembeddedChunksByDocument(ctx context.Context, arg ListUn
 	return items, nil
 }
 
+const searchBM25Chunks = `-- name: SearchBM25Chunks :many
+SELECT id, document_id, seq, content, context_header, score::float8 AS score
+FROM (
+    SELECT chunks.id, chunks.document_id, chunks.seq, chunks.content, chunks.context_header,
+           pdb.score(chunks) AS score
+    FROM chunks
+    WHERE chunks.document_id = ANY($1::uuid[])
+      AND ((chunks.context_header || E'\n\n' || chunks.content)::pdb.alias('chunk_text') ||| $2::text
+        OR (chunks.context_header || E'\n\n' || chunks.content)::pdb.alias('chunk_text_folded') ||| $2::text)
+    ORDER BY pdb.score(chunks) DESC, chunks.id
+    LIMIT $3
+) ranked
+ORDER BY score DESC, id
+`
+
+type SearchBM25ChunksParams struct {
+	DocumentIds []uuid.UUID
+	Query       string
+	TopK        int32
+}
+
+type SearchBM25ChunksRow struct {
+	ID            uuid.UUID
+	DocumentID    uuid.UUID
+	Seq           int32
+	Content       string
+	ContextHeader string
+	Score         float64
+}
+
+// BM25 retrieval: rank the Chunks of the readable Documents by pg_search's
+// BM25 score over the text dense embeds, ContextHeader + "\n\n" + Content.
+// The index has that text twice, exact and ASCII-folded, so a query typed
+// without diacritics ("thue tncn") matches "thuế TNCN" and one typed with
+// diacritics matches the exact field.
+//
+// The readable-ID filter is indexed and stays in the scan: pg_search pushes
+// it into the Tantivy query before the top-K, so a Chunk the caller cannot
+// read neither comes back nor takes a readable Chunk's place (ADR-0004).
+//
+// ||| is a match-disjunction query, not the Tantivy query-string parser: it
+// tokenizes the query like the field, so punctuation in a caller's query is
+// only a separator and cannot error or change its meaning.
+//
+// The text expression below must stay identical to the index's expression in
+// migrations/00008_bm25_chunks.sql: pg_search only uses the index when it
+// matches exactly. It must also stay identical to the text ingest embeds,
+// ContextHeader + "\n\n" + Content (chunkText in
+// internal/application/service/ingest.go).
+func (q *Queries) SearchBM25Chunks(ctx context.Context, arg SearchBM25ChunksParams) ([]SearchBM25ChunksRow, error) {
+	rows, err := q.db.Query(ctx, searchBM25Chunks, arg.DocumentIds, arg.Query, arg.TopK)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SearchBM25ChunksRow
+	for rows.Next() {
+		var i SearchBM25ChunksRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.DocumentID,
+			&i.Seq,
+			&i.Content,
+			&i.ContextHeader,
+			&i.Score,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const searchDenseChunks = `-- name: SearchDenseChunks :many
 WITH query_vec AS MATERIALIZED (SELECT $4::text::vector AS embedding)
 SELECT id, document_id, seq, content, context_header, score

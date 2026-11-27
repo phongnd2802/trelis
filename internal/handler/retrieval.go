@@ -39,18 +39,18 @@ func NewRetrievalHandler(service interfaces.RetrievalService) *RetrievalHandler 
 // never a 404, so the answer reveals nothing about what exists.
 //
 //	@Summary		Retrieve Chunks for a query
-//	@Description	Runs the Retrieval Techniques named in retrieval_config (dense today) over the Documents the caller can read and returns the ranked Chunks with per-technique scores and a step trace. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values and unknown techniques are 400; a body over 64 KiB is 413; without models.embedding, dense retrieval is 503.
+//	@Description	Runs the Retrieval Technique named in retrieval_config (dense or bm25) over the Documents the caller can read and returns the ranked Chunks with per-technique scores and a step trace. A bm25 request needs no embedding model. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values, unknown techniques and more than one technique are 400; a body over 64 KiB is 413; without models.embedding, dense retrieval is 503.
 //	@Tags			retrieval
 //	@Accept			json
 //	@Produce		json
 //	@Security		bearerAuth
 //	@Param			request	body		types.RetrievalRequest	true	"The query, how many Chunks to return and which Retrieval Techniques to run"
 //	@Success		200		{object}	handler.DataResponse{data=types.RetrievalResult}
-//	@Failure		400		{object}	handler.ErrorResponse	"Body that is not one JSON object, an unknown field or wrong value type, a blank or too-long query, an out-of-range top_k or an invalid retrieval_config"
+//	@Failure		400		{object}	handler.ErrorResponse	"Body that is not one JSON object, an unknown field or wrong value type, a blank or too-long query, an out-of-range top_k or an invalid retrieval_config (an unknown technique or more than one)"
 //	@Failure		401		{object}	router.ErrorResponse	"Missing or invalid API key"
 //	@Failure		413		{object}	handler.ErrorResponse	"Request body larger than 64 KiB"
 //	@Failure		500		{object}	handler.ErrorResponse	"Internal server error; a failed API key check answers the router's error body instead"
-//	@Failure		503		{object}	handler.ErrorResponse	"models.embedding is not configured, so dense retrieval is unavailable"
+//	@Failure		503		{object}	handler.ErrorResponse	"models.embedding is not configured, so dense retrieval is unavailable (bm25 still works)"
 //	@Router			/retrieve [post]
 func (h *RetrievalHandler) Retrieve(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, retrievalBodyLimit)

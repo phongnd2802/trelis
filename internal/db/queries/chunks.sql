@@ -59,3 +59,36 @@ FROM (
 WHERE score <> 'NaN'::float8
 ORDER BY score DESC, id
 LIMIT sqlc.arg(top_k);
+
+-- BM25 retrieval: rank the Chunks of the readable Documents by pg_search's
+-- BM25 score over the text dense embeds, ContextHeader + "\n\n" + Content.
+-- The index has that text twice, exact and ASCII-folded, so a query typed
+-- without diacritics ("thue tncn") matches "thuế TNCN" and one typed with
+-- diacritics matches the exact field.
+--
+-- The readable-ID filter is indexed and stays in the scan: pg_search pushes
+-- it into the Tantivy query before the top-K, so a Chunk the caller cannot
+-- read neither comes back nor takes a readable Chunk's place (ADR-0004).
+--
+-- ||| is a match-disjunction query, not the Tantivy query-string parser: it
+-- tokenizes the query like the field, so punctuation in a caller's query is
+-- only a separator and cannot error or change its meaning.
+--
+-- The text expression below must stay identical to the index's expression in
+-- migrations/00008_bm25_chunks.sql: pg_search only uses the index when it
+-- matches exactly. It must also stay identical to the text ingest embeds,
+-- ContextHeader + "\n\n" + Content (chunkText in
+-- internal/application/service/ingest.go).
+-- name: SearchBM25Chunks :many
+SELECT id, document_id, seq, content, context_header, score::float8 AS score
+FROM (
+    SELECT chunks.id, chunks.document_id, chunks.seq, chunks.content, chunks.context_header,
+           pdb.score(chunks) AS score
+    FROM chunks
+    WHERE chunks.document_id = ANY(sqlc.arg(document_ids)::uuid[])
+      AND ((chunks.context_header || E'\n\n' || chunks.content)::pdb.alias('chunk_text') ||| sqlc.arg(query)::text
+        OR (chunks.context_header || E'\n\n' || chunks.content)::pdb.alias('chunk_text_folded') ||| sqlc.arg(query)::text)
+    ORDER BY pdb.score(chunks) DESC, chunks.id
+    LIMIT sqlc.arg(top_k)
+) ranked
+ORDER BY score DESC, id;
