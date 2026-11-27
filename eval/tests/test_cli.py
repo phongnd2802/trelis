@@ -763,3 +763,19 @@ def test_retrieval_run_rejects_bad_timeout_or_concurrency(
         run_retrieval(tmp_path, monkeypatch, httpx.MockTransport(should_not_be_called), flag, value)
 
     assert caught.value.code == 2
+
+
+def test_retrieval_run_prints_per_step_latencies(tmp_path, monkeypatch, capsys):
+    trace = [
+        {"step": "embed_query", "technique": "dense", "duration_ms": 4, "model": "m"},
+        {"step": "search", "technique": "dense", "duration_ms": 19000, "candidates": 1},
+    ]
+    server = RetrievalServer({}, trace=trace)
+
+    code, _ = run_retrieval(tmp_path, monkeypatch, httpx.MockTransport(server))
+
+    assert code == 0
+    output = capsys.readouterr().out
+    assert (
+        "steps: dense/embed_query p50=4ms p95=4ms, dense/search p50=19000ms p95=19000ms" in output
+    )

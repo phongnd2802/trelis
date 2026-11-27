@@ -154,6 +154,10 @@ slow answer from becoming a question error, and `--concurrency N` (default 1,
 at most 32) keeps N questions in flight to cut the wall-clock time. The header
 records the concurrency because latency is measured under it.
 
+Under each summary line, `steps:` gives the p50/p95 of every `/retrieve` trace
+step (for example `dense/embed_query` and `dense/search`), so a slow run shows
+which step is slow rather than only the request total.
+
 The command runs the configs one after another, writes
 `eval/runs/<run-id>/<config-name>.jsonl`, and prints one line per Ablation Run
 with `scored`/`skipped`/`error` counts, the four metric means and the p50/p95

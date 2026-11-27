@@ -26,6 +26,7 @@ from .ablation_run import (
     load_manifest,
     parse_retrieval_config,
     run_ablation,
+    step_latencies,
     write_ablation_run,
 )
 from .client import TrelisClient, TrelisError
@@ -430,6 +431,12 @@ def _print_retrieval_summary(run: AblationRun, path: Path) -> None:
     if first_error is not None:
         line += f" first_error={first_error!r}"
     print(line)
+    steps = step_latencies(run)
+    if steps:
+        print(
+            "  steps: "
+            + ", ".join(f"{name} p50={p50}ms p95={p95}ms" for name, (p50, p95) in steps.items())
+        )
     print(f"  -> {path}")
 
 
