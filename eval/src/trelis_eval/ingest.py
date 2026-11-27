@@ -99,9 +99,7 @@ def ingest(
                 record.error = str(exc)
                 continue
             record.status = IngestStatus(document.parse_status)
-            record.error = (
-                document.parse_error if record.status == IngestStatus.FAILED else ""
-            )
+            record.error = document.parse_error if record.status == IngestStatus.FAILED else ""
             if record.status in (IngestStatus.COMPLETED, IngestStatus.FAILED):
                 pending.remove(record)
         if not pending:

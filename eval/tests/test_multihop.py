@@ -257,7 +257,9 @@ def test_fetch_downloads_missing_files_and_skips_present_ones(tmp_path):
     first = fetch(tmp_path, client=client)
     second = fetch(
         tmp_path,
-        client=httpx.Client(transport=httpx.MockTransport(lambda request: pytest.fail("fetched twice"))),
+        client=httpx.Client(
+            transport=httpx.MockTransport(lambda request: pytest.fail("fetched twice"))
+        ),
     )
 
     assert [path.name for path in first] == ["corpus.json", "MultiHopRAG.json"]

@@ -19,9 +19,7 @@ DATA_BASE_URL = "https://huggingface.co/datasets/yixuantt/MultiHopRAG/resolve/ma
 """Where the published MultiHop-RAG Benchmark Corpus lives."""
 
 _DATA_FILES = ("corpus.json", "MultiHopRAG.json")
-_QUESTION_TYPES = frozenset(
-    {"inference_query", "comparison_query", "temporal_query", "null_query"}
-)
+_QUESTION_TYPES = frozenset({"inference_query", "comparison_query", "temporal_query", "null_query"})
 
 
 class MultiHopDataError(ValueError):
@@ -96,8 +94,9 @@ def load_corpus(path: str | Path) -> list[BenchmarkDocument]:
             raise MultiHopDataError(f"{where}: expected a JSON object")
         source_id = _required_string(item, "url", where)
         if source_id in first_document_by_url:
+            first = first_document_by_url[source_id]
             raise MultiHopDataError(
-                f"{where}: duplicate url {source_id!r} (first at document {first_document_by_url[source_id]})"
+                f"{where}: duplicate url {source_id!r} (first at document {first})"
             )
         first_document_by_url[source_id] = index
         documents.append(
@@ -172,9 +171,7 @@ def select_subset(
 
     selected_questions = list(golden[:questions])
     wanted = {
-        evidence.source_id
-        for question in selected_questions
-        for evidence in question.evidence
+        evidence.source_id for question in selected_questions for evidence in question.evidence
     }
     by_source_id = {document.source_id: document for document in documents}
     missing = sorted(wanted - set(by_source_id))
@@ -270,7 +267,9 @@ def _question_type(item: dict[str, Any], where: str) -> str | None:
     return value
 
 
-def _load_evidence(item: dict[str, Any], path: Path, question_index: int) -> tuple[EvidenceFact, ...]:
+def _load_evidence(
+    item: dict[str, Any], path: Path, question_index: int
+) -> tuple[EvidenceFact, ...]:
     """Validate one question's evidence_list, which may be empty."""
     where = f"{path}: question {question_index}"
     if "evidence_list" not in item:

@@ -1,4 +1,4 @@
-.PHONY: help tools sqlc swagger anydoc-lib build build-lite dev test test-linked test-integration test-integration-linked vet vet-lite vet-linked lint lint-linked eval-test stack-up dev-up dev-down clean
+.PHONY: help tools sqlc swagger anydoc-lib build build-lite dev test test-linked test-integration test-integration-linked vet vet-lite vet-linked lint lint-linked eval-lint eval-test stack-up dev-up dev-down clean
 
 BIN_DIR := bin
 BINARY  := $(BIN_DIR)/trelis
@@ -15,6 +15,7 @@ help:
 	@echo "  dev          go run ./cmd/server with anydoc linked (ARGS=... passes flags)"
 	@echo "  test         unit tests that need no archive"
 	@echo "  test-linked  full tests against the linked anydoc archive"
+	@echo "  eval-lint    ruff lint and format check of the eval harness (needs uv)"
 	@echo "  eval-test    eval harness tests (cd eval && uv run pytest; needs uv)"
 	@echo "  test-integration  HTTP API tests against Postgres, Neo4j, silo (S3) and Temporal in testcontainers (needs Docker)"
 	@echo "  test-integration-linked  the same with the anydoc engine linked (needs anydoc-lib)"
@@ -54,6 +55,10 @@ test-linked:
 	CGO_ENABLED=1 go test -tags anydoc ./...
 
 # The external Python eval harness (eval/, ADR-0001); no Go build needed.
+# Kept out of lint/test so the Go jobs need no uv; CI runs both in its eval job.
+eval-lint:
+	cd eval && uv run ruff check . && uv run ruff format --check .
+
 eval-test:
 	cd eval && uv run pytest
 

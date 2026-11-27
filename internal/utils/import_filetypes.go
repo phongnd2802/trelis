@@ -8,7 +8,6 @@ package utils
 
 import (
 	"github.com/phongnd2802/trelis/internal/parser"
-	"github.com/phongnd2802/trelis/internal/parser/anydoc"
 )
 
 // NormalizeImportExtension lowercases an extension and strips surrounding
@@ -19,15 +18,9 @@ func NormalizeImportExtension(ext string) string {
 }
 
 // IsSupportedImportExtension reports whether a bare extension can be
-// uploaded: plain text, or a format anydoc converts (whether or not the
-// binding is linked into this build, so the answer is the same everywhere).
+// uploaded: exactly the types ingest can parse (parser.SupportedFileTypes),
+// whether or not the anydoc binding is linked into this build, so the answer
+// is the same everywhere.
 func IsSupportedImportExtension(ext string) bool {
-	ext = NormalizeImportExtension(ext)
-	if ext == "" {
-		return false
-	}
-	if parser.IsPlainTextFileType(ext) {
-		return true
-	}
-	return anydoc.Supports(ext, "")
+	return parser.SupportsFileType(ext)
 }

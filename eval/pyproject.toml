@@ -14,10 +14,21 @@ dependencies = ["httpx"]
 trelis-eval = "trelis_eval.cli:main"
 
 [dependency-groups]
-dev = ["pytest"]
+dev = [
+    "pytest",
+    "ruff>=0.17.6",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/trelis_eval"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# pyflakes/pycodestyle defaults, plus import order, bugbear and pyupgrade.
+select = ["E", "F", "W", "I", "B", "UP"]

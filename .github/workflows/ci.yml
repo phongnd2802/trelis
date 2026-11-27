@@ -98,6 +98,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
+      - name: Lint eval harness (ruff)
+        run: make eval-lint
       - name: Test eval harness
         run: cd eval && uv run pytest
 
