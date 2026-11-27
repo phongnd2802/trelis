@@ -2,6 +2,7 @@ package parser
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -76,5 +77,44 @@ func TestPlainTextParserRejectsContentThatCannotBeStored(t *testing.T) {
 				t.Errorf("Parse error = %q, want no file name or content", err)
 			}
 		})
+	}
+}
+
+// TestEveryUploadableFileTypeHasAParser guards the gap #38 found: POST
+// /documents accepted md and txt while ingest had no parser for them, so every
+// such Document failed. Each type upload accepts must reach a parser that
+// reads it; the content is garbage, so a conversion error is fine, but never
+// ErrUnsupportedFileType.
+func TestEveryUploadableFileTypeHasAParser(t *testing.T) {
+	fileTypes := SupportedFileTypes()
+	if len(fileTypes) == 0 {
+		t.Fatal("SupportedFileTypes is empty")
+	}
+	for _, ext := range fileTypes {
+		t.Run(ext, func(t *testing.T) {
+			if !SupportsFileType(ext) {
+				t.Errorf("SupportsFileType(%q) = false for a listed type", ext)
+			}
+			_, err := NewFormatRouter(false).Parse(context.Background(), &types.ParseRequest{
+				FileContent: []byte("not a real document"),
+				FileName:    "upload." + ext,
+				FileType:    ext,
+			})
+			if errors.Is(err, ErrUnsupportedFileType) {
+				t.Fatalf("Parse(%q) = %v: upload accepts this type but no parser reads it", ext, err)
+			}
+		})
+	}
+}
+
+func TestFormatRouterRejectsAnUnsupportedFileType(t *testing.T) {
+	if SupportsFileType("exe") {
+		t.Fatal(`SupportsFileType("exe") = true`)
+	}
+	_, err := NewFormatRouter(false).Parse(context.Background(), &types.ParseRequest{
+		FileContent: []byte("MZ"), FileName: "tool.exe", FileType: "exe",
+	})
+	if !errors.Is(err, ErrUnsupportedFileType) {
+		t.Fatalf("Parse(exe) error = %v, want ErrUnsupportedFileType", err)
 	}
 }

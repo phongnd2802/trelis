@@ -72,9 +72,8 @@ def load_golden_set(path: str | Path) -> list[GoldenQuestion]:
         if question is None:
             continue
         if question.id in first_line_by_id:
-            problems.append(
-                f"{where}: duplicate id {question.id!r} (first on line {first_line_by_id[question.id]})"
-            )
+            first_line = first_line_by_id[question.id]
+            problems.append(f"{where}: duplicate id {question.id!r} (first on line {first_line})")
             continue
         first_line_by_id[question.id] = line_number
         questions.append(question)
@@ -167,14 +166,21 @@ def _evidence_field(value: dict[str, Any], add: Callable[[str], None]) -> tuple[
             continue
         unknown = sorted(set(item) - set(_EVIDENCE_FIELDS))
         if unknown:
-            add(f"field {label!r} has unknown field(s): {', '.join(repr(name) for name in unknown)}")
+            add(
+                f"field {label!r} has unknown field(s): {', '.join(repr(name) for name in unknown)}"
+            )
         source_id = item.get("source_id")
         fact = item.get("fact")
         if not isinstance(source_id, str) or not source_id.strip():
             add(f"field {label!r} needs a non-empty 'source_id' string")
         if not isinstance(fact, str) or not fact.strip():
             add(f"field {label!r} needs a non-empty 'fact' string")
-        if isinstance(source_id, str) and source_id.strip() and isinstance(fact, str) and fact.strip():
+        if (
+            isinstance(source_id, str)
+            and source_id.strip()
+            and isinstance(fact, str)
+            and fact.strip()
+        ):
             evidence.append(Evidence(source_id=source_id, fact=fact))
     return tuple(evidence)
 

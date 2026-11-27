@@ -132,9 +132,7 @@ def _run_fetch(args: argparse.Namespace, transport: httpx.BaseTransport | None) 
     return 0
 
 
-def _run_multihop_golden(
-    args: argparse.Namespace, transport: httpx.BaseTransport | None
-) -> int:
+def _run_multihop_golden(args: argparse.Namespace, transport: httpx.BaseTransport | None) -> int:
     """Write the full MultiHop-RAG Golden Set as JSONL."""
     del transport
     questions = load_questions(args.data_dir / "MultiHopRAG.json")
@@ -144,9 +142,7 @@ def _run_multihop_golden(
     return 0
 
 
-def _run_golden_validate(
-    args: argparse.Namespace, transport: httpx.BaseTransport | None
-) -> int:
+def _run_golden_validate(args: argparse.Namespace, transport: httpx.BaseTransport | None) -> int:
     """Load a Golden Set with validation and print its Slice counts."""
     del transport
     questions = load_golden_set(args.path)

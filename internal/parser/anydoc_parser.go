@@ -20,7 +20,7 @@ type AnydocParser struct {
 func (r *AnydocParser) Parse(ctx context.Context, req *types.ParseRequest) (*types.ParseResult, error) {
 	format, ok := anydoc.FormatForFile(req.FileType, req.FileName)
 	if !ok {
-		return nil, fmt.Errorf("anydoc engine does not support file type %q", fileTypeOf(req))
+		return nil, fmt.Errorf("anydoc engine: %w %q", ErrUnsupportedFileType, fileTypeOf(req))
 	}
 
 	converted, err := anydoc.Convert(req.FileContent, anydoc.Options{

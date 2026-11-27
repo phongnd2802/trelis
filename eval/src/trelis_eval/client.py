@@ -6,8 +6,9 @@ one Principal with that Principal's API key, exactly as any other client does.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 from urllib.parse import quote
 
 import httpx

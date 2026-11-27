@@ -155,22 +155,15 @@ def run_ingest(tmp_path, monkeypatch, transport, *extra):
     return code, golden_out, manifest_out
 
 
-def test_multihop_ingest_writes_the_subset_golden_set_and_manifest(
-    tmp_path, monkeypatch, capsys
-):
+def test_multihop_ingest_writes_the_subset_golden_set_and_manifest(tmp_path, monkeypatch, capsys):
     server = IngestServer()
 
-    code, golden_out, manifest_out = run_ingest(
-        tmp_path, monkeypatch, httpx.MockTransport(server)
-    )
+    code, golden_out, manifest_out = run_ingest(tmp_path, monkeypatch, httpx.MockTransport(server))
 
     assert code == 0
     golden = load_golden_set(golden_out)
     assert [question.id for question in golden] == ["mhr-0000", "mhr-0001"]
-    manifest = [
-        json.loads(line)
-        for line in manifest_out.read_text(encoding="utf-8").splitlines()
-    ]
+    manifest = [json.loads(line) for line in manifest_out.read_text(encoding="utf-8").splitlines()]
     assert [record["source_id"] for record in manifest] == [
         "https://example.com/alpha",
         "https://example.com/beta",
@@ -193,15 +186,10 @@ def test_multihop_ingest_writes_the_subset_golden_set_and_manifest(
 def test_multihop_ingest_exits_one_when_a_document_fails(tmp_path, monkeypatch, capsys):
     server = IngestServer(final_status="failed")
 
-    code, _, manifest_out = run_ingest(
-        tmp_path, monkeypatch, httpx.MockTransport(server)
-    )
+    code, _, manifest_out = run_ingest(tmp_path, monkeypatch, httpx.MockTransport(server))
 
     assert code == 1
-    manifest = [
-        json.loads(line)
-        for line in manifest_out.read_text(encoding="utf-8").splitlines()
-    ]
+    manifest = [json.loads(line) for line in manifest_out.read_text(encoding="utf-8").splitlines()]
     assert {record["status"] for record in manifest} == {"failed"}
     assert {record["error"] for record in manifest} == {"parse: broken"}
     assert "failed=4" in capsys.readouterr().out
@@ -216,10 +204,7 @@ def test_multihop_ingest_writes_outputs_when_requests_fail(tmp_path, monkeypatch
 
     assert code == 1
     assert len(load_golden_set(golden_out)) == 2
-    manifest = [
-        json.loads(line)
-        for line in manifest_out.read_text(encoding="utf-8").splitlines()
-    ]
+    manifest = [json.loads(line) for line in manifest_out.read_text(encoding="utf-8").splitlines()]
     assert [record["status"] for record in manifest] == [
         "error",
         "timeout",

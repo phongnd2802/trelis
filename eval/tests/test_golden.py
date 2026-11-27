@@ -4,8 +4,13 @@ import json
 
 import pytest
 
-from trelis_eval.golden import GoldenQuestion, GoldenSetError, load_golden_set, write_golden_set
-from trelis_eval.golden import Evidence
+from trelis_eval.golden import (
+    Evidence,
+    GoldenQuestion,
+    GoldenSetError,
+    load_golden_set,
+    write_golden_set,
+)
 
 
 def write_lines(tmp_path, *lines):
@@ -68,12 +73,30 @@ def test_evidence_may_be_empty_and_principal_may_be_absent(tmp_path):
         "not json",
         "[]",
         json.dumps({"id": "q1", "question": "Who?", "expected_answer": "A", "evidence": []}),
-        json.dumps({"id": 1, "question": "Who?", "expected_answer": "A", "evidence": [], "slices": []}),
-        json.dumps({"id": "", "question": "Who?", "expected_answer": "A", "evidence": [], "slices": []}),
-        json.dumps({"id": "q1", "question": "  ", "expected_answer": "A", "evidence": [], "slices": []}),
-        json.dumps({"id": "q1", "question": "Who?", "expected_answer": 7, "evidence": [], "slices": []}),
-        json.dumps({"id": "q1", "question": "Who?", "expected_answer": "A", "evidence": {}, "slices": []}),
-        json.dumps({"id": "q1", "question": "Who?", "expected_answer": "A", "evidence": ["x"], "slices": []}),
+        json.dumps(
+            {"id": 1, "question": "Who?", "expected_answer": "A", "evidence": [], "slices": []}
+        ),
+        json.dumps(
+            {"id": "", "question": "Who?", "expected_answer": "A", "evidence": [], "slices": []}
+        ),
+        json.dumps(
+            {"id": "q1", "question": "  ", "expected_answer": "A", "evidence": [], "slices": []}
+        ),
+        json.dumps(
+            {"id": "q1", "question": "Who?", "expected_answer": 7, "evidence": [], "slices": []}
+        ),
+        json.dumps(
+            {"id": "q1", "question": "Who?", "expected_answer": "A", "evidence": {}, "slices": []}
+        ),
+        json.dumps(
+            {
+                "id": "q1",
+                "question": "Who?",
+                "expected_answer": "A",
+                "evidence": ["x"],
+                "slices": [],
+            }
+        ),
         json.dumps(
             {
                 "id": "q1",
@@ -101,9 +124,21 @@ def test_evidence_may_be_empty_and_principal_may_be_absent(tmp_path):
                 "slices": [],
             }
         ),
-        json.dumps({"id": "q1", "question": "Who?", "expected_answer": "A", "evidence": [], "slices": "hops-1"}),
-        json.dumps({"id": "q1", "question": "Who?", "expected_answer": "A", "evidence": [], "slices": [""]}),
-        json.dumps({"id": "q1", "question": "Who?", "expected_answer": "A", "evidence": [], "slices": [1]}),
+        json.dumps(
+            {
+                "id": "q1",
+                "question": "Who?",
+                "expected_answer": "A",
+                "evidence": [],
+                "slices": "hops-1",
+            }
+        ),
+        json.dumps(
+            {"id": "q1", "question": "Who?", "expected_answer": "A", "evidence": [], "slices": [""]}
+        ),
+        json.dumps(
+            {"id": "q1", "question": "Who?", "expected_answer": "A", "evidence": [], "slices": [1]}
+        ),
         json.dumps(
             {
                 "id": "q1",
