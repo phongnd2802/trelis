@@ -23,6 +23,9 @@ func TestRetrievalRequestValidateFillsTheDefaults(t *testing.T) {
 		req.RetrievalConfig.Techniques[0] != RetrievalTechniqueDense {
 		t.Errorf("retrieval_config = %+v, want dense alone", req.RetrievalConfig)
 	}
+	if req.RetrievalConfig.RRFK == nil || *req.RetrievalConfig.RRFK != RetrievalRRFKDefault {
+		t.Errorf("rrf_k = %v, want a pointer to the default %d", req.RetrievalConfig.RRFK, RetrievalRRFKDefault)
+	}
 }
 
 func TestRetrievalRequestValidateKeepsAConfiguredTechnique(t *testing.T) {
@@ -46,11 +49,7 @@ func TestRetrievalConfigValidateRejectsBadTechniqueLists(t *testing.T) {
 	}{
 		"empty":     {RetrievalConfig{}, []string{"at least one", "dense"}},
 		"duplicate": {RetrievalConfig{Techniques: []RetrievalTechnique{RetrievalTechniqueDense, RetrievalTechniqueDense}}, []string{"dense", "more than once"}},
-		"two techniques": {
-			RetrievalConfig{Techniques: []RetrievalTechnique{RetrievalTechniqueBM25, RetrievalTechniqueDense}},
-			[]string{"only one retrieval technique per request", "fusion"},
-		},
-		"unknown": {RetrievalConfig{Techniques: []RetrievalTechnique{"foo"}}, []string{"foo", "dense"}},
+		"unknown":   {RetrievalConfig{Techniques: []RetrievalTechnique{"foo"}}, []string{"foo", "dense"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := tc.config.Validate()
@@ -70,6 +69,37 @@ func TestRetrievalConfigValidateAcceptsBM25Alone(t *testing.T) {
 	config := RetrievalConfig{Techniques: []RetrievalTechnique{RetrievalTechniqueBM25}}
 	if err := config.Validate(); err != nil {
 		t.Fatalf("Validate(%+v) = %v, want bm25 accepted on its own", config, err)
+	}
+}
+
+func TestRetrievalConfigValidateAcceptsSeveralTechniques(t *testing.T) {
+	config := RetrievalConfig{Techniques: []RetrievalTechnique{RetrievalTechniqueBM25, RetrievalTechniqueDense}}
+	if err := config.Validate(); err != nil {
+		t.Fatalf("Validate(%+v) = %v, want bm25 and dense accepted together", config, err)
+	}
+	if config.RRFK == nil || *config.RRFK != RetrievalRRFKDefault {
+		t.Errorf("rrf_k = %v, want a pointer to the default %d", config.RRFK, RetrievalRRFKDefault)
+	}
+}
+
+func TestRetrievalConfigValidateChecksRRFK(t *testing.T) {
+	for _, k := range []int{0, -1, RetrievalRRFKMax + 1} {
+		config := RetrievalConfig{
+			Techniques: []RetrievalTechnique{RetrievalTechniqueBM25},
+			RRFK:       intPointer(k),
+		}
+		if err := config.Validate(); err == nil || !strings.Contains(err.Error(), "rrf_k") {
+			t.Errorf("rrf_k %d: Validate = %v, want an error naming rrf_k", k, err)
+		}
+	}
+	for _, k := range []int{1, RetrievalRRFKMax} {
+		config := RetrievalConfig{
+			Techniques: []RetrievalTechnique{RetrievalTechniqueBM25},
+			RRFK:       intPointer(k),
+		}
+		if err := config.Validate(); err != nil {
+			t.Errorf("rrf_k %d: Validate = %v, want it accepted", k, err)
+		}
 	}
 }
 

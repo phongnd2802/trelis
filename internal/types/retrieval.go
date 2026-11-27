@@ -23,12 +23,29 @@ const (
 	RetrievalTechniqueBM25 RetrievalTechnique = "bm25"
 )
 
+// RetrievalTechniqueRRF labels the step that fuses several techniques' lists
+// in a trace. It is not a technique a caller can switch on, so Known reports
+// false for it and KnownRetrievalTechniques leaves it out.
+const RetrievalTechniqueRRF RetrievalTechnique = "rrf"
+
 // RetrievalTopKDefault is how many Chunks a request that leaves top_k out
 // gets.
 const RetrievalTopKDefault = 10
 
 // RetrievalTopKMax is the largest top_k a request may ask for.
 const RetrievalTopKMax = 100
+
+// RetrievalRRFKDefault is the Reciprocal Rank Fusion constant k a request that
+// leaves rrf_k out gets.
+const RetrievalRRFKDefault = 60
+
+// RetrievalRRFKMax is the largest rrf_k a request may ask for.
+const RetrievalRRFKMax = 1000
+
+// RetrievalFusionCandidates is how many candidates each technique fetches
+// before fusion when a request runs more than one technique. A Chunk that
+// every list places low can still reach the fused top_k that way.
+const RetrievalFusionCandidates = 50
 
 // RetrievalQueryMaxRunes is the longest query a request may carry, in runes.
 // It keeps an arbitrary string out of a paid embedding call.
@@ -65,21 +82,30 @@ func knownTechniqueList() string {
 // together (GLOSSARY.md).
 type RetrievalConfig struct {
 	// Techniques is the set of Retrieval Techniques to run, without
-	// duplicates.
+	// duplicates. More than one makes the request a fusion: each runs over
+	// the readable Documents and their lists are combined with Reciprocal
+	// Rank Fusion.
 	Techniques []RetrievalTechnique `json:"techniques"`
+	// RRFK is the Reciprocal Rank Fusion constant k; nil means the default.
+	// It only affects a request that runs more than one technique, so it is
+	// accepted and ignored for a single one.
+	RRFK *int `json:"rrf_k,omitempty"`
 }
 
 // DefaultRetrievalConfig returns the config a request that leaves it out
 // gets: dense alone.
 func DefaultRetrievalConfig() *RetrievalConfig {
-	return &RetrievalConfig{Techniques: []RetrievalTechnique{RetrievalTechniqueDense}}
+	rrfK := RetrievalRRFKDefault
+	return &RetrievalConfig{
+		Techniques: []RetrievalTechnique{RetrievalTechniqueDense},
+		RRFK:       &rrfK,
+	}
 }
 
 // Validate rejects an empty list, a technique this build does not implement,
-// a technique listed twice and more than one technique. The message names the
-// offending technique and the ones a caller can use, except for the
-// more-than-one rule, which names no technique because every listed one is
-// valid on its own.
+// a technique listed twice and an rrf_k outside 1..RetrievalRRFKMax. It fills
+// an omitted rrf_k with RetrievalRRFKDefault. The messages are fit for the
+// client.
 func (c *RetrievalConfig) Validate() error {
 	if c == nil || len(c.Techniques) == 0 {
 		return fmt.Errorf("retrieval_config.techniques must name at least one technique (known techniques: %s)",
@@ -96,10 +122,12 @@ func (c *RetrievalConfig) Validate() error {
 		}
 		seen[technique] = struct{}{}
 	}
-	if len(c.Techniques) > 1 {
-		// #34's RRF fusion runs several techniques in one request; until it
-		// lands, running two would need a way to combine their scores here.
-		return fmt.Errorf("only one retrieval technique per request is supported until fusion lands")
+	if c.RRFK == nil {
+		rrfK := RetrievalRRFKDefault
+		c.RRFK = &rrfK
+	}
+	if *c.RRFK < 1 || *c.RRFK > RetrievalRRFKMax {
+		return fmt.Errorf("retrieval_config.rrf_k must be between 1 and %d", RetrievalRRFKMax)
 	}
 	return nil
 }
@@ -150,7 +178,8 @@ type ChunkMatch struct {
 }
 
 // RetrievedChunk is one Chunk in the answer to POST /retrieve, with the
-// final score that orders the results and the score each technique gave it.
+// final score that orders the results and, for every technique whose list
+// carried it, that technique's own score and 1-based rank.
 type RetrievedChunk struct {
 	ChunkID       uuid.UUID                      `json:"chunk_id"`
 	DocumentID    uuid.UUID                      `json:"document_id"`
@@ -159,6 +188,7 @@ type RetrievedChunk struct {
 	ContextHeader string                         `json:"context_header"`
 	Score         float64                        `json:"score"`
 	Scores        map[RetrievalTechnique]float64 `json:"scores"`
+	Ranks         map[RetrievalTechnique]int     `json:"ranks"`
 }
 
 // The steps a retrieval run records in its trace.
@@ -167,6 +197,9 @@ const (
 	TraceStepEmbedQuery = "embed_query"
 	// TraceStepSearch searches the Chunks of the readable Documents.
 	TraceStepSearch = "search"
+	// TraceStepFuse combines the techniques' ranked lists with Reciprocal
+	// Rank Fusion.
+	TraceStepFuse = "fuse"
 )
 
 // TraceStep is one step of a retrieval run, timed so a caller can see where
@@ -174,15 +207,16 @@ const (
 type TraceStep struct {
 	// Step names what ran, e.g. TraceStepEmbedQuery.
 	Step string `json:"step"`
-	// Technique is the Retrieval Technique the step belongs to.
+	// Technique is the Retrieval Technique the step belongs to, or
+	// RetrievalTechniqueRRF on the fuse step.
 	Technique RetrievalTechnique `json:"technique,omitempty"`
 	// DurationMS is how long the step took, in milliseconds.
 	DurationMS int64 `json:"duration_ms"`
 	// Model is the embedding model, on the step that called one.
 	Model string `json:"model,omitempty"`
-	// Candidates is how many Chunks the search returned, on the search step.
-	// It is a pointer so the search step reports 0 while the embed step,
-	// which has no candidate count, leaves the field out.
+	// Candidates is how many Chunks the step returned: the search step's own
+	// matches, or the distinct Chunks a fuse step combined. It is a pointer so
+	// a step with no candidate count leaves the field out.
 	Candidates *int `json:"candidates,omitempty"`
 }
 

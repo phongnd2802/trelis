@@ -30,6 +30,7 @@ type retrievedChunk struct {
 	ContextHeader string             `json:"context_header"`
 	Score         float64            `json:"score"`
 	Scores        map[string]float64 `json:"scores"`
+	Ranks         map[string]int     `json:"ranks"`
 }
 
 // traceStep is one timed step of a retrieval run.
@@ -54,21 +55,28 @@ type retrievalAnswer struct {
 // the decoded answer, failing unless the request succeeded.
 func (tr *trelis) retrieve(t *testing.T, key, query, technique string, topK int) retrievalAnswer {
 	t.Helper()
+	return tr.retrieveConfig(t, key, query, topK, map[string]any{"techniques": []string{technique}})
+}
+
+// retrieveConfig POSTs /retrieve with the given retrieval_config and returns
+// the decoded answer, failing unless the request succeeded.
+func (tr *trelis) retrieveConfig(t *testing.T, key, query string, topK int, config map[string]any) retrievalAnswer {
+	t.Helper()
 	resp := tr.post(t, "/retrieve", key, map[string]any{
 		"query":            query,
 		"top_k":            topK,
-		"retrieval_config": map[string]any{"techniques": []string{technique}},
+		"retrieval_config": config,
 	})
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("POST /retrieve (%s) = %d %s, want 200", technique, resp.StatusCode, body)
+		t.Fatalf("POST /retrieve (%v) = %d %s, want 200", config["techniques"], resp.StatusCode, body)
 	}
 	var answer retrievalAnswer
 	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
-		t.Fatalf("decode /retrieve (%s) answer: %v", technique, err)
+		t.Fatalf("decode /retrieve (%v) answer: %v", config["techniques"], err)
 	}
 	if !answer.Success {
-		t.Fatalf("POST /retrieve (%s) answered success = false", technique)
+		t.Fatalf("POST /retrieve (%v) answered success = false", config["techniques"])
 	}
 	return answer
 }
@@ -192,6 +200,9 @@ func TestRetrieveReturnsOnlyChunksOfDocumentsTheCallerCanRead(t *testing.T) {
 		if dense, ok := result.Scores["dense"]; !ok || math.Abs(dense-result.Score) > 1e-9 {
 			t.Errorf("result %s scores = %v, score %v; want a matching dense entry", result.ChunkID, result.Scores, result.Score)
 		}
+		if result.Ranks["dense"] != i+1 {
+			t.Errorf("result %s ranks = %v, want dense rank %d", result.ChunkID, result.Ranks, i+1)
+		}
 		if i > 0 && bobAnswer.Data.Results[i-1].Score < result.Score {
 			t.Errorf("results out of order at %d: %v then %v", i, bobAnswer.Data.Results[i-1].Score, result.Score)
 		}
@@ -276,13 +287,16 @@ func TestRetrieveBM25ReturnsOnlyChunksOfDocumentsTheCallerCanRead(t *testing.T) 
 
 	bobAnswer := tr.retrieve(t, bob, bm25Query, "bm25", 10)
 	bobDocs := map[string]bool{}
-	for _, result := range bobAnswer.Data.Results {
+	for i, result := range bobAnswer.Data.Results {
 		if result.DocumentID == secretID {
 			t.Errorf("bob received Chunk %s of alice's Restricted Document", result.ChunkID)
 		}
 		bobDocs[result.DocumentID] = true
 		if bm25, ok := result.Scores["bm25"]; !ok || math.Abs(bm25-result.Score) > 1e-9 {
 			t.Errorf("result %s scores = %v, score %v; want a matching bm25 entry", result.ChunkID, result.Scores, result.Score)
+		}
+		if result.Ranks["bm25"] != i+1 {
+			t.Errorf("result %s ranks = %v, want bm25 rank %d", result.ChunkID, result.Ranks, i+1)
 		}
 		if _, ok := result.Scores["dense"]; ok {
 			t.Errorf("result %s carries a dense score, want bm25 alone: %v", result.ChunkID, result.Scores)
@@ -338,5 +352,121 @@ func TestRetrieveBM25ReturnsOnlyChunksOfDocumentsTheCallerCanRead(t *testing.T) 
 				t.Errorf("the embedding provider saw a bm25 query text %q", text)
 			}
 		}
+	}
+}
+
+// TestRetrieveHybridReturnsOnlyChunksOfDocumentsTheCallerCanRead is the
+// leakage test for RRF fusion: both lists are fetched over the caller's
+// readable set, so Bob's fused answer never contains Alice's Restricted
+// Document even though it ranks first in both of Alice's lists.
+func TestRetrieveHybridReturnsOnlyChunksOfDocumentsTheCallerCanRead(t *testing.T) {
+	tr := start(t)
+	alice := tr.principalKey(t, "alice")
+	bob := tr.principalKey(t, "bob")
+
+	const query = "thue tncn"
+	secretID := tr.upload(t, alice, "secret.md",
+		"# Secret\n\nThuế TNCN thuế TNCN thuế TNCN thuế TNCN thuế TNCN là thuế thu nhập cá nhân.\n")
+	// A Document Alice shares with Bob through its Access List.
+	sharedID := tr.uploadBytesWithFields(t, alice, "shared.md",
+		[]byte("# Shared\n\nThuế TNCN được khấu trừ tại nguồn.\n"), map[string]string{"principals": "bob"})
+	bobID := tr.upload(t, bob, "bob.md", "# Bob\n\nThuế TNCN của bob.\n")
+
+	for _, doc := range []struct{ id, key, name string }{
+		{secretID, alice, "Alice's secret"},
+		{sharedID, alice, "Alice's shared"},
+		{bobID, bob, "Bob's own"},
+	} {
+		if got := tr.waitForIngest(t, doc.key, doc.id); got.ParseStatus != "completed" {
+			t.Fatalf("%s Document parse_status = %q (%q), want completed", doc.name, got.ParseStatus, got.ParseError)
+		}
+	}
+
+	// Both lists would rank the secret first for Alice: pin the dense vector
+	// to its first Chunk, and its repeated syllables win BM25.
+	vectors := tr.chunkVectors(t, secretID)
+	if len(vectors) == 0 {
+		t.Fatal("the secret Document has no embedded Chunk")
+	}
+	tr.provider.EmbedAs(query, vectors[0])
+
+	const rrfK = 10
+	bobAnswer := tr.retrieveConfig(t, bob, query, 10, map[string]any{
+		"techniques": []string{"bm25", "dense"},
+		"rrf_k":      rrfK,
+	})
+	if len(bobAnswer.Data.Results) == 0 {
+		t.Fatal("bob received no fused results, want the Documents he can read")
+	}
+	bobDocs := map[string]bool{}
+	rankByTechnique := map[string]map[int]bool{}
+	for _, result := range bobAnswer.Data.Results {
+		if result.DocumentID == secretID {
+			t.Errorf("bob received Chunk %s of alice's Restricted Document", result.ChunkID)
+		}
+		bobDocs[result.DocumentID] = true
+		// The fused score is the RRF sum over the lists the Chunk is in, and
+		// every rank shown carries that technique's score.
+		want := 0.0
+		if len(result.Ranks) == 0 {
+			t.Errorf("result %s ranks = %v, want at least one technique's rank", result.ChunkID, result.Ranks)
+		}
+		for technique, rank := range result.Ranks {
+			if rank < 1 {
+				t.Errorf("result %s %s rank = %d, want 1-based", result.ChunkID, technique, rank)
+			}
+			if _, ok := result.Scores[technique]; !ok {
+				t.Errorf("result %s ranks %s at %d but scores = %v, want that technique's score",
+					result.ChunkID, technique, rank, result.Scores)
+			}
+			if rankByTechnique[technique] == nil {
+				rankByTechnique[technique] = map[int]bool{}
+			}
+			if rankByTechnique[technique][rank] {
+				t.Errorf("two results share %s rank %d", technique, rank)
+			}
+			rankByTechnique[technique][rank] = true
+			want += 1 / float64(rrfK+rank)
+		}
+		if math.Abs(result.Score-want) > 1e-12 {
+			t.Errorf("result %s score = %v, want the RRF sum %v from ranks %v", result.ChunkID, result.Score, want, result.Ranks)
+		}
+	}
+	if !bobDocs[sharedID] {
+		t.Errorf("bob's fused results = %v, want the shared Document %s", bobDocs, sharedID)
+	}
+	if !bobDocs[bobID] {
+		t.Errorf("bob's fused results = %v, want his own Document %s", bobDocs, bobID)
+	}
+
+	// bm25's search, dense's two steps, then one fuse step naming rrf.
+	trace := bobAnswer.Data.Trace
+	if len(trace) != 4 {
+		t.Fatalf("hybrid trace = %+v, want bm25's search, dense's two steps and the fuse step", trace)
+	}
+	if step := trace[0]; step.Step != "search" || step.Technique != "bm25" || step.DurationMS < 0 {
+		t.Errorf("trace[0] = %+v, want the bm25 search step", step)
+	}
+	if step := trace[1]; step.Step != "embed_query" || step.Technique != "dense" || step.Model != embeddingModel {
+		t.Errorf("trace[1] = %+v, want the dense embed step", step)
+	}
+	if step := trace[2]; step.Step != "search" || step.Technique != "dense" || step.DurationMS < 0 {
+		t.Errorf("trace[2] = %+v, want the dense search step", step)
+	}
+	if step := trace[3]; step.Step != "fuse" || step.Technique != "rrf" ||
+		step.DurationMS < 0 || step.Candidates < len(bobAnswer.Data.Results) {
+		t.Errorf("trace[3] = %+v, want the fuse step with at least %d candidates", step, len(bobAnswer.Data.Results))
+	}
+
+	aliceAnswer := tr.retrieveConfig(t, alice, query, 10, map[string]any{
+		"techniques": []string{"bm25", "dense"},
+		"rrf_k":      rrfK,
+	})
+	if len(aliceAnswer.Data.Results) == 0 {
+		t.Fatal("alice received no fused results, want her own Documents")
+	}
+	if first := aliceAnswer.Data.Results[0]; first.DocumentID != secretID {
+		t.Errorf("alice's first fused result is from %s, want the secret Document %s both lists rank first",
+			first.DocumentID, secretID)
 	}
 }

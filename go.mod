@@ -23,6 +23,7 @@ require (
 	go.temporal.io/api v1.64.3
 	go.temporal.io/sdk v1.52.0
 	go.uber.org/zap v1.28.0
+	golang.org/x/sync v0.25.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
@@ -122,7 +123,6 @@ require (
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/mod v0.42.0 // indirect
 	golang.org/x/net v0.62.0 // indirect
-	golang.org/x/sync v0.25.0 // indirect
 	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/text v0.44.0 // indirect
 	golang.org/x/time v0.11.0 // indirect

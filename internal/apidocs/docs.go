@@ -390,7 +390,7 @@ const docTemplate = `{
                         "bearerAuth": []
                     }
                 ],
-                "description": "Runs the Retrieval Technique named in retrieval_config (dense or bm25) over the Documents the caller can read and returns the ranked Chunks with per-technique scores and a step trace. A bm25 request needs no embedding model. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values, unknown techniques and more than one technique are 400; a body over 64 KiB is 413; without models.embedding, dense retrieval is 503.",
+                "description": "Runs every Retrieval Technique named in retrieval_config (dense and/or bm25) over the Documents the caller can read. One technique answers in its own order with its own score; several run concurrently over max(top_k, 50) candidates each and are fused with Reciprocal Rank Fusion, score = the sum of 1/(rrf_k + rank) over the lists that carry the Chunk, then cut to top_k with equal fused scores ordered by chunk_id. rrf_k defaults to 60 and must be between 1 and 1000; it has no effect with one technique. Every result carries the score and 1-based rank of each technique whose list carried it. A bm25 request needs no embedding model. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values, an unknown or duplicate technique and an out-of-range rrf_k are 400; a body over 64 KiB is 413; without models.embedding, a dense request (alone or alongside bm25) is 503.",
                 "consumes": [
                     "application/json"
                 ],
@@ -403,7 +403,7 @@ const docTemplate = `{
                 "summary": "Retrieve Chunks for a query",
                 "parameters": [
                     {
-                        "description": "The query, how many Chunks to return and which Retrieval Techniques to run",
+                        "description": "The query, how many Chunks to return, which Retrieval Techniques to run and the RRF constant",
                         "name": "request",
                         "in": "body",
                         "required": true,
@@ -432,7 +432,7 @@ const docTemplate = `{
                         }
                     },
                     "400": {
-                        "description": "Body that is not one JSON object, an unknown field or wrong value type, a blank or too-long query, an out-of-range top_k or an invalid retrieval_config (an unknown technique or more than one)",
+                        "description": "Body that is not one JSON object, an unknown field or wrong value type, a blank or too-long query, an out-of-range top_k or an invalid retrieval_config (an unknown or duplicate technique, or an rrf_k outside 1..1000)",
                         "schema": {
                             "$ref": "#/definitions/handler.ErrorResponse"
                         }
@@ -456,7 +456,7 @@ const docTemplate = `{
                         }
                     },
                     "503": {
-                        "description": "models.embedding is not configured, so dense retrieval is unavailable (bm25 still works)",
+                        "description": "models.embedding is not configured, so a request naming dense is unavailable (bm25 alone still works)",
                         "schema": {
                             "$ref": "#/definitions/handler.ErrorResponse"
                         }
@@ -710,8 +710,12 @@ const docTemplate = `{
         "types.RetrievalConfig": {
             "type": "object",
             "properties": {
+                "rrf_k": {
+                    "description": "RRFK is the Reciprocal Rank Fusion constant k; nil means the default.\nIt only affects a request that runs more than one technique, so it is\naccepted and ignored for a single one.",
+                    "type": "integer"
+                },
                 "techniques": {
-                    "description": "Techniques is the set of Retrieval Techniques to run, without\nduplicates.",
+                    "description": "Techniques is the set of Retrieval Techniques to run, without\nduplicates. More than one makes the request a fusion: each runs over\nthe readable Documents and their lists are combined with Reciprocal\nRank Fusion.",
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/types.RetrievalTechnique"
@@ -761,11 +765,13 @@ const docTemplate = `{
             "type": "string",
             "enum": [
                 "dense",
-                "bm25"
+                "bm25",
+                "rrf"
             ],
             "x-enum-varnames": [
                 "RetrievalTechniqueDense",
-                "RetrievalTechniqueBM25"
+                "RetrievalTechniqueBM25",
+                "RetrievalTechniqueRRF"
             ]
         },
         "types.RetrievedChunk": {
@@ -782,6 +788,12 @@ const docTemplate = `{
                 },
                 "document_id": {
                     "type": "string"
+                },
+                "ranks": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "integer"
+                    }
                 },
                 "score": {
                     "type": "number"
@@ -802,7 +814,7 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "candidates": {
-                    "description": "Candidates is how many Chunks the search returned, on the search step.\nIt is a pointer so the search step reports 0 while the embed step,\nwhich has no candidate count, leaves the field out.",
+                    "description": "Candidates is how many Chunks the step returned: the search step's own\nmatches, or the distinct Chunks a fuse step combined. It is a pointer so\na step with no candidate count leaves the field out.",
                     "type": "integer"
                 },
                 "duration_ms": {
@@ -818,7 +830,7 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "technique": {
-                    "description": "Technique is the Retrieval Technique the step belongs to.",
+                    "description": "Technique is the Retrieval Technique the step belongs to, or\nRetrievalTechniqueRRF on the fuse step.",
                     "allOf": [
                         {
                             "$ref": "#/definitions/types.RetrievalTechnique"

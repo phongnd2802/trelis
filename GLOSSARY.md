@@ -134,6 +134,10 @@ _Avoid_: Strategy, mode, feature
 A named combination of Retrieval Techniques that is switched on together.
 _Avoid_: Pipeline, preset
 
+**Reciprocal Rank Fusion (RRF)**:
+The way several Retrieval Techniques' ranked lists become one: a Chunk scores the sum of 1/(k + rank) over the lists that carry it, with 1-based ranks and k a per-request constant (default 60).
+_Avoid_: Score blending, rank merge
+
 **Ablation Run**:
 One scoring of a Golden Set under one Retrieval Config, recording quality, latency and cost.
 _Avoid_: Eval job, experiment
