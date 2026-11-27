@@ -32,3 +32,19 @@ func TestAnUnparseableSourceFileMarksTheDocumentFailed(t *testing.T) {
 		t.Errorf("Chunks = %q, want none for a failed parse", chunks)
 	}
 }
+
+// TestAPlainTextSourceFileGivesACompletedDocument covers the formats anydoc
+// does not convert: a Markdown upload is read as Markdown and ingest completes.
+func TestAPlainTextSourceFileGivesACompletedDocument(t *testing.T) {
+	tr := start(t)
+	alice := tr.principalKey(t, "alice")
+	id := tr.upload(t, alice, "notes.md", "# Notes\n\nThe launch was in 2024.\n")
+
+	doc := tr.waitForIngest(t, alice, id)
+	if doc.ParseStatus != "completed" {
+		t.Fatalf("parse_status = %q (%q), want completed", doc.ParseStatus, doc.ParseError)
+	}
+	if chunks := tr.chunkContents(t, id); len(chunks) == 0 {
+		t.Fatal("no Chunks stored for a parsed Markdown Source File")
+	}
+}

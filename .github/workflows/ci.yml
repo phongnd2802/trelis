@@ -91,6 +91,16 @@ jobs:
       - name: Integration tests
         run: make test-integration
 
+  # The external Python eval harness (eval/, ADR-0001) against its fixtures and
+  # MockTransport; no Trelis process, Go build or dataset download needed.
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Test eval harness
+        run: cd eval && uv run pytest
+
   # The whole compose stack on a fresh runner (the clean-checkout case), then
   # again over the same volumes to prove every init step is idempotent.
   compose-smoke:

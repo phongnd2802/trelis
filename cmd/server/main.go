@@ -255,7 +255,7 @@ func run(configPath string, args []string) (err error) {
 		logger.Ctx(ctx).Warn("no embedding model configured; Documents will fail ingest until one is set")
 	}
 	ingestActivities := ingest.NewActivities(service.NewIngestService(dbStore, docRepo,
-		repository.NewChunkRepository(dbStore), files, parser.NewAnydocParser(false), embedder))
+		repository.NewChunkRepository(dbStore), files, parser.NewFormatRouter(false), embedder))
 	stopIngestWorker := startWorker(ctx, "ingest", cfg.Temporal.TaskQueue, func() worker.Worker {
 		return ingest.NewWorker(temporal, cfg.Temporal.TaskQueue, cfg.Temporal.ModelTaskQueue,
 			cfg.Models.Embedding.BatchSize, ingestActivities)

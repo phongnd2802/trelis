@@ -1,0 +1,38 @@
+[
+  {
+    "title": "Alpha Mission Launches",
+    "author": "Ada Lovelace",
+    "source": "Example Science",
+    "published_at": "2024-01-01T10:00:00+00:00",
+    "category": "science",
+    "url": "https://example.com/alpha",
+    "body": "The Alpha Mission launched on 1 January 2024.\n\nIt carries a small telescope."
+  },
+  {
+    "title": "Beta Probe Returns",
+    "author": null,
+    "source": "Example Science",
+    "published_at": "2024-02-02T10:00:00+00:00",
+    "category": "science",
+    "url": "https://example.com/beta",
+    "body": "The Beta Probe returned samples from the Moon."
+  },
+  {
+    "title": "Gamma Study Published",
+    "author": "Grace Hopper",
+    "source": "Example Health",
+    "published_at": "2024-03-03T10:00:00+00:00",
+    "category": "health",
+    "url": "https://example.com/gamma",
+    "body": "The Gamma Study followed 10,000 people for five years."
+  },
+  {
+    "title": "Delta Market Report",
+    "author": null,
+    "source": "Example Business",
+    "published_at": "2024-04-04T10:00:00+00:00",
+    "category": "business",
+    "url": "https://example.com/delta",
+    "body": "The Delta Market Report covers quarterly earnings."
+  }
+]

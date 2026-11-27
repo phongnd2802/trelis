@@ -38,3 +38,9 @@ go.work.sum
 /.claude/settings.local.json
 .agents/skills/
 .qwen/skills/
+
+# Eval harness (eval/, external Python per ADR-0001)
+/eval/data/
+__pycache__/
+.venv/
+.pytest_cache/

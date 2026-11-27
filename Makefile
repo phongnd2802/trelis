@@ -1,4 +1,4 @@
-.PHONY: help tools sqlc swagger anydoc-lib build build-lite dev test test-linked test-integration test-integration-linked vet vet-lite vet-linked lint lint-linked stack-up dev-up dev-down clean
+.PHONY: help tools sqlc swagger anydoc-lib build build-lite dev test test-linked test-integration test-integration-linked vet vet-lite vet-linked lint lint-linked eval-test stack-up dev-up dev-down clean
 
 BIN_DIR := bin
 BINARY  := $(BIN_DIR)/trelis
@@ -15,6 +15,7 @@ help:
 	@echo "  dev          go run ./cmd/server with anydoc linked (ARGS=... passes flags)"
 	@echo "  test         unit tests that need no archive"
 	@echo "  test-linked  full tests against the linked anydoc archive"
+	@echo "  eval-test    eval harness tests (cd eval && uv run pytest; needs uv)"
 	@echo "  test-integration  HTTP API tests against Postgres, Neo4j, silo (S3) and Temporal in testcontainers (needs Docker)"
 	@echo "  test-integration-linked  the same with the anydoc engine linked (needs anydoc-lib)"
 	@echo "  vet          go vet both build variants (vet-lite / vet-linked for one)"
@@ -51,6 +52,10 @@ test:
 
 test-linked:
 	CGO_ENABLED=1 go test -tags anydoc ./...
+
+# The external Python eval harness (eval/, ADR-0001); no Go build needed.
+eval-test:
+	cd eval && uv run pytest
 
 # Behind the integration build tag so `make test` needs no Docker; see
 # internal/integration. -count=1 because the cache cannot see the containers.

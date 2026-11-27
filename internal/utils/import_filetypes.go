@@ -7,21 +7,15 @@
 package utils
 
 import (
-	"strings"
-
+	"github.com/phongnd2802/trelis/internal/parser"
 	"github.com/phongnd2802/trelis/internal/parser/anydoc"
 )
-
-// plainTextImportExtensions are read as text without a parser.
-var plainTextImportExtensions = map[string]struct{}{
-	"txt": {}, "md": {}, "markdown": {},
-}
 
 // NormalizeImportExtension lowercases an extension and strips surrounding
 // whitespace and one leading dot, so callers can pass "xlsx", ".XLSX" or a
 // raw user-supplied file_type.
 func NormalizeImportExtension(ext string) string {
-	return strings.ToLower(strings.TrimPrefix(strings.TrimSpace(ext), "."))
+	return parser.NormalizeFileType(ext)
 }
 
 // IsSupportedImportExtension reports whether a bare extension can be
@@ -32,7 +26,7 @@ func IsSupportedImportExtension(ext string) bool {
 	if ext == "" {
 		return false
 	}
-	if _, ok := plainTextImportExtensions[ext]; ok {
+	if parser.IsPlainTextFileType(ext) {
 		return true
 	}
 	return anydoc.Supports(ext, "")
