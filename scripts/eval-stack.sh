@@ -7,6 +7,13 @@
 # It serves the dev database (the ingested Benchmark Corpus) on :8080, in
 # place of `make dev`, and runs in the background until `down`.
 #
+# Before it starts the proxy or Trelis, `up` prints each routed role's model
+# and how many fixtures are already recorded for that role and model (#166).
+# The model is part of every request, so a changed one turns a record run into
+# paid calls and a replay run into misses: a role whose fixtures were all
+# recorded with another model warns, since every call for the configured
+# model will be paid (record) or miss (replay).
+#
 # Usage:
 #   scripts/eval-stack.sh up record [--rerank]   # paid calls go upstream once and are stored
 #   scripts/eval-stack.sh up replay [--rerank]   # fixtures only: a missing one is an error, no key needed
@@ -24,6 +31,9 @@
 #                            Trelis sends and the proxy forwards
 #   TRELIS_MODELS_RERANK_API_KEY     record mode with --rerank: the same for
 #                            the rerank provider
+#   TRELIS_MODELS_<ROLE>_MODEL  the model Trelis will send for a routed role;
+#                            `up` reports it, falling back to that role's
+#                            `model:` under `models:` in config/trelis.yaml
 #   .local/models.env        exported for `up` when present; the environment
 #                            wins over the file (unlike `make dev`)
 #   any other TRELIS_* setting is passed to Trelis unchanged
@@ -82,6 +92,99 @@ wait_for() {
   done
 }
 
+# role_model <role> prints the model Trelis will send for one role:
+# TRELIS_MODELS_<ROLE>_MODEL when the environment names one, otherwise the
+# role's `model:` under `models:` in config/trelis.yaml, otherwise nothing.
+role_model() {
+  local name value
+  name="TRELIS_MODELS_$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')_MODEL"
+  value=${!name:-}
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value"
+  else
+    configured_model "$1"
+  fi
+}
+
+# configured_model <role> prints models.<role>.model from config/trelis.yaml,
+# or nothing. The file is YAML and the harness has no YAML library, so this
+# small reader walks only the plain mapping layout the file uses: the
+# top-level `models:` block, uncommented role keys, a `model:` under the role.
+configured_model() {
+  eval/.venv/bin/python - config/trelis.yaml "$1" <<'PY'
+import sys
+
+config, role = sys.argv[1], sys.argv[2]
+try:
+    with open(config, encoding="utf-8") as handle:
+        lines = handle.readlines()
+except OSError:
+    sys.exit(0)
+in_models = False
+role_indent = None
+in_role = False
+for raw in lines:
+    line = raw.split("#", 1)[0].rstrip()
+    stripped = line.strip()
+    if not stripped:
+        continue
+    indent = len(line) - len(line.lstrip())
+    key, _, value = stripped.partition(":")
+    if indent == 0:
+        in_models = key == "models"
+        role_indent = None
+        in_role = False
+    elif in_models:
+        if role_indent is None:
+            role_indent = indent
+        if indent == role_indent:
+            in_role = key == role
+        elif in_role and key == "model":
+            print(value.strip().strip("'\""))
+            break
+PY
+}
+
+# The three helpers below read `trelis-eval proxy fixtures` output, which is
+# one unindented line per role and request model: "<role> <model>: N fixtures".
+
+# fixture_count <role> <model> <summary> prints the fixtures recorded for one
+# role and model, or 0.
+fixture_count() {
+  awk -v prefix="$1 $2: " '
+    index($0, prefix) == 1 { count = $(NF - 1) }
+    END { print (count == "" ? 0 : count) }
+  ' <<<"$3"
+}
+
+# fixture_word <count> prints "fixture" or "fixtures" for a count.
+fixture_word() {
+  if [ "$1" -eq 1 ]; then
+    printf 'fixture\n'
+  else
+    printf 'fixtures\n'
+  fi
+}
+
+# role_fixture_count <role> <summary> prints every fixture recorded for a role.
+role_fixture_count() {
+  awk -v role="$1" '$1 == role { total += $(NF - 1) } END { print total + 0 }' <<<"$2"
+}
+
+# role_models <role> <summary> prints the models that role's fixtures used,
+# comma-separated.
+role_models() {
+  awk -v role="$1" '
+    $1 == role {
+      rest = $0
+      sub(/^[^ ]+ /, "", rest)
+      sub(/: [0-9]+ fixtures?$/, "", rest)
+      models = models (models == "" ? "" : ", ") rest
+    }
+    END { print models }
+  ' <<<"$2"
+}
+
 cmd=${1:-}
 case "$cmd" in
   up)
@@ -138,8 +241,40 @@ case "$cmd" in
     fi
     mkdir -p "$state" "$fixtures"
 
-    go build -o "$state/trelis" ./cmd/server
     uv sync --project eval -q
+
+    # What a paid run is about to send. The model travels in every request, so
+    # a changed one misses every recorded fixture and a record run pays again:
+    # show each routed role's model and the fixtures already answering it.
+    # A broken fixture tree stops here with the harness's one-line error,
+    # before the proxy or Trelis starts.
+    fixtures_summary=$(eval/.venv/bin/trelis-eval proxy fixtures --fixtures "$fixtures") || exit 1
+    routed_roles=(embedding)
+    if [ "$rerank" = true ]; then
+      routed_roles+=(rerank)
+    fi
+    echo "model and recorded fixtures per routed role:" >&2
+    for role in "${routed_roles[@]}"; do
+      model=$(role_model "$role")
+      total=$(role_fixture_count "$role" "$fixtures_summary")
+      noun=$(fixture_word "$total")
+      if [ -z "$model" ]; then
+        echo "  $role: model: unknown; $total $noun recorded under this role" >&2
+        continue
+      fi
+      count=$(fixture_count "$role" "$model" "$fixtures_summary")
+      echo "  $role: model $model; $count $(fixture_word "$count") recorded for it" >&2
+      if [ "$count" -eq 0 ] && [ "$total" -gt 0 ]; then
+        recorded=$(role_models "$role" "$fixtures_summary")
+        if [ "$mode" = record ]; then
+          echo "eval-stack.sh: warning: $role has $total $noun but none for model $model; every $role call will be paid (recorded models: $recorded)" >&2
+        else
+          echo "eval-stack.sh: warning: $role has $total $noun but none for model $model; every $role call will fail as a missing fixture (recorded models: $recorded)" >&2
+        fi
+      fi
+    done
+
+    go build -o "$state/trelis" ./cmd/server
 
     proxy_args=(proxy --mode "$mode" --fixtures "$fixtures" --listen "$proxy_addr")
     if [ "$mode" = record ]; then

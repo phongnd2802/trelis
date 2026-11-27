@@ -199,6 +199,12 @@ roles are the ones already present in the fixture tree (or any role it is
 asked for). `eval/fixtures/` is gitignored for now; committed fixtures come
 with the CI smoke eval (#53).
 
+`trelis-eval proxy fixtures --fixtures <dir>` prints the tree without
+starting the proxy: one line per role and request model with its fixture
+count, and `(no model)` for a fixture whose request names none. The model is
+part of the key, so this shows what a changed model would cost;
+`scripts/eval-stack.sh up` calls it before starting Trelis for that reason.
+
 ### Worked example: the dense baseline
 
 Ingest and the Golden Set come first, as in [the README](../README.md). In one

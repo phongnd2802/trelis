@@ -255,6 +255,17 @@ environment, a variable already in the environment wins here. Without
 `config/trelis.yaml` or `TRELIS_MODELS_RERANK_BASE_URL`), because those calls
 would reach the provider unrecorded.
 
+Before it starts the proxy or Trelis, `up` prints one line per routed role
+(embedding, and rerank with `--rerank`) with the model Trelis will send and
+how many fixtures already answer that role and model. The model comes from
+`TRELIS_MODELS_<ROLE>_MODEL` when set, otherwise the role's `model:` under
+`models:` in `config/trelis.yaml`, and `model: unknown` when neither names
+one. In record mode it warns when a role has fixtures but none for that
+model, because every call for the new model will then be paid; in replay
+mode it warns that every call will instead miss as a missing fixture. The
+same summary is available on its own with
+`uv run --project eval trelis-eval proxy fixtures --fixtures eval/fixtures/models`.
+
 The stratified-500 corpus in the dev database belongs to the Principal
 `eval`, so the run needs one of its keys (`admin key create eval`, see
 above). Stop `make dev` first: the script refuses to start while something
