@@ -1,10 +1,6 @@
 package chunker
 
-import (
-	"strings"
-
-	"go.uber.org/zap"
-)
+import "strings"
 
 // StrategyTier names one chunking implementation in a tier chain.
 type StrategyTier string
@@ -76,6 +72,10 @@ func SplitWithDiagnostics(text string, cfg SplitterConfig) ([]Chunk, *Diagnostic
 // the first structured tier whose sections are dense enough: heading before
 // heuristic, since real Markdown headings are the stronger signal.
 //
+// An unknown strategy falls back to recursive, and Diagnostics.TierChain is
+// where a library caller sees that: config validation rejects it before
+// ingest, so the chunker logs nothing.
+//
 // A structured tier scans for its boundaries again rather than taking the
 // profile's list: tierSplitters is text+cfg for every tier, and threading one
 // scan through it would couple the chain to the profiler for a cheap line
@@ -86,8 +86,6 @@ func resolveChain(text string, cfg SplitterConfig) ([]StrategyTier, *DocProfile)
 	case StrategyAuto:
 		p := ProfileDocument(text)
 		return SelectTiers(p, cfg), &p
-	default:
-		zap.L().Warn("chunker: unknown strategy, using recursive", zap.String("strategy", string(cfg.Strategy))) //nolint:forbidigo // the chunker has no ctx until #31 moves this log to the ingest activity
 	}
 	return []StrategyTier{TierRecursive}, nil
 }
@@ -106,7 +104,6 @@ func runChain(text string, cfg SplitterConfig, chain []StrategyTier) ([]Chunk, *
 			return out, diag
 		}
 		diag.Rejected = append(diag.Rejected, TierRejection{Tier: tier, Reason: v.Reason})
-		zap.L().Debug("chunker: tier rejected", zap.String("tier", string(tier)), zap.String("reason", v.Reason)) //nolint:forbidigo // the chunker has no ctx until #31 moves this log to the ingest activity
 	}
 	return out, diag
 }

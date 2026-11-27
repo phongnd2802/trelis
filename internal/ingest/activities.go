@@ -45,18 +45,18 @@ func NewActivities(service interfaces.IngestService) *Activities {
 	return &Activities{ingest: service}
 }
 
-// ParseAndChunk parses a Document's Source File, stores its Chunks and
-// returns how many there are, so the workflow can divide them into embedding
-// batches. A Source File that cannot be parsed becomes a non-retryable
-// application error carrying a reason safe to store, as does a Document that
-// is gone; a storage or database failure is returned as-is, so Temporal
-// retries it.
+// ParseAndChunk parses a Document's Source File, stores its Chunks and Parent
+// Chunks, and returns how many Chunks it stored, so the workflow can divide
+// them into embedding batches. A Source File that cannot be parsed becomes a
+// non-retryable application error carrying a reason safe to store, as does a
+// Document that is gone; a storage or database failure is returned as-is, so
+// Temporal retries it.
 func (a *Activities) ParseAndChunk(ctx context.Context, documentID string) (int, error) {
 	id, err := parseDocumentID(documentID)
 	if err != nil {
 		return 0, err
 	}
-	chunks, err := a.ingest.ParseAndChunk(ctx, id)
+	result, err := a.ingest.ParseAndChunk(ctx, id)
 	if err != nil {
 		var unparseable *types.UnparseableError
 		if errors.As(err, &unparseable) {
@@ -80,8 +80,18 @@ func (a *Activities) ParseAndChunk(ctx context.Context, documentID string) (int,
 		}
 		return 0, err
 	}
-	logger.Ctx(ctx).Info("ingest: Chunks stored", zap.Stringer("document", id), zap.Int("chunks", chunks))
-	return chunks, nil
+	rejected := make([]string, len(result.Rejected))
+	for i, rejection := range result.Rejected {
+		rejected[i] = rejection.Tier + ": " + rejection.Reason
+	}
+	logger.Ctx(ctx).Info("ingest: Chunks stored",
+		zap.Stringer("document", id),
+		zap.Int("chunks", result.Chunks),
+		zap.Int("parent_chunks", result.ParentChunks),
+		zap.String("tier", result.Tier),
+		zap.Strings("tier_chain", result.TierChain),
+		zap.Strings("rejected_tiers", rejected))
+	return result.Chunks, nil
 }
 
 // EmbedBatch embeds the Chunks of one seq range that have no embedding yet,

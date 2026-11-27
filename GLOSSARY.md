@@ -22,6 +22,10 @@ _Avoid_: Media, image (in prose), picture, asset
 A contiguous piece of a Document's text that is retrieved and cited on its own.
 _Avoid_: Passage, segment
 
+**Parent Chunk**:
+A wider window of a Document's text around consecutive Chunks, stored to give an answer more context; it is never embedded or searched itself.
+_Avoid_: Parent document, context chunk
+
 **Principal**:
 The identity a question is asked as; it belongs to zero or more Groups.
 _Avoid_: User (when meaning the asking identity), account, tenant

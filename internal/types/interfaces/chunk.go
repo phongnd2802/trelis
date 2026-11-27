@@ -10,11 +10,14 @@ import (
 
 // ChunkRepository persists the Chunks of a Document.
 type ChunkRepository interface {
-	// ReplaceChunks deletes every Chunk of documentID and inserts chunks in
-	// the given order. Running it again with the same input leaves the same
+	// ReplaceChunks deletes every Parent Chunk and Chunk of documentID and
+	// inserts set's Parent Chunks in Seq order, then its Chunks with their
+	// Parent Chunk links. It deletes the Chunks before the Parent Chunks;
+	// switching parent-child mode off and replacing the set therefore leaves no
+	// orphan Parent Chunk. Running it again with the same input leaves the same
 	// rows, so a retried ingest activity never duplicates them. It starts no
 	// transaction: the caller runs it in one with the status update.
-	ReplaceChunks(ctx context.Context, documentID uuid.UUID, chunks []*types.Chunk) error
+	ReplaceChunks(ctx context.Context, documentID uuid.UUID, set types.ChunkSet) error
 
 	// ListUnembeddedChunks returns the Chunks of documentID whose Seq is in
 	// [from, to) and that have no embedding yet, in seq order. It fills ID,

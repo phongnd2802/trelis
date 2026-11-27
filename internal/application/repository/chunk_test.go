@@ -87,7 +87,7 @@ func replaceChunks(t *testing.T, s db.Store, doc *types.Document, seeds []chunkS
 		offset += len(seed.content)
 	}
 	if err := s.ExecTx(ctx, func(ctx context.Context) error {
-		return repo.ReplaceChunks(ctx, doc.ID, input)
+		return repo.ReplaceChunks(ctx, doc.ID, types.ChunkSet{Chunks: input})
 	}); err != nil {
 		t.Fatalf("ReplaceChunks: %v", err)
 	}
@@ -118,14 +118,14 @@ func TestReplaceChunksLeavesTheSameSetOnEveryRun(t *testing.T) {
 		{Seq: 1, Content: "Điều 2.", ContextHeader: "Chương I", StartOffset: 8, EndOffset: 15},
 	}
 	if err := s.ExecTx(ctx, func(ctx context.Context) error {
-		return repo.ReplaceChunks(ctx, doc.ID, first)
+		return repo.ReplaceChunks(ctx, doc.ID, types.ChunkSet{Chunks: first})
 	}); err != nil {
 		t.Fatalf("first ReplaceChunks: %v", err)
 	}
 	// Running the same input again, as a retried activity would, must not
 	// duplicate the rows.
 	if err := s.ExecTx(ctx, func(ctx context.Context) error {
-		return repo.ReplaceChunks(ctx, doc.ID, first)
+		return repo.ReplaceChunks(ctx, doc.ID, types.ChunkSet{Chunks: first})
 	}); err != nil {
 		t.Fatalf("second ReplaceChunks: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestReplaceChunksLeavesTheSameSetOnEveryRun(t *testing.T) {
 
 	// A new set replaces the old one rather than appending to it.
 	if err := s.ExecTx(ctx, func(ctx context.Context) error {
-		return repo.ReplaceChunks(ctx, doc.ID, []*types.Chunk{{Seq: 0, Content: "Điều 3.", StartOffset: 16, EndOffset: 23}})
+		return repo.ReplaceChunks(ctx, doc.ID, types.ChunkSet{Chunks: []*types.Chunk{{Seq: 0, Content: "Điều 3.", StartOffset: 16, EndOffset: 23}}})
 	}); err != nil {
 		t.Fatalf("third ReplaceChunks: %v", err)
 	}
@@ -151,6 +151,113 @@ func TestReplaceChunksLeavesTheSameSetOnEveryRun(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Content != "Điều 3." {
 		t.Errorf("chunks after a replacement = %+v, want only the new Chunk", got)
+	}
+}
+
+func TestReplaceChunksStoresParentChunksAndLinksChunksToThem(t *testing.T) {
+	ctx := context.Background()
+	pool := dbtest.Migrated(t)
+	s := db.NewStore(pool)
+	owner, err := s.Querier(ctx).CreatePrincipal(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := document(t, s, owner.ID)
+	repo := NewChunkRepository(s)
+
+	set := types.ChunkSet{
+		Parents: []*types.ParentChunk{
+			{Seq: 0, Content: "Điều 1. Phạm vi\nĐiều 2. Đối tượng", ContextHeader: "Chương I", StartOffset: 0, EndOffset: 36},
+			{Seq: 1, Content: "Điều 3. Thu nhập chịu thuế", ContextHeader: "Chương I", StartOffset: 37, EndOffset: 64},
+		},
+		Chunks: []*types.Chunk{
+			{Seq: 0, Content: "Điều 1. Phạm vi", ContextHeader: "Chương I", StartOffset: 0, EndOffset: 16},
+			{Seq: 1, Content: "Điều 2. Đối tượng", ContextHeader: "Chương I", StartOffset: 17, EndOffset: 35},
+			{Seq: 2, Content: "Điều 3. Thu nhập chịu thuế", ContextHeader: "Chương I", StartOffset: 37, EndOffset: 64},
+		},
+		ParentOf: []int{0, 0, 1},
+	}
+	if err := s.ExecTx(ctx, func(ctx context.Context) error {
+		return repo.ReplaceChunks(ctx, doc.ID, set)
+	}); err != nil {
+		t.Fatalf("ReplaceChunks with Parent Chunks: %v", err)
+	}
+
+	type parentRow struct {
+		id              uuid.UUID
+		seq             int
+		content, header string
+		start, end      int
+	}
+	rows, err := pool.Query(ctx, `SELECT id, seq, content, context_header, start_offset, end_offset
+FROM parent_chunks WHERE document_id = $1 ORDER BY seq`, doc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parents []parentRow
+	for rows.Next() {
+		var p parentRow
+		if err := rows.Scan(&p.id, &p.seq, &p.content, &p.header, &p.start, &p.end); err != nil {
+			t.Fatal(err)
+		}
+		parents = append(parents, p)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(parents) != len(set.Parents) {
+		t.Fatalf("parent_chunks = %d rows, want %d", len(parents), len(set.Parents))
+	}
+	for i, want := range set.Parents {
+		got := parents[i]
+		if got.seq != want.Seq || got.content != want.Content || got.header != want.ContextHeader ||
+			got.start != want.StartOffset || got.end != want.EndOffset {
+			t.Errorf("Parent Chunk %d = %+v, want seq %d content %q header %q offsets [%d,%d)",
+				i, got, want.Seq, want.Content, want.ContextHeader, want.StartOffset, want.EndOffset)
+		}
+	}
+
+	var parentIDs []uuid.UUID
+	rows, err = pool.Query(ctx, `SELECT parent_id FROM chunks WHERE document_id = $1 ORDER BY seq`, doc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		parentIDs = append(parentIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	wantParents := []uuid.UUID{parents[0].id, parents[0].id, parents[1].id}
+	if !slices.Equal(parentIDs, wantParents) {
+		t.Errorf("Chunk parent_ids = %v, want %v", parentIDs, wantParents)
+	}
+
+	// Replacing the set without Parent Chunks, as re-ingesting with the mode off
+	// does, must leave no Parent Chunk behind and no Chunk linked to one.
+	if err := s.ExecTx(ctx, func(ctx context.Context) error {
+		return repo.ReplaceChunks(ctx, doc.ID, types.ChunkSet{
+			Chunks: []*types.Chunk{{Seq: 0, Content: "Điều 4. Điều khoản thi hành", StartOffset: 0, EndOffset: 32}},
+		})
+	}); err != nil {
+		t.Fatalf("ReplaceChunks without Parent Chunks: %v", err)
+	}
+	var parentCount, linked int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM parent_chunks WHERE document_id = $1`, doc.ID).Scan(&parentCount); err != nil {
+		t.Fatal(err)
+	}
+	if parentCount != 0 {
+		t.Errorf("parent_chunks = %d rows after replacing without Parent Chunks, want 0", parentCount)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM chunks WHERE document_id = $1 AND parent_id IS NOT NULL`, doc.ID).Scan(&linked); err != nil {
+		t.Fatal(err)
+	}
+	if linked != 0 {
+		t.Errorf("%d Chunks still have a parent_id, want 0", linked)
 	}
 }
 
@@ -165,10 +272,10 @@ func TestSetChunkEmbeddingStoresTheVectorAndModel(t *testing.T) {
 	doc := document(t, s, owner.ID)
 	repo := NewChunkRepository(s)
 	if err := s.ExecTx(ctx, func(ctx context.Context) error {
-		return repo.ReplaceChunks(ctx, doc.ID, []*types.Chunk{
+		return repo.ReplaceChunks(ctx, doc.ID, types.ChunkSet{Chunks: []*types.Chunk{
 			{Seq: 0, Content: "Điều 1.", StartOffset: 0, EndOffset: 7},
 			{Seq: 1, Content: "Điều 2.", ContextHeader: "Chương I", StartOffset: 8, EndOffset: 15},
-		})
+		}})
 	}); err != nil {
 		t.Fatalf("ReplaceChunks: %v", err)
 	}
@@ -256,7 +363,7 @@ func TestSearchDenseOrdersByCosineAndSkipsUncomparableChunks(t *testing.T) {
 	// unembedded keeps its Chunk but no vector.
 	if err := s.ExecTx(ctx, func(ctx context.Context) error {
 		return chunks.ReplaceChunks(ctx, unembedded.ID,
-			[]*types.Chunk{{Seq: 0, Content: "no vector", StartOffset: 0, EndOffset: 9}})
+			types.ChunkSet{Chunks: []*types.Chunk{{Seq: 0, Content: "no vector", StartOffset: 0, EndOffset: 9}}})
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -550,7 +657,7 @@ func TestSearchDenseSkipsChunksOfAnotherModelAtAnotherDimension(t *testing.T) {
 		offset += len(row.content)
 	}
 	if err := s.ExecTx(ctx, func(ctx context.Context) error {
-		return chunks.ReplaceChunks(ctx, doc.ID, input)
+		return chunks.ReplaceChunks(ctx, doc.ID, types.ChunkSet{Chunks: input})
 	}); err != nil {
 		t.Fatal(err)
 	}

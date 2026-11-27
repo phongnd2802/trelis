@@ -19,6 +19,7 @@ type Querier interface {
 	CreateGroup(ctx context.Context, name string) (CreateGroupRow, error)
 	CreatePrincipal(ctx context.Context, name string) (CreatePrincipalRow, error)
 	DeleteChunksByDocument(ctx context.Context, documentID uuid.UUID) error
+	DeleteParentChunksByDocument(ctx context.Context, documentID uuid.UUID) error
 	// The system view of one Document, with no access check: the ingest
 	// activities run with no Principal.
 	GetDocumentByID(ctx context.Context, id uuid.UUID) (Document, error)
@@ -36,7 +37,11 @@ type Querier interface {
 	GetReadableDocument(ctx context.Context, arg GetReadableDocumentParams) (Document, error)
 	GrantDocumentToGroup(ctx context.Context, arg GrantDocumentToGroupParams) error
 	GrantDocumentToPrincipal(ctx context.Context, arg GrantDocumentToPrincipalParams) error
+	// parent_id is NULL when the Document was ingested without parent-child
+	// mode, or before it was enabled, and the ID of the Parent Chunk the Chunk
+	// belongs to otherwise. A NULL means a reader falls back to the Chunk itself.
 	InsertChunk(ctx context.Context, arg InsertChunkParams) error
+	InsertParentChunk(ctx context.Context, arg InsertParentChunkParams) (uuid.UUID, error)
 	ListAPIKeys(ctx context.Context, principalID uuid.UUID) ([]ListAPIKeysRow, error)
 	ListDocumentGroups(ctx context.Context, documentID uuid.UUID) ([]string, error)
 	ListDocumentPrincipals(ctx context.Context, documentID uuid.UUID) ([]string, error)
