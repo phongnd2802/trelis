@@ -1,6 +1,7 @@
 """Tests for the record/replay model proxy, against a fake upstream server."""
 
 import base64
+import errno
 import gzip
 import http.client
 import json
@@ -712,3 +713,17 @@ def test_base_url_lines_names_the_role_env_variables_in_order():
         "TRELIS_MODELS_CHAT_BASE_URL=http://127.0.0.1:4100/chat",
         "TRELIS_MODELS_EMBEDDING_BASE_URL=http://127.0.0.1:4100/embedding",
     ]
+
+
+def test_serve_surfaces_a_taken_port_as_os_error(tmp_path):
+    config = ProxyConfig(ProxyMode.REPLAY, tmp_path / "fixtures")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+        holder.bind(("127.0.0.1", 0))
+        holder.listen()
+        port = holder.getsockname()[1]
+
+        with pytest.raises(Exception) as caught:
+            serve(config, "127.0.0.1", port)
+
+    assert isinstance(caught.value, OSError)
+    assert caught.value.errno == errno.EADDRINUSE

@@ -429,11 +429,13 @@ class _ProxyServer(ThreadingHTTPServer):
         client: httpx.Client,
         owns_client: bool,
     ):
-        super().__init__(address, _ProxyHandler)
+        # socketserver calls server_close() when the bind fails, before
+        # __init__ returns, so server_close must find every attribute.
         self.config = config
         self.store = store
         self.client = client
         self.owns_client = owns_client
+        super().__init__(address, _ProxyHandler)
 
     def server_close(self) -> None:
         """Close the listening socket and the upstream client this server owns."""
