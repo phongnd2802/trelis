@@ -17,6 +17,7 @@ import pytest
 
 from trelis_eval.model_proxy import (
     Fixture,
+    FixtureError,
     FixtureStore,
     ProxyConfig,
     ProxyMode,
@@ -258,6 +259,22 @@ def test_fixture_store_load_returns_none_for_a_missing_fixture(tmp_path):
     store = FixtureStore(tmp_path / "fixtures")
 
     assert store.load("embedding", "0" * 64) is None
+
+
+def test_model_counts_names_the_shard_a_misfiled_fixture_sits_in(tmp_path):
+    store = FixtureStore(tmp_path / "fixtures")
+    fixture = make_fixture(key="e8" + "a" * 62)
+    saved = store.save(fixture)
+    misfiled = saved.parent.parent / "ab" / saved.name
+    misfiled.parent.mkdir()
+    saved.rename(misfiled)
+
+    with pytest.raises(FixtureError) as caught:
+        store.model_counts()
+
+    message = str(caught.value)
+    assert "shard ab" in message
+    assert "expected shard e8" in message
 
 
 def test_fixture_store_records_each_miss_as_one_json_line(tmp_path):

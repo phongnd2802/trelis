@@ -34,6 +34,7 @@ from .client import TrelisClient, TrelisError
 from .golden import GoldenSetError, load_golden_set, write_golden_set
 from .ingest import IngestRecord, IngestStatus, ingest, write_manifest
 from .model_proxy import (
+    FixtureError,
     FixtureStore,
     ProxyConfig,
     ProxyMode,
@@ -81,6 +82,7 @@ def main(
         MultiHopDataError,
         TrelisError,
         CliError,
+        FixtureError,
         ValueError,
         OSError,
         httpx.HTTPError,
@@ -252,14 +254,15 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Trelis posts to {base_url}/embeddings, /chat/completions, /responses or "
             "/rerank, so point each role's base_url at http://<listen>/<role>. Each "
-            "--upstream names the provider one role forwards to."
+            "--upstream names the provider one role forwards to. `proxy fixtures` "
+            "lists the recorded fixtures per role and model instead of serving."
         ),
     )
     proxy.add_argument(
         "--mode",
         choices=[mode.value for mode in ProxyMode],
-        required=True,
-        help="record paid calls once, replay fixtures only, or forward without saving",
+        help="record paid calls once, replay fixtures only, or forward without saving "
+        "(required unless a subcommand is given)",
     )
     proxy.add_argument(
         "--upstream",
@@ -281,6 +284,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="host:port to listen on (default: 127.0.0.1:4100)",
     )
     proxy.set_defaults(handler=_run_proxy)
+
+    proxy_commands = proxy.add_subparsers(dest="proxy_command")
+    fixtures_command = proxy_commands.add_parser(
+        "fixtures",
+        help="list the recorded fixtures per role and model",
+        description=(
+            "Print one line per role and request model with the number of "
+            "fixtures recorded for it, without starting the proxy. A fixture "
+            "whose request names no model is listed as (no model)."
+        ),
+    )
+    fixtures_command.add_argument(
+        "--fixtures",
+        type=Path,
+        default=Path("eval/fixtures/models"),
+        help="fixture tree (default: eval/fixtures/models)",
+    )
+    fixtures_command.set_defaults(handler=_run_proxy_fixtures)
 
     return parser
 
@@ -451,9 +472,27 @@ def _results_files(arguments: Sequence[Path]) -> list[Path]:
     return paths
 
 
+def _run_proxy_fixtures(args: argparse.Namespace, transport: httpx.BaseTransport | None) -> int:
+    """Print the fixtures each role holds, counted per request model."""
+    del transport
+    if args.mode is not None:
+        raise CliError(f"proxy fixtures does not serve, so --mode {args.mode} does not apply")
+    counts = FixtureStore(args.fixtures).model_counts()
+    if not counts:
+        print(f"No fixtures in {args.fixtures}")
+        return 0
+    for entry in counts:
+        model = "(no model)" if entry.model is None else entry.model
+        noun = "fixture" if entry.count == 1 else "fixtures"
+        print(f"{entry.role} {model}: {entry.count} {noun}")
+    return 0
+
+
 def _run_proxy(args: argparse.Namespace, transport: httpx.BaseTransport | None) -> int:
     """Serve the record/replay proxy until Ctrl-C."""
     del transport
+    if args.mode is None:
+        raise CliError("proxy needs --mode record|replay|passthrough, or a subcommand")
     mode = ProxyMode(args.mode)
     upstreams = parse_upstreams(args.upstream)
     host, port = parse_listen(args.listen)

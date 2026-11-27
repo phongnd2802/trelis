@@ -27,6 +27,7 @@ import re
 import sys
 import tempfile
 import threading
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -225,6 +226,30 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _read_fixture(path: Path) -> Fixture | None:
+    """Read one fixture document, or None when the file is not there."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise FixtureError(f"cannot read fixture {path}: {exc}") from exc
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise FixtureError(f"{path} is not valid JSON: {exc}") from exc
+    return Fixture.from_json(document)
+
+
+@dataclass(frozen=True)
+class ModelCount:
+    """How many fixtures one role holds for one request model."""
+
+    role: str
+    model: str | None
+    count: int
+
+
 class FixtureStore:
     """The fixture tree: one JSON file per recorded call, plus a miss log."""
 
@@ -239,19 +264,13 @@ class FixtureStore:
     def load(self, role: str, key: str) -> Fixture | None:
         """Read one fixture, or None when it was never recorded."""
         path = self.path_for(role, key)
-        try:
-            text = path.read_text(encoding="utf-8")
-        except FileNotFoundError:
+        fixture = _read_fixture(path)
+        if fixture is None:
             return None
-        except OSError as exc:
-            raise FixtureError(f"cannot read fixture {path}: {exc}") from exc
-        try:
-            document = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise FixtureError(f"{path} is not valid JSON: {exc}") from exc
-        fixture = Fixture.from_json(document)
-        if fixture.key != key or fixture.role != role:
-            raise FixtureError(f"{path} holds {fixture.role} {fixture.key}, not {role} {key}")
+        if fixture.role != role:
+            raise FixtureError(f"{path} holds role {fixture.role}, not {role}")
+        if fixture.key != key:
+            raise FixtureError(f"{path} holds key {fixture.key}, not {key}")
         return fixture
 
     def save(self, fixture: Fixture) -> Path:
@@ -312,6 +331,36 @@ class FixtureStore:
                 entry.name for entry in entries if entry.is_dir() and _ROLE_RE.fullmatch(entry.name)
             )
         )
+
+    def model_counts(self) -> tuple[ModelCount, ...]:
+        """The fixtures each role holds, counted per request model.
+
+        The model is the one stored in the fixture's request, so a role whose
+        provider model changed shows one entry per model. A fixture whose
+        request names no model (a non-JSON body, or JSON without one) is
+        counted with ``model=None``.
+        """
+        counts: Counter[tuple[str, str | None]] = Counter()
+        for role in self.roles():
+            for path in sorted((self.root / role).glob("*/*.json")):
+                fixture = _read_fixture(path)
+                if fixture is None:
+                    continue
+                if fixture.role != role:
+                    raise FixtureError(f"{path} holds role {fixture.role}, not {role}")
+                if fixture.key != path.stem:
+                    raise FixtureError(f"{path} holds key {fixture.key}, not {path.stem}")
+                if self.path_for(role, fixture.key) != path:
+                    raise FixtureError(
+                        f"{path} is stored under shard {path.parent.name}, "
+                        f"expected shard {fixture.key[:2]}"
+                    )
+                counts[(role, _request_model(fixture.request))] += 1
+        ordered = sorted(
+            counts.items(),
+            key=lambda item: (item[0][0], item[0][1] is None, item[0][1] or ""),
+        )
+        return tuple(ModelCount(role, model, count) for (role, model), count in ordered)
 
 
 @dataclass(frozen=True)

@@ -13,6 +13,12 @@ from trelis_eval.golden import (
     load_golden_set,
     write_golden_set,
 )
+from trelis_eval.model_proxy import (
+    Fixture,
+    FixtureError,
+    FixtureStore,
+    RecordedResponse,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -815,6 +821,100 @@ def test_proxy_rejects_a_malformed_listen_address_before_listening(capsys):
 
     assert code == 1
     assert "--listen" in capsys.readouterr().err
+
+
+def test_proxy_without_mode_fails_with_one_error_line(capsys):
+    code = main(["proxy"])
+
+    assert code == 1
+    error = capsys.readouterr().err
+    assert error.startswith("error: ")
+    assert "--mode" in error
+    assert len(error.splitlines()) == 1
+
+
+def save_fixture(fixtures: Path, role: str, request: dict, key: str) -> None:
+    """Save one fixture in the layout the proxy writes."""
+    FixtureStore(fixtures).save(
+        Fixture(
+            key=key,
+            role=role,
+            path="/embeddings",
+            request=request,
+            response=RecordedResponse(
+                status=200,
+                content_type="application/json",
+                stream=False,
+                chunks=(b"{}",),
+            ),
+            recorded_at="2026-01-01T00:00:00Z",
+        )
+    )
+
+
+def test_proxy_fixtures_counts_each_role_and_model(tmp_path, capsys):
+    fixtures = tmp_path / "fixtures"
+    save_fixture(fixtures, "embedding", {"model": "model-a", "input": ["a"]}, "a" * 64)
+    save_fixture(fixtures, "embedding", {"model": "model-a", "input": ["b"]}, "b" * 64)
+    save_fixture(fixtures, "embedding", {"model": "model-b", "input": ["c"]}, "c" * 64)
+    save_fixture(fixtures, "rerank", {"model": "model-c", "query": "q"}, "d" * 64)
+    (fixtures / "misses.jsonl").write_text("{}\n", encoding="utf-8")
+
+    assert main(["proxy", "fixtures", "--fixtures", str(fixtures)]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        "embedding model-a: 2 fixtures",
+        "embedding model-b: 1 fixture",
+        "rerank model-c: 1 fixture",
+    ]
+
+
+def test_proxy_fixtures_lists_a_fixture_without_a_model_last(tmp_path, capsys):
+    fixtures = tmp_path / "fixtures"
+    save_fixture(fixtures, "embedding", {"model": "model-a", "input": ["a"]}, "a" * 64)
+    save_fixture(fixtures, "embedding", {"input": ["b"]}, "b" * 64)
+
+    assert main(["proxy", "fixtures", "--fixtures", str(fixtures)]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        "embedding model-a: 1 fixture",
+        "embedding (no model): 1 fixture",
+    ]
+
+
+def test_proxy_fixtures_says_so_for_an_empty_tree(tmp_path, capsys):
+    fixtures = tmp_path / "fixtures"
+
+    assert main(["proxy", "fixtures", "--fixtures", str(fixtures)]) == 0
+
+    assert capsys.readouterr().out.strip() == f"No fixtures in {fixtures}"
+
+
+def test_proxy_fixtures_reports_a_broken_tree_as_one_error_line(tmp_path, capsys):
+    fixtures = tmp_path / "fixtures"
+    shard = fixtures / "embedding" / "ab"
+    shard.mkdir(parents=True)
+    (shard / ("ab" + "0" * 62 + ".json")).write_text("{", encoding="utf-8")
+
+    try:
+        code = main(["proxy", "fixtures", "--fixtures", str(fixtures)])
+    except FixtureError:
+        pytest.fail("the CLI let FixtureError escape instead of printing one error line")
+
+    assert code == 1
+    error = capsys.readouterr().err
+    assert error.startswith("error: ")
+    assert "is not valid JSON" in error
+    assert len(error.splitlines()) == 1
+
+
+def test_proxy_fixtures_rejects_a_mode(tmp_path, capsys):
+    code = main(["proxy", "--mode", "replay", "fixtures", "--fixtures", str(tmp_path)])
+
+    assert code == 1
+    error = capsys.readouterr().err
+    assert "--mode" in error
+    assert "fixtures" in error
 
 
 @pytest.mark.parametrize(
