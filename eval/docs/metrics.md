@@ -82,6 +82,11 @@ the nearest-rank definition: sort the latencies and take rank
 mean and both latencies are `null`, not `0`, so "nothing measured" is not
 mistaken for a score of zero.
 
+Latency is measured under the run's `concurrency` (how many questions were in
+flight at once, recorded in the header): requests that share Trelis and the
+model provider wait on each other, so compare latencies only between runs at
+the same concurrency. The metrics do not depend on it.
+
 ## Questions that are not scored
 
 A `null_query` has no evidence: its expected answer is "insufficient
@@ -141,7 +146,7 @@ Retrieval Technique and model without a schema change.
 ### `run`
 
 ```json
-{"schema_version": 1, "type": "run", "run_id": "20260101T000000Z", "config": {"name": "dense", "techniques": ["dense"]}, "top_k": 10, "golden_set": {"path": "eval/data/multihop-rag/subset-golden.jsonl", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "questions": 500}, "manifest": {"path": "eval/data/multihop-rag/manifest.jsonl", "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}, "base_url": "http://localhost:8080", "harness_version": "0.1.0", "started_at": "2026-01-01T00:00:00+00:00"}
+{"schema_version": 1, "type": "run", "run_id": "20260101T000000Z", "config": {"name": "dense", "techniques": ["dense"]}, "top_k": 10, "concurrency": 1, "golden_set": {"path": "eval/data/multihop-rag/subset-golden.jsonl", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "questions": 500}, "manifest": {"path": "eval/data/multihop-rag/manifest.jsonl", "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}, "base_url": "http://localhost:8080", "harness_version": "0.1.0", "started_at": "2026-01-01T00:00:00+00:00"}
 ```
 
 ### `question` — scored

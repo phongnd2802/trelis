@@ -14,6 +14,7 @@ import httpx
 
 from .ablation_run import (
     HARNESS_VERSION,
+    MAX_CONCURRENCY,
     AblationAborted,
     AblationRun,
     AblationRunFile,
@@ -43,6 +44,11 @@ from .multihop import (
 
 DEFAULT_DATA_DIR = Path("eval/data/multihop-rag")
 DEFAULT_BASE_URL = "http://localhost:8080"
+
+DEFAULT_REQUEST_TIMEOUT = 120.0
+"""Seconds one POST /retrieve may take. Trelis embeds the query with a hosted
+model inside the request, and a slow provider answer must not turn into a
+question error that biases the means."""
 
 
 class CliError(RuntimeError):
@@ -166,6 +172,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Chunks to retrieve per question, between 10 and 100",
     )
     run_command.add_argument(
+        "--concurrency",
+        type=_concurrency,
+        default=1,
+        help=f"questions in flight at once, 1 to {MAX_CONCURRENCY} (recorded in the results "
+        "header, since latency is measured under it)",
+    )
+    run_command.add_argument(
+        "--request-timeout",
+        type=_positive_float,
+        default=DEFAULT_REQUEST_TIMEOUT,
+        help="seconds to wait for one POST /retrieve, including Trelis's own model call",
+    )
+    run_command.add_argument(
         "--out-dir", type=Path, default=Path("eval/runs"), help="directory for results files"
     )
     run_command.add_argument(
@@ -276,7 +295,9 @@ def _run_retrieval(args: argparse.Namespace, transport: httpx.BaseTransport | No
     manifest_ref = ManifestRef(path=str(args.manifest), sha256=file_sha256(args.manifest))
 
     exit_code = 0
-    with TrelisClient(base_url, api_key, transport=transport) as client:
+    with TrelisClient(
+        base_url, api_key, transport=transport, timeout=args.request_timeout
+    ) as client:
         for config, path in zip(configs, paths, strict=True):
             try:
                 run = run_ablation(
@@ -286,6 +307,7 @@ def _run_retrieval(args: argparse.Namespace, transport: httpx.BaseTransport | No
                     config,
                     args.top_k,
                     clock=time.monotonic,
+                    concurrency=args.concurrency,
                 )
             except AblationAborted as exc:
                 print(f"config {config.name}: aborted: {exc}")
@@ -392,4 +414,20 @@ def _non_negative_int(value: str) -> int:
     number = int(value)
     if number < 0:
         raise argparse.ArgumentTypeError("must not be negative")
+    return number
+
+
+def _concurrency(value: str) -> int:
+    """Parse --concurrency: how many questions an Ablation Run keeps in flight."""
+    number = int(value)
+    if not 1 <= number <= MAX_CONCURRENCY:
+        raise argparse.ArgumentTypeError(f"must be between 1 and {MAX_CONCURRENCY}")
+    return number
+
+
+def _positive_float(value: str) -> float:
+    """Parse a number of seconds that must be above zero."""
+    number = float(value)
+    if not number > 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
     return number

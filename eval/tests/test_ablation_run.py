@@ -605,6 +605,7 @@ def test_jsonl_round_trip_keeps_the_trace_hashes_and_never_the_api_key(tmp_path)
         "sha256": hashlib.sha256((tmp_path / "manifest.jsonl").read_bytes()).hexdigest(),
     }
     assert "api_key" not in lines[0]
+    assert lines[0]["concurrency"] == 1
     assert lines[1]["trace"] == list(TRACE)
     assert "content" not in lines[1]["retrieved"][0]
     assert "context_header" not in lines[1]["retrieved"][0]
@@ -617,6 +618,7 @@ def test_jsonl_reader_rejects_a_bad_schema_or_record_order(tmp_path):
         "run_id": "run",
         "config": {"name": "dense", "techniques": ["dense"]},
         "top_k": 10,
+        "concurrency": 1,
         "golden_set": {"path": "golden.jsonl", "sha256": "0" * 64, "questions": 0},
         "manifest": {"path": "manifest.jsonl", "sha256": "0" * 64},
         "base_url": BASE_URL,
@@ -674,6 +676,7 @@ def test_jsonl_reader_requires_sorted_config_techniques(tmp_path):
         "run_id": "run",
         "config": {"name": "dense+bm25", "techniques": ["dense", "bm25"]},
         "top_k": 10,
+        "concurrency": 1,
         "golden_set": {"path": "golden.jsonl", "sha256": "0" * 64, "questions": 0},
         "manifest": {"path": "manifest.jsonl", "sha256": "0" * 64},
         "base_url": BASE_URL,
@@ -699,3 +702,81 @@ def test_default_run_id_is_a_utc_timestamp():
     now = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
 
     assert default_run_id(now=lambda: now) == "20260102T030405Z"
+
+
+def concurrency_fixture(count):
+    golden = [question(f"q{i}", ["https://example.com/a"]) for i in range(count)]
+    manifest = Manifest(
+        source_by_document={"doc-a": "https://example.com/a"},
+        completed_source_ids=frozenset({"https://example.com/a"}),
+    )
+    return golden, manifest
+
+
+def test_a_concurrent_run_keeps_golden_set_order_and_records_its_concurrency():
+    golden, manifest = concurrency_fixture(8)
+    # Only even questions find the evidence, so a reordered result would show.
+    server = RetrievalServer({f"Question q{i}?": [chunk("doc-a", f"c{i}")] for i in range(0, 8, 2)})
+
+    with make_client(server) as client:
+        run = run_ablation(
+            client, golden, manifest, RetrievalConfig("dense", ("dense",)), concurrency=4
+        )
+
+    assert [result.id for result in run.questions] == [f"q{i}" for i in range(8)]
+    assert [result.metrics.recall_at_10 for result in run.questions] == [1.0, 0.0] * 4
+    assert len(server.requests) == 8
+    assert run.concurrency == 4
+
+
+def test_concurrent_requests_really_overlap():
+    import threading
+
+    golden, manifest = concurrency_fixture(2)
+    # Both requests must be in flight at once to pass the barrier; a
+    # sequential run would time out on it.
+    barrier = threading.Barrier(2, timeout=5)
+    server = RetrievalServer({})
+
+    def handler(request):
+        barrier.wait()
+        return server(request)
+
+    with make_client(handler) as client:
+        run = run_ablation(
+            client, golden, manifest, RetrievalConfig("dense", ("dense",)), concurrency=2
+        )
+
+    assert run.summary.scored == 2
+
+
+def test_a_rejected_config_aborts_a_concurrent_run_without_sending_every_question():
+    golden, manifest = concurrency_fixture(50)
+    server = RetrievalServer({}, failing_queries={f"Question q{i}?" for i in range(50)})
+
+    with make_client(server) as client, pytest.raises(AblationAborted):
+        run_ablation(client, golden, manifest, RetrievalConfig("bm25", ("bm25",)), concurrency=2)
+
+    assert len(server.requests) < 50
+
+
+@pytest.mark.parametrize("concurrency", [0, -1, 33, True])
+def test_concurrency_must_be_between_1_and_32(concurrency):
+    golden, manifest = concurrency_fixture(1)
+    with make_client(RetrievalServer({})) as client, pytest.raises(ValueError, match="concurrency"):
+        run_ablation(
+            client, golden, manifest, RetrievalConfig("dense", ("dense",)), concurrency=concurrency
+        )
+
+
+def test_jsonl_round_trip_keeps_the_concurrency_latency_was_measured_under(tmp_path):
+    import dataclasses
+
+    golden = [question("q1", ["https://example.com/a"])]
+    run_file = build_run_file(tmp_path, golden, RetrievalServer({}))
+    run_file = dataclasses.replace(run_file, run=dataclasses.replace(run_file.run, concurrency=4))
+    path = tmp_path / "runs" / "r" / "dense.jsonl"
+
+    write_ablation_run(path, run_file)
+
+    assert load_ablation_run(path).run.concurrency == 4

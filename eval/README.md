@@ -147,6 +147,12 @@ Each value is Retrieval Techniques joined with `+`; techniques are sorted, so
 also the results file name. The default is one `dense` config. `--top-k` must
 be between 10 and 100; the header records it, and MRR is MRR@top-k in effect.
 
+Each `POST /retrieve` includes Trelis's own call to the embedding model, so a
+slow hosted provider sets the pace. `--request-timeout` (default 120 s) keeps a
+slow answer from becoming a question error, and `--concurrency N` (default 1,
+at most 32) keeps N questions in flight to cut the wall-clock time. The header
+records the concurrency because latency is measured under it.
+
 The command runs the configs one after another, writes
 `eval/runs/<run-id>/<config-name>.jsonl`, and prints one line per Ablation Run
 with `scored`/`skipped`/`error` counts, the four metric means and the p50/p95

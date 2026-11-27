@@ -11,6 +11,7 @@ import hashlib
 import json
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -42,6 +43,9 @@ from .metrics import (
 )
 
 SCHEMA_VERSION = 1
+
+MAX_CONCURRENCY = 32
+"""The most questions one Ablation Run keeps in flight at once."""
 HARNESS_VERSION = version("trelis-eval")
 
 RECALL_5 = "recall@5"
@@ -232,6 +236,9 @@ class AblationRun:
     finished_at: str
     questions: tuple[QuestionResult, ...]
     summary: RunSummary
+    # Requests in flight at once. Latency is measured under this load, so two
+    # runs' latencies compare only at the same concurrency.
+    concurrency: int = 1
 
 
 def run_ablation(
@@ -242,6 +249,7 @@ def run_ablation(
     top_k: int = 10,
     *,
     clock: Callable[[], float] = time.monotonic,
+    concurrency: int = 1,
 ) -> AblationRun:
     """Score every Golden question under one Retrieval Config.
 
@@ -250,16 +258,26 @@ def run_ablation(
     :class:`AblationAborted`, because Trelis rejected the config rather than the
     question. Missing evidence Documents and a per-Principal question fail
     before any request runs.
+
+    With ``concurrency`` above 1, that many questions are in flight at once;
+    the results keep Golden Set order, and an abort cancels the questions not
+    yet sent.
     """
+    if (
+        not isinstance(concurrency, int)
+        or isinstance(concurrency, bool)
+        or not 1 <= concurrency <= MAX_CONCURRENCY
+    ):
+        raise ValueError(
+            f"concurrency must be between 1 and {MAX_CONCURRENCY}, got {concurrency!r}"
+        )
     if not isinstance(top_k, int) or isinstance(top_k, bool) or not 10 <= top_k <= 100:
         raise ValueError(f"top_k must be between 10 and 100, got {top_k!r}")
     _check_principals(golden)
     _check_evidence(golden, manifest)
 
     started_at = _utc_now()
-    results = tuple(
-        _score_question(client, question, manifest, config, top_k, clock) for question in golden
-    )
+    results = _score_questions(client, golden, manifest, config, top_k, clock, concurrency)
     finished_at = _utc_now()
 
     scored = [result for result in results if result.status is QuestionStatus.SCORED]
@@ -283,7 +301,35 @@ def run_ablation(
         finished_at=finished_at,
         questions=results,
         summary=summary,
+        concurrency=concurrency,
     )
+
+
+def _score_questions(
+    client: TrelisClient,
+    golden: Sequence[GoldenQuestion],
+    manifest: Manifest,
+    config: RetrievalConfig,
+    top_k: int,
+    clock: Callable[[], float],
+    concurrency: int,
+) -> tuple[QuestionResult, ...]:
+    """Score the questions, ``concurrency`` at a time, in Golden Set order."""
+    if concurrency == 1:
+        return tuple(
+            _score_question(client, question, manifest, config, top_k, clock) for question in golden
+        )
+    executor = ThreadPoolExecutor(max_workers=concurrency)
+    futures = [
+        executor.submit(_score_question, client, question, manifest, config, top_k, clock)
+        for question in golden
+    ]
+    try:
+        return tuple(future.result() for future in futures)
+    finally:
+        # On an abort, drop the questions still queued instead of sending
+        # each one only to be rejected the same way.
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def _check_principals(golden: Sequence[GoldenQuestion]) -> None:
@@ -454,6 +500,7 @@ class _RunHeader:
     base_url: str
     harness_version: str
     started_at: str
+    concurrency: int
 
 
 @dataclass(frozen=True)
@@ -492,6 +539,7 @@ def _run_record(run_file: AblationRunFile) -> dict[str, Any]:
             "techniques": list(run.config.techniques),
         },
         "top_k": run.top_k,
+        "concurrency": run.concurrency,
         "golden_set": {
             "path": run_file.golden_set.path,
             "sha256": run_file.golden_set.sha256,
@@ -607,6 +655,7 @@ def load_ablation_run(path: str | Path) -> AblationRunFile:
         run=AblationRun(
             config=header.config,
             top_k=header.top_k,
+            concurrency=header.concurrency,
             started_at=header.started_at,
             finished_at=finished_at,
             questions=questions,
@@ -643,6 +692,7 @@ def _parse_run_record(value: dict[str, Any], where: str) -> _RunHeader:
             "run_id",
             "config",
             "top_k",
+            "concurrency",
             "golden_set",
             "manifest",
             "base_url",
@@ -660,7 +710,18 @@ def _parse_run_record(value: dict[str, Any], where: str) -> _RunHeader:
         base_url=string_field(value, "base_url", where),
         harness_version=string_field(value, "harness_version", where),
         started_at=string_field(value, "started_at", where),
+        concurrency=_concurrency_field(value, where),
     )
+
+
+def _concurrency_field(value: dict[str, Any], where: str) -> int:
+    """Return a run header's concurrency, which must be one a run can use."""
+    concurrency = int_field(value, "concurrency", where)
+    if not 1 <= concurrency <= MAX_CONCURRENCY:
+        raise ValueError(
+            f"{where}: 'concurrency' must be between 1 and {MAX_CONCURRENCY}, got {concurrency}"
+        )
+    return concurrency
 
 
 def _top_k_field(value: dict[str, Any], where: str) -> int:
