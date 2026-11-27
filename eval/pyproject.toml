@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trelis-eval"
+version = "0.1.0"
+description = "External eval harness for Trelis, over the public HTTP API (ADR-0001)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["httpx"]
+
+[project.scripts]
+trelis-eval = "trelis_eval.cli:main"
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/trelis_eval"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

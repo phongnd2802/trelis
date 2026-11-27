@@ -88,11 +88,11 @@ func pdfMarkdownIsEmpty(converted *anydoc.Result, err error) bool {
 }
 
 func fileTypeOf(req *types.ParseRequest) string {
-	if ft := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(req.FileType)), "."); ft != "" {
+	if ft := NormalizeFileType(req.FileType); ft != "" {
 		return ft
 	}
 
-	return strings.TrimPrefix(strings.ToLower(filepath.Ext(req.FileName)), ".")
+	return NormalizeFileType(filepath.Ext(req.FileName))
 }
 
 func NewAnydocParser(extractImages bool) *AnydocParser {

@@ -35,6 +35,7 @@ Status: **done** (built, tested, reachable), **partial** (code exists but nothin
 |---|---|---|---|---|---|
 | Parse office documents to Markdown (anydoc, in process, cgo) | done | `internal/parser/anydoc_parser.go`, `internal/parser/anydoc/`, `third_party/anydoc-go/` | the ingest workflow's parse activity; build with `make anydoc-lib`, `make build` | `internal/parser/anydoc/anydoc_test.go`, `internal/parser/anydoc/convert_linked_test.go` (`make test-linked`), `internal/integration/ingest_anydoc_test.go` | ADR-0005, #21 |
 | Supported upload types | done | `internal/utils/import_filetypes.go` | `POST /documents` rejects other types | `internal/router/documents_test.go` | — |
+| Plain-text Source Files (`txt`, `md`, `markdown`) parsed as Markdown without anydoc | done | `internal/parser/plain_text_parser.go`, `internal/parser/format_router.go` | `POST /documents` | `internal/parser/format_router_test.go`, `internal/integration/ingest_test.go` | #38 |
 | Chunker: recursive tier, token limit, protected spans, validator | done | `internal/chunker/` | the ingest workflow (`internal/application/service/ingest.go`) | `internal/chunker/splitter_test.go`, `internal/chunker/strategy_test.go`, `internal/chunker/config_test.go` | #27 |
 | Chunker: heading tier and document profiler (`StrategyAuto` picks the tier chain) | partial | `internal/chunker/heading.go`, `internal/chunker/profile.go` | — | `internal/chunker/heading_test.go`, `internal/chunker/profile_test.go`, `internal/chunker/strategy_test.go` | #28 |
 | Chunker: heuristic tier (Vietnamese legal), tables, parent-child | planned | — | — | — | #29, #30 |
@@ -67,6 +68,17 @@ Each role (`models.chat`, `models.extraction`, `models.judge`, `models.embedding
 | Swagger UI and generated spec | done | `internal/apidocs/` (generated), swag annotations on handlers | `/swagger/index.html`, `/swagger/doc.json`; `server.swagger`; `make swagger` | `internal/router/swagger_test.go` | #117 |
 | Request ID, access log, panic recoverer | done | `internal/router/logging.go` | `X-Request-Id` response header | `internal/router/logging_test.go` | ADR-0008, #119 |
 
+## Eval harness
+
+The harness is an external Python program (ADR-0001) that calls the public
+HTTP API as one Principal; it never imports Go code, reads Postgres or calls
+the admin CLI. Setup and the fetch → ingest walkthrough are in `eval/README.md`.
+
+| Feature | Status | Where | Entry points | Tests | Decisions / issues |
+|---|---|---|---|---|---|
+| MultiHop-RAG Benchmark Corpus: fetch, load, subset selection, one-command ingest as Documents, polling and a `source_id` → Document manifest | done | `eval/src/trelis_eval/multihop.py`, `eval/src/trelis_eval/client.py`, `eval/src/trelis_eval/ingest.py`, `eval/src/trelis_eval/cli.py` | `trelis-eval multihop fetch`, `trelis-eval multihop ingest` | `eval/tests/test_multihop.py`, `eval/tests/test_client.py`, `eval/tests/test_ingest.py`, `eval/tests/test_cli.py` | ADR-0001, #38 |
+| Golden Set JSONL: load with collected validation, write losslessly, document Slices and the MultiHop-RAG mapping | done | `eval/src/trelis_eval/golden.py`, `eval/docs/golden-set.md` | `trelis-eval multihop golden`, `trelis-eval golden validate` | `eval/tests/test_golden.py`, `eval/tests/test_cli.py` | ADR-0001, #38 |
+
 ## Platform
 
 | Feature | Status | Where | Entry points | Tests | Decisions / issues |
@@ -88,5 +100,5 @@ One line per roadmap milestone (#1); the issues hold the detail.
 - **GraphRAG**: Extractions, cross-document Entity Resolution, Neo4j projection, graph read API: Week 4 (#5), ADR-0003, #56, #60, #61.
 - **Agent Answer, tools, MCP server**: Week 5 (#6), #66, #67, #69, #70.
 - **Wiki** (Summary, Entity and Index Pages), **MCP client** with Tool Approval: Week 6 (#7), #62–#65, #71–#73.
-- **Eval harness** (external Python, Golden Set, Ablation Matrix): ADR-0001, Week 2 (#3), #38, #81, #88.
+- **Eval harness** (external Python, Golden Set, Ablation Matrix): skeleton in [Eval harness](#eval-harness) (#38); retrieval metrics, stratified sampling and the record/replay proxy follow (#39, #41); #81, #88.
 - **Frontend, demo**: Week 8 (#9), #83, #84, #86, #87, #89.

@@ -1,0 +1,83 @@
+[
+  {
+    "query": "Which missions launched or returned in 2024?",
+    "answer": "Alpha and Beta.",
+    "question_type": "comparison_query",
+    "evidence_list": [
+      {
+        "title": "Alpha Mission Launches",
+        "author": "Ada Lovelace",
+        "url": "https://example.com/alpha",
+        "source": "Example Science",
+        "category": "science",
+        "published_at": "2024-01-01T10:00:00+00:00",
+        "fact": "The Alpha Mission launched in 2024."
+      },
+      {
+        "title": "Beta Probe Returns",
+        "author": null,
+        "url": "https://example.com/beta",
+        "source": "Example Science",
+        "category": "science",
+        "published_at": "2024-02-02T10:00:00+00:00",
+        "fact": "The Beta Probe returned in 2024."
+      }
+    ]
+  },
+  {
+    "query": "Which health study uses a mission's telescope?",
+    "answer": "The Gamma Study.",
+    "question_type": "inference_query",
+    "evidence_list": [
+      {
+        "title": "Gamma Study Published",
+        "author": "Grace Hopper",
+        "url": "https://example.com/gamma",
+        "source": "Example Health",
+        "category": "health",
+        "published_at": "2024-03-03T10:00:00+00:00",
+        "fact": "The Gamma Study followed 10,000 people."
+      },
+      {
+        "title": "Alpha Mission Launches",
+        "author": "Ada Lovelace",
+        "url": "https://example.com/alpha",
+        "source": "Example Science",
+        "category": "science",
+        "published_at": "2024-01-01T10:00:00+00:00",
+        "fact": "The Alpha Mission carries a telescope."
+      },
+      {
+        "title": "Alpha Mission Launches",
+        "author": "Ada Lovelace",
+        "url": "https://example.com/alpha",
+        "source": "Example Science",
+        "category": "science",
+        "published_at": "2024-01-01T10:00:00+00:00",
+        "fact": "The telescope studies X-rays."
+      }
+    ]
+  },
+  {
+    "query": "What did the Delta report say about Alpha?",
+    "answer": "Insufficient information.",
+    "question_type": "null_query",
+    "evidence_list": []
+  },
+  {
+    "query": "When did Delta publish?",
+    "answer": "April 2024.",
+    "question_type": "temporal_query",
+    "evidence_list": [
+      {
+        "title": "Delta Market Report",
+        "author": null,
+        "url": "https://example.com/delta",
+        "source": "Example Business",
+        "category": "business",
+        "published_at": "2024-04-04T10:00:00+00:00",
+        "fact": "The report was published in April 2024."
+      }
+    ]
+  }
+]
