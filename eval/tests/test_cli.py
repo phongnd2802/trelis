@@ -726,6 +726,29 @@ def test_retrieval_run_defaults_to_a_120s_request_timeout_and_one_request_at_a_t
     assert header["concurrency"] == 1
 
 
+def test_proxy_record_requires_an_upstream(capsys):
+    code = main(["proxy", "--mode", "record", "--fixtures", "unused"])
+
+    assert code == 1
+    assert "at least one --upstream" in capsys.readouterr().err
+
+
+def test_proxy_rejects_a_malformed_upstream_before_listening(capsys):
+    code = main(
+        ["proxy", "--mode", "record", "--upstream", "Embedding=https://openrouter.ai/api/v1"]
+    )
+
+    assert code == 1
+    assert "--upstream" in capsys.readouterr().err
+
+
+def test_proxy_rejects_a_malformed_listen_address_before_listening(capsys):
+    code = main(["proxy", "--mode", "replay", "--listen", "not-an-address"])
+
+    assert code == 1
+    assert "--listen" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     ("flag", "value"),
     [("--concurrency", "0"), ("--concurrency", "33"), ("--request-timeout", "0")],

@@ -31,6 +31,15 @@ from .ablation_run import (
 from .client import TrelisClient, TrelisError
 from .golden import GoldenSetError, load_golden_set, write_golden_set
 from .ingest import IngestRecord, IngestStatus, ingest, write_manifest
+from .model_proxy import (
+    FixtureStore,
+    ProxyConfig,
+    ProxyMode,
+    base_url_lines,
+    parse_listen,
+    parse_upstreams,
+    serve,
+)
 from .multihop import (
     MultiHopDataError,
     fetch,
@@ -195,6 +204,42 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run_command.set_defaults(handler=_run_retrieval)
 
+    proxy = commands.add_parser(
+        "proxy",
+        help="run the OpenAI-compatible record/replay proxy for model calls",
+        epilog=(
+            "Trelis posts to {base_url}/embeddings, /chat/completions, /responses or "
+            "/rerank, so point each role's base_url at http://<listen>/<role>. Each "
+            "--upstream names the provider one role forwards to."
+        ),
+    )
+    proxy.add_argument(
+        "--mode",
+        choices=[mode.value for mode in ProxyMode],
+        required=True,
+        help="record paid calls once, replay fixtures only, or forward without saving",
+    )
+    proxy.add_argument(
+        "--upstream",
+        action="append",
+        default=[],
+        metavar="ROLE=URL",
+        help="provider base URL for one role (repeatable), "
+        "e.g. embedding=https://openrouter.ai/api/v1",
+    )
+    proxy.add_argument(
+        "--fixtures",
+        type=Path,
+        default=Path("eval/fixtures/models"),
+        help="fixture tree (default: eval/fixtures/models)",
+    )
+    proxy.add_argument(
+        "--listen",
+        default="127.0.0.1:4100",
+        help="host:port to listen on (default: 127.0.0.1:4100)",
+    )
+    proxy.set_defaults(handler=_run_proxy)
+
     return parser
 
 
@@ -328,6 +373,33 @@ def _run_retrieval(args: argparse.Namespace, transport: httpx.BaseTransport | No
             if run.summary.scored == 0:
                 exit_code = 1
     return exit_code
+
+
+def _run_proxy(args: argparse.Namespace, transport: httpx.BaseTransport | None) -> int:
+    """Serve the record/replay proxy until Ctrl-C."""
+    del transport
+    mode = ProxyMode(args.mode)
+    upstreams = parse_upstreams(args.upstream)
+    host, port = parse_listen(args.listen)
+    config = ProxyConfig(mode, args.fixtures, upstreams)
+    server = serve(config, host, port)
+    bound_host, bound_port = server.server_address[:2]
+    try:
+        print(f"Listening on http://{bound_host}:{bound_port}/ (mode: {mode.value})")
+        roles = upstreams or FixtureStore(config.fixtures_dir).roles()
+        if roles:
+            print("Point Trelis's model roles at the proxy with:")
+            for line in base_url_lines(bound_host, bound_port, roles):
+                print(f"  {line}")
+        else:
+            print("No roles named yet; record fixtures or pass --upstream ROLE=URL.")
+        print("Press Ctrl-C to stop.")
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        server.server_close()
+    return 0
 
 
 def _print_retrieval_summary(run: AblationRun, path: Path) -> None:
