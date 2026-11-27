@@ -195,6 +195,36 @@ Chunk change cannot silently score a stale answer. [docs/record-replay.md](docs/
 covers the routing, the key, the fixture schema, the modes, the miss workflow
 and a worked dense-baseline example.
 
+## Re-run a baseline
+
+`scripts/eval-stack.sh` replaces `make dev` for an Ablation Run. It builds
+Trelis from the checkout and starts it on `:8080` against the dev database,
+with the embedding role routed through the proxy, and keeps both running in
+the background:
+
+```sh
+# First run of a new question set: pay each query embedding once.
+TRELIS_MODELS_EMBEDDING_API_KEY=... scripts/eval-stack.sh up record
+# Every later run: fixtures only, no provider key, no cost.
+scripts/eval-stack.sh up replay
+
+uv run --project eval trelis-eval retrieval run \
+  --golden eval/data/multihop-rag/strat500-golden.jsonl \
+  --manifest eval/data/multihop-rag/strat500-manifest.jsonl \
+  --config bm25 --config dense --config bm25+dense --concurrency 4
+
+scripts/eval-stack.sh down
+```
+
+The stratified-500 corpus in the dev database belongs to the Principal
+`eval`, so the run needs one of its keys (`admin key create eval`, see
+above). Stop `make dev` first: the script refuses to start while something
+serves `:8080`. A replay run reproduces a recorded run's metrics exactly, and
+its `dense/embed_query` step drops to a few milliseconds, so compare latency
+only between runs that made, or replayed, the same model calls.
+`eval/baselines/README.md` lists the kept reference rows and the command for
+each.
+
 ## Tests
 
 ```sh
