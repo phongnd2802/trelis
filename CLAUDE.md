@@ -3,6 +3,7 @@
 - Each ticket gets its own branch `<type>/<slug>` (e.g. `feat/chunker-core`) cut from `main`, and a PR whose body has `Closes #N`. `main` only changes through merged PRs.
 - Before pushing, run `make lint vet test`, plus `make eval-lint eval-test` when `eval/` changed; CI also runs the `-linked` variants, integration tests and a compose smoke test (`.github/workflows/ci.yml`). After pushing, wait with `scripts/ci-wait.sh <branch>`.
 - Develop with `make dev-up` (dependencies) and `make dev` (Trelis on the host; Swagger UI at http://localhost:8080/swagger/index.html). `make stack-up` runs the full stack with the trelis image.
+- Local dev secrets live in `.local/` (gitignored): `dev-credentials.md` (Principals, Groups, API keys), `eval.env` (`TRELIS_API_KEY` of the `eval` Principal, which owns the ingested Benchmark Corpus) and `models.env` (model role keys, exported by `make dev` and `scripts/eval-stack.sh`). Never print their values.
 - Read `docs/feature-map.md` before exploring the code: it says what exists, where it lives and what is planned.
 - `CODING_STANDARDS.md` holds the review rules (access, layers, logging, HTTP API, docs, tests).
 
