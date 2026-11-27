@@ -7,15 +7,23 @@
 // are; both put the section breadcrumb their Content does not already hold in
 // ContextHeader. The recursive tier always ends the chain and its output is
 // returned even when rejected, so non-blank text always yields Chunks.
-// Protected spans (fenced code, tables, math, inline code, links and images)
-// are kept whole within a Chunk; overlap between Chunks starts at a semantic
-// boundary.
+// Protected spans (fenced code, math, inline code, links and images) are kept
+// whole within a Chunk. A table too large for one Chunk is split at row
+// boundaries, and the Chunks after the first carry its header in
+// ContextHeader. Overlap between Chunks starts at a semantic boundary.
+//
+// SplitParentChild packs the child Chunks Split returns into wider parent
+// Chunks, never embedded.
 package chunker
 
 import (
 	"strings"
 	"unicode/utf8"
 )
+
+// contextSeparator joins a Chunk's ContextHeader to its Content when it is
+// embedded.
+const contextSeparator = "\n\n"
 
 // Chunk is a contiguous piece of a Document's text.
 //
@@ -40,7 +48,7 @@ func (c Chunk) EmbeddingContent() string {
 	if c.ContextHeader == "" {
 		return body
 	}
-	return c.ContextHeader + "\n\n" + body
+	return c.ContextHeader + contextSeparator + body
 }
 
 // runeIndex converts byte offsets of one text into rune offsets. It is

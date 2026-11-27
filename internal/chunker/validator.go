@@ -19,9 +19,12 @@ type ValidationResult struct {
 // whether the chain should fall through to the next tier. cfg must have its
 // defaults applied. Each Chunk must be the source text at its offsets and
 // must not start or end inside a protected span, unless the span is too
-// large to keep whole (see SplitterConfig.TokenLimit). Beyond that the
-// check is deliberately lenient and catches only plainly broken output,
-// with T the target size cfg.ChunkSize:
+// large to keep whole (see SplitterConfig.TokenLimit); a table too large for
+// one Chunk may also be cut at a row start, or anywhere inside a row that is
+// itself larger than the room the Chunk has for Content once its
+// ContextHeader is counted. Beyond that the check is deliberately lenient
+// and catches only plainly broken output, with T the target size
+// cfg.ChunkSize:
 //
 //   - no Chunks;
 //   - one Chunk for text over 2T runes that is not one protected span:
@@ -40,14 +43,30 @@ func ValidateChunks(text string, chunks []Chunk, cfg SplitterConfig) ValidationR
 	}
 	target := cfg.ChunkSize
 	runes := []rune(text)
-	protected := toRuneSpans(text, protectedSpans(text))
+	protectedBytes := protectedSpans(text)
+	protected := toRuneSpans(text, protectedBytes)
 	if len(chunks) == 1 && len(runes) > 2*target && !withinSpan(protected, runes, chunks[0]) {
 		return reject("one chunk for a document of %d runes", len(runes))
 	}
 	wholeLimit := protectedLimit(cfg, text)
-	cuts := func(pos int) bool {
-		s, ok := spanAround(protected, pos)
-		return ok && s.end-s.start <= wholeLimit
+	layouts := make([]tableLayout, len(protected))
+	for i, s := range protectedBytes {
+		if isTableSpan(text, s) && protected[i].end-protected[i].start > target {
+			layouts[i] = tableLayoutIn(text, s, protected[i])
+		}
+	}
+	breaksProtectedSpan := func(pos, chunkStart, budget int) bool {
+		i := firstEndingAfter(protected, pos)
+		if i >= len(protected) || protected[i].start >= pos {
+			return false
+		}
+		if !isTableSpan(text, protectedBytes[i]) {
+			return protected[i].end-protected[i].start <= wholeLimit
+		}
+		if protected[i].end-protected[i].start <= target {
+			return true
+		}
+		return tableCutBreaksSpan(protected[i], layouts[i], pos, chunkStart, budget)
 	}
 
 	longest, tiny := 0, 0
@@ -55,7 +74,10 @@ func ValidateChunks(text string, chunks []Chunk, cfg SplitterConfig) ValidationR
 		if c.Start < 0 || c.End > len(runes) || c.Start >= c.End || string(runes[c.Start:c.End]) != c.Content {
 			return reject("chunk %d is not the source text at [%d,%d)", i, c.Start, c.End)
 		}
-		if cuts(c.Start) || cuts(c.End) {
+		// A Chunk's Content budget is what its ContextHeader leaves of the
+		// target; a row the splitter cut inside must be longer than that.
+		budget := target - contextCost(c.ContextHeader)
+		if breaksProtectedSpan(c.Start, c.Start, budget) || breaksProtectedSpan(c.End, c.Start, budget) {
 			return reject("chunk %d at [%d,%d) cuts a protected span", i, c.Start, c.End)
 		}
 		n := c.End - c.Start
@@ -74,15 +96,6 @@ func ValidateChunks(text string, chunks []Chunk, cfg SplitterConfig) ValidationR
 		return reject("no chunk reaches a quarter of the target size %d", target)
 	}
 	return ValidationResult{OK: true}
-}
-
-// spanAround returns the span that pos falls strictly inside, if any.
-func spanAround(spans []span, pos int) (span, bool) {
-	i := firstEndingAfter(spans, pos)
-	if i < len(spans) && spans[i].start < pos {
-		return spans[i], true
-	}
-	return span{}, false
 }
 
 // withinSpan reports whether c, less surrounding whitespace, lies inside a

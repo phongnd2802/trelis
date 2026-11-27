@@ -144,7 +144,7 @@ func TestTheLastTierIsReturnedEvenWhenRejected(t *testing.T) {
 	assertPositions(t, text, chunks)
 }
 
-func TestLargeProtectedSpansAreNotRejected(t *testing.T) {
+func TestALargeTableDoesNotFailValidation(t *testing.T) {
 	var rows strings.Builder
 	rows.WriteString("| Bậc | Thuế suất |\n|---|---|\n")
 	for i := range 100 {
@@ -155,8 +155,8 @@ func TestLargeProtectedSpansAreNotRejected(t *testing.T) {
 		name string
 		cfg  SplitterConfig
 	}{
-		{"kept whole over twice the size", SplitterConfig{Strategy: StrategyRecursive}},
-		{"cut at the token limit", SplitterConfig{TokenLimit: 300, Languages: []string{LangEnglish}, Strategy: StrategyRecursive}},
+		{"split at its rows", SplitterConfig{Strategy: StrategyRecursive}},
+		{"budgeted by the token limit", SplitterConfig{TokenLimit: 300, Languages: []string{LangEnglish}, Strategy: StrategyRecursive}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -294,6 +294,8 @@ func TestDiagnosticsForEmptyText(t *testing.T) {
 
 func TestValidateChunks(t *testing.T) {
 	long := strings.Repeat("a", 1000)
+	bigTable := "| a | b |\n|---|---|\n" + strings.Repeat("| x | y |\n", 20)
+	oneLongRow := "| a | b |\n|---|---|\n|" + strings.Repeat("x", 100) + "|"
 	evenly := func(text string, size int) []Chunk {
 		var out []Chunk
 		n := utf8.RuneCountInString(text)
@@ -319,6 +321,10 @@ func TestValidateChunks(t *testing.T) {
 		{"one chunk with offsets past the text", long, []Chunk{{Content: long, Start: 0, End: 5000}}, 100, "one chunk for a document"},
 		{"content not at its offsets", "xin chào", []Chunk{{Content: "chào", Start: 0, End: 4}}, 100, "is not the source text"},
 		{"a cut table", "a\n" + table, byLines("a\n"+table, SplitterConfig{}), 1000, "cuts a protected span"},
+		{"a cut at a row start of a big table", bigTable, []Chunk{chunkAt(bigTable, 0, 0, 30), chunkAt(bigTable, 1, 30, 220)}, 60, ""},
+		{"a cut mid-row of a big table with short rows", bigTable, []Chunk{chunkAt(bigTable, 0, 0, 25), chunkAt(bigTable, 1, 25, 220)}, 60, "cuts a protected span"},
+		{"a cut inside a row longer than the target", oneLongRow, []Chunk{chunkAt(oneLongRow, 0, 0, 70), chunkAt(oneLongRow, 1, 70, 122)}, 60, ""},
+		{"a cut inside a table that fits", table, []Chunk{chunkAt(table, 0, 0, 47), chunkAt(table, 1, 47, 234)}, 400, "cuts a protected span"},
 		{"a lone protected span over twice the size", "Mở đầu.\n\n" + table, []Chunk{chunkAt("Mở đầu.\n\n"+table, 0, 0, 9), chunkAt("Mở đầu.\n\n"+table, 1, 9, 9+utf8.RuneCountInString(table))}, 60, ""},
 	}
 	for _, tt := range tests {

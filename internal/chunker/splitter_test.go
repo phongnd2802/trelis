@@ -189,7 +189,8 @@ func TestProtectedSpansAreNeverSplit(t *testing.T) {
 		name string
 		span string
 	}{
-		{"pipe table", table},
+		// Tables have their own rule: one over ChunkSize splits at its rows
+		// (see TestTableHeaderCarriesOver).
 		{"backtick fence with blank lines", "```go\nfunc main() {\n\tfmt.Println(\"a\")\n\n\tfmt.Println(\"b\")\n}\n```"},
 		{"tilde fence holding a shorter fence", "~~~~\nline one\n\n~~~\nstill code\n~~~~"},
 		{"fence holding table-like lines", "```\n| a | b |\n|---|---|\n\n| c | d |\n```"},
@@ -274,10 +275,31 @@ func TestStrayBracketDoesNotSwallowTheDocument(t *testing.T) {
 }
 
 func TestAProtectedSpanOverTheChunkSizeStaysWhole(t *testing.T) {
-	text := "Mở đầu.\n\n" + table + "\n\nKết thúc."
-	chunks := Split(text, recursiveCfg(60, 0))
-	assertPositions(t, text, chunks)
-	assertWhole(t, text, table, chunks)
+	fence := "```go\nfunc main() {\n\tfmt.Println(\"a\")\n\n\tfmt.Println(\"b\")\n}\n```"
+	t.Run("a fenced code block", func(t *testing.T) {
+		text := "Mở đầu.\n\n" + fence + "\n\nKết thúc."
+		chunks := Split(text, recursiveCfg(60, 0))
+		assertPositions(t, text, chunks)
+		assertWhole(t, text, fence, chunks)
+	})
+	t.Run("a table splits at its rows instead", func(t *testing.T) {
+		text := "Mở đầu.\n\n" + table + "\n\nKết thúc."
+		chunks := Split(text, recursiveCfg(150, 0))
+		assertPositions(t, text, chunks)
+		header := tableHeaderOf(t, text)
+		continuations := 0
+		for _, c := range chunks {
+			if strings.Contains(c.Content, table) {
+				t.Fatalf("the over-size table is whole in a chunk: %q", first(c.Content, 40))
+			}
+			if c.ContextHeader == header {
+				continuations++
+			}
+		}
+		if continuations == 0 {
+			t.Fatal("no continuation chunk carries the table header")
+		}
+	})
 }
 
 func TestTokenLimitCapsEveryChunkIncludingProtectedSpans(t *testing.T) {

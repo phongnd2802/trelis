@@ -215,12 +215,12 @@ func splitHeading(text string, cfg SplitterConfig) []Chunk {
 func splitSections(text string, cfg SplitterConfig, sections []headingSection) []Chunk {
 	var out []Chunk
 	idx := runeIndex{text: text}
-	hardMax := protectedLimit(cfg, text)
+	caps := splitCaps{protected: protectedLimit(cfg, text), table: cfg.ChunkSize}
 	for _, sec := range sections {
 		base := idx.runeOffset(sec.start)
 		content := text[sec.start:sec.end]
 		n := utf8.RuneCountInString(content)
-		if n <= sectionBudget(cfg, utf8.RuneCountInString(sec.ancestors)) {
+		if n <= sectionBudget(cfg, sec.ancestors) {
 			out = append(out, Chunk{
 				Content:       content,
 				ContextHeader: sec.ancestors,
@@ -230,13 +230,14 @@ func splitSections(text string, cfg SplitterConfig, sections []headingSection) [
 			continue
 		}
 		sectionCfg := cfg
-		sectionCfg.ChunkSize = sectionBudget(cfg, utf8.RuneCountInString(sec.breadcrumb))
+		sectionCfg.ChunkSize = sectionBudget(cfg, sec.breadcrumb)
 		sectionCfg.ChunkOverlap = min(cfg.ChunkOverlap, sectionCfg.ChunkSize/2)
-		for _, c := range splitRecursiveLimited(content, sectionCfg, hardMax) {
+		for _, c := range splitRecursiveLimited(content, sectionCfg, caps) {
+			table := c.ContextHeader
 			if c.Start == 0 {
-				c.ContextHeader = sec.ancestors
+				c.ContextHeader = joinContext(sec.ancestors, table)
 			} else {
-				c.ContextHeader = sec.breadcrumb
+				c.ContextHeader = joinContext(sec.breadcrumb, table)
 			}
 			c.Start += base
 			c.End += base
@@ -249,16 +250,42 @@ func splitSections(text string, cfg SplitterConfig, sections []headingSection) [
 	return out
 }
 
+// joinContext stacks the path a structured tier supplies above the table
+// header the splitter carried, either of which may be empty. EmbeddingContent
+// separates ContextHeader from Content with a blank line, so the two are
+// joined the same way.
+func joinContext(path, header string) string {
+	switch {
+	case path == "":
+		return header
+	case header == "":
+		return path
+	default:
+		return path + contextSeparator + header
+	}
+}
+
+// contextCost is how many runes of a Chunk's budget its ContextHeader takes:
+// the header's runes plus the blank line EmbeddingContent joins it with, or 0
+// when there is no header.
+func contextCost(header string) int {
+	if header == "" {
+		return 0
+	}
+	return utf8.RuneCountInString(header) + utf8.RuneCountInString(contextSeparator)
+}
+
 // sectionBudget is the most Content runes a section's Chunk may hold so that
 // EmbeddingContent, which prepends ContextHeader and a blank line, fits
-// ChunkSize. A breadcrumb may not shrink Chunks below half the target: a
-// path that long is over budget on its own, and pieces that small would
-// fragment. The 1 keeps a tiny ChunkSize from producing zero-length pieces.
-// A Chunk that is one protected span keeps the Document's protected limit
-// instead, because ValidateChunks requires such spans whole.
-func sectionBudget(cfg SplitterConfig, headerRunes int) int {
-	if headerRunes == 0 {
+// ChunkSize. A header may not shrink Chunks below half the target: a path or
+// table header that long is over budget on its own, and pieces that small
+// would fragment. The 1 keeps a tiny ChunkSize from producing zero-length
+// pieces. A Chunk that is one protected span keeps the Document's protected
+// limit instead, because ValidateChunks requires such spans whole.
+func sectionBudget(cfg SplitterConfig, header string) int {
+	cost := contextCost(header)
+	if cost == 0 {
 		return cfg.ChunkSize
 	}
-	return max(1, cfg.ChunkSize/2, cfg.ChunkSize-headerRunes-2)
+	return max(1, cfg.ChunkSize/2, cfg.ChunkSize-cost)
 }
