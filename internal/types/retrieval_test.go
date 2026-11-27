@@ -46,8 +46,11 @@ func TestRetrievalConfigValidateRejectsBadTechniqueLists(t *testing.T) {
 	}{
 		"empty":     {RetrievalConfig{}, []string{"at least one", "dense"}},
 		"duplicate": {RetrievalConfig{Techniques: []RetrievalTechnique{RetrievalTechniqueDense, RetrievalTechniqueDense}}, []string{"dense", "more than once"}},
-		"bm25":      {RetrievalConfig{Techniques: []RetrievalTechnique{"bm25"}}, []string{"bm25", "dense"}},
-		"unknown":   {RetrievalConfig{Techniques: []RetrievalTechnique{"foo"}}, []string{"foo", "dense"}},
+		"two techniques": {
+			RetrievalConfig{Techniques: []RetrievalTechnique{RetrievalTechniqueBM25, RetrievalTechniqueDense}},
+			[]string{"only one retrieval technique per request", "fusion"},
+		},
+		"unknown": {RetrievalConfig{Techniques: []RetrievalTechnique{"foo"}}, []string{"foo", "dense"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := tc.config.Validate()
@@ -60,6 +63,13 @@ func TestRetrievalConfigValidateRejectsBadTechniqueLists(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRetrievalConfigValidateAcceptsBM25Alone(t *testing.T) {
+	config := RetrievalConfig{Techniques: []RetrievalTechnique{RetrievalTechniqueBM25}}
+	if err := config.Validate(); err != nil {
+		t.Fatalf("Validate(%+v) = %v, want bm25 accepted on its own", config, err)
 	}
 }
 

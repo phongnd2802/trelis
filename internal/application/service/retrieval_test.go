@@ -31,16 +31,19 @@ func (f *fakeReadableDocuments) ListReadableDocumentIDs(_ context.Context, princ
 	return f.readable, f.err
 }
 
-// fakeChunkSearch records the dense search arguments and answers fixed
-// matches.
+// fakeChunkSearch records the dense and BM25 search arguments and answers
+// fixed matches. calls counts only dense searches, bm25Calls only BM25 ones,
+// so a test can prove which technique ran.
 type fakeChunkSearch struct {
 	interfaces.ChunkSearcher
 	matches        []*types.ChunkMatch
 	err            error
 	calls          int
+	bm25Calls      int
 	gotDocumentIDs []uuid.UUID
 	gotVector      []float32
 	gotModel       string
+	gotQuery       string
 	gotTopK        int
 }
 
@@ -49,6 +52,13 @@ func (f *fakeChunkSearch) SearchDense(_ context.Context, documentIDs []uuid.UUID
 	f.gotDocumentIDs = append([]uuid.UUID(nil), documentIDs...)
 	f.gotVector = append([]float32(nil), queryVector...)
 	f.gotModel, f.gotTopK = model, topK
+	return f.matches, f.err
+}
+
+func (f *fakeChunkSearch) SearchBM25(_ context.Context, documentIDs []uuid.UUID, query string, topK int) ([]*types.ChunkMatch, error) {
+	f.bm25Calls++
+	f.gotDocumentIDs = append([]uuid.UUID(nil), documentIDs...)
+	f.gotQuery, f.gotTopK = query, topK
 	return f.matches, f.err
 }
 
@@ -184,6 +194,87 @@ func TestRetrieveWithoutReadableDocumentsStillEmbedsAndSearches(t *testing.T) {
 	}
 }
 
+func TestRetrieveBM25RunsWithoutAnEmbeddingModel(t *testing.T) {
+	principalID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000a1")
+	docA := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	docB := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b2")
+	chunkHigh := uuid.MustParse("0190d2a8-0000-7000-8000-000000000002")
+	chunkLow := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+
+	docs := &fakeReadableDocuments{readable: []uuid.UUID{docA, docB}}
+	chunks := &fakeChunkSearch{matches: []*types.ChunkMatch{
+		{Chunk: &types.Chunk{ID: chunkHigh, DocumentID: docA, Seq: 1, Content: "thuế TNCN", ContextHeader: "Chương I"}, Score: 2.5},
+		{Chunk: &types.Chunk{ID: chunkLow, DocumentID: docB, Seq: 0, Content: "thuế giá trị gia tăng"}, Score: 1.25},
+	}}
+	// nil embedder: a bm25-only request must not need models.embedding.
+	retrieval := NewRetrievalService(docs, chunks, nil)
+
+	req := &types.RetrievalRequest{
+		Query:           "  thue tncn  ",
+		TopK:            intPointer(5),
+		RetrievalConfig: &types.RetrievalConfig{Techniques: []types.RetrievalTechnique{types.RetrievalTechniqueBM25}},
+	}
+	got, err := retrieval.Retrieve(callerContext(principalID), req)
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+
+	if docs.calls != 1 || docs.gotPrincipal != principalID {
+		t.Errorf("readable Documents asked %d times for %s, want once for %s", docs.calls, docs.gotPrincipal, principalID)
+	}
+	if chunks.bm25Calls != 1 || chunks.calls != 0 {
+		t.Errorf("bm25/dense searches called %d/%d times, want bm25 once and dense never", chunks.bm25Calls, chunks.calls)
+	}
+	if !slices.Equal(chunks.gotDocumentIDs, []uuid.UUID{docA, docB}) {
+		t.Errorf("search document IDs = %v, want the readable set %v", chunks.gotDocumentIDs, []uuid.UUID{docA, docB})
+	}
+	if chunks.gotQuery != "thue tncn" || chunks.gotTopK != 5 {
+		t.Errorf("search query/top_k = %q/%d, want the trimmed query and 5", chunks.gotQuery, chunks.gotTopK)
+	}
+
+	// The repository's order comes through unchanged, and every result carries
+	// only the bm25 score.
+	wantIDs := []uuid.UUID{chunkHigh, chunkLow}
+	gotIDs := make([]uuid.UUID, len(got.Results))
+	for i, r := range got.Results {
+		gotIDs[i] = r.ChunkID
+		if r.Score != r.Scores[types.RetrievalTechniqueBM25] {
+			t.Errorf("result %s score %v, scores[bm25] %v; want the same value", r.ChunkID, r.Score, r.Scores)
+		}
+		if _, ok := r.Scores[types.RetrievalTechniqueDense]; ok {
+			t.Errorf("result %s carries a dense score, want bm25 alone: %v", r.ChunkID, r.Scores)
+		}
+	}
+	if !slices.Equal(gotIDs, wantIDs) {
+		t.Errorf("result order = %v, want %v", gotIDs, wantIDs)
+	}
+	if got.Results[0].ContextHeader != "Chương I" || got.Results[0].DocumentID != docA {
+		t.Errorf("first result = %+v, want the docA Chunk with its header", got.Results[0])
+	}
+
+	if len(got.Trace) != 1 {
+		t.Fatalf("trace = %+v, want the search step alone", got.Trace)
+	}
+	if step := got.Trace[0]; step.Step != types.TraceStepSearch || step.Technique != types.RetrievalTechniqueBM25 ||
+		step.Candidates == nil || *step.Candidates != 2 || step.Model != "" || step.DurationMS < 0 {
+		t.Errorf("trace[0] = %+v, want the bm25 search step with 2 candidates and no model", step)
+	}
+}
+
+func TestRetrieveBM25WrapsASearchFailure(t *testing.T) {
+	searchErr := errors.New("postgres down")
+	chunks := &fakeChunkSearch{err: searchErr}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{uuid.New()}}, chunks, nil)
+
+	_, err := retrieval.Retrieve(callerContext(uuid.New()), &types.RetrievalRequest{
+		Query:           "thue tncn",
+		RetrievalConfig: &types.RetrievalConfig{Techniques: []types.RetrievalTechnique{types.RetrievalTechniqueBM25}},
+	})
+	if !errors.Is(err, searchErr) || !strings.Contains(err.Error(), "search") {
+		t.Errorf("Retrieve = %v, want the BM25 search error wrapped with what it was doing", err)
+	}
+}
+
 func TestRetrieveWithoutAnEmbeddingModelIsServiceUnavailable(t *testing.T) {
 	docs := &fakeReadableDocuments{err: errors.New("must not be reached")}
 	var embedder interfaces.Embedder // nil: no embedding role configured
@@ -237,8 +328,9 @@ func TestRetrieveRejectsAnInvalidRequestBeforeTouchingItsDependencies(t *testing
 		"top_k zero":        {Query: "who won?", TopK: intPointer(0)},
 		"top_k too large":   {Query: "who won?", TopK: intPointer(101)},
 		"no techniques":     {Query: "who won?", RetrievalConfig: &types.RetrievalConfig{}},
-		"unknown technique": {Query: "who won?", RetrievalConfig: &types.RetrievalConfig{Techniques: []types.RetrievalTechnique{"bm25"}}},
+		"unknown technique": {Query: "who won?", RetrievalConfig: &types.RetrievalConfig{Techniques: []types.RetrievalTechnique{"rerank"}}},
 		"duplicate":         {Query: "who won?", RetrievalConfig: &types.RetrievalConfig{Techniques: []types.RetrievalTechnique{types.RetrievalTechniqueDense, types.RetrievalTechniqueDense}}},
+		"two techniques":    {Query: "who won?", RetrievalConfig: &types.RetrievalConfig{Techniques: []types.RetrievalTechnique{types.RetrievalTechniqueBM25, types.RetrievalTechniqueDense}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			docs := &fakeReadableDocuments{err: errors.New("must not be reached")}

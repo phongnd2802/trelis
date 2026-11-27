@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -58,6 +59,52 @@ func singleConnPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(single.Close)
 	return single
+}
+
+// chunkSeed is one Chunk a test installs: its text and optional context
+// header.
+type chunkSeed struct {
+	content string
+	header  string
+}
+
+// replaceChunks replaces doc's Chunks with seeds in seq order and returns the
+// stored rows, so a test can name their IDs.
+func replaceChunks(t *testing.T, s db.Store, doc *types.Document, seeds []chunkSeed) []*types.Chunk {
+	t.Helper()
+	ctx := context.Background()
+	repo := NewChunkRepository(s)
+	input := make([]*types.Chunk, len(seeds))
+	offset := 0
+	for i, seed := range seeds {
+		input[i] = &types.Chunk{
+			Seq:           i,
+			Content:       seed.content,
+			ContextHeader: seed.header,
+			StartOffset:   offset,
+			EndOffset:     offset + len(seed.content),
+		}
+		offset += len(seed.content)
+	}
+	if err := s.ExecTx(ctx, func(ctx context.Context) error {
+		return repo.ReplaceChunks(ctx, doc.ID, input)
+	}); err != nil {
+		t.Fatalf("ReplaceChunks: %v", err)
+	}
+	stored, err := repo.ListUnembeddedChunks(ctx, doc.ID, 0, len(seeds))
+	if err != nil || len(stored) != len(seeds) {
+		t.Fatalf("ListUnembeddedChunks = %+v, %v; want %d Chunks", stored, err, len(seeds))
+	}
+	return stored
+}
+
+// chunkIDs returns matches' Chunk IDs in order.
+func chunkIDs(matches []*types.ChunkMatch) []uuid.UUID {
+	ids := make([]uuid.UUID, len(matches))
+	for i, match := range matches {
+		ids[i] = match.Chunk.ID
+	}
+	return ids
 }
 
 func TestReplaceChunksLeavesTheSameSetOnEveryRun(t *testing.T) {
@@ -189,19 +236,11 @@ func TestSearchDenseOrdersByCosineAndSkipsUncomparableChunks(t *testing.T) {
 
 	replaceAndEmbed := func(doc *types.Document, vectors [][]float32, model string) []*types.Chunk {
 		t.Helper()
-		input := make([]*types.Chunk, len(vectors))
+		seeds := make([]chunkSeed, len(vectors))
 		for i := range vectors {
-			input[i] = &types.Chunk{Seq: i, Content: fmt.Sprintf("chunk %d", i), StartOffset: i, EndOffset: i + 1}
+			seeds[i] = chunkSeed{content: fmt.Sprintf("chunk %d", i)}
 		}
-		if err := s.ExecTx(ctx, func(ctx context.Context) error {
-			return chunks.ReplaceChunks(ctx, doc.ID, input)
-		}); err != nil {
-			t.Fatalf("ReplaceChunks: %v", err)
-		}
-		stored, err := chunks.ListUnembeddedChunks(ctx, doc.ID, 0, len(input))
-		if err != nil || len(stored) != len(input) {
-			t.Fatalf("ListUnembeddedChunks = %+v, %v; want %d Chunks", stored, err, len(input))
-		}
+		stored := replaceChunks(t, s, doc, seeds)
 		for i, c := range stored {
 			if err := chunks.SetChunkEmbedding(ctx, c.ID, vectors[i], model); err != nil {
 				t.Fatalf("SetChunkEmbedding: %v", err)
@@ -273,18 +312,10 @@ func TestSearchDenseSkipsNaNScoresFromZeroVectors(t *testing.T) {
 	searcher := NewChunkSearcher(s)
 	doc := document(t, s, ids["alice"])
 
-	if err := s.ExecTx(ctx, func(ctx context.Context) error {
-		return chunks.ReplaceChunks(ctx, doc.ID, []*types.Chunk{
-			{Seq: 0, Content: "zero vector", StartOffset: 0, EndOffset: 11},
-			{Seq: 1, Content: "unit vector", StartOffset: 12, EndOffset: 23},
-		})
-	}); err != nil {
-		t.Fatal(err)
-	}
-	stored, err := chunks.ListUnembeddedChunks(ctx, doc.ID, 0, 2)
-	if err != nil || len(stored) != 2 {
-		t.Fatalf("ListUnembeddedChunks = %+v, %v; want both Chunks", stored, err)
-	}
+	stored := replaceChunks(t, s, doc, []chunkSeed{
+		{content: "zero vector"},
+		{content: "unit vector"},
+	})
 	// Cosine similarity is NaN when either vector has zero norm.
 	if err := chunks.SetChunkEmbedding(ctx, stored[0].ID, []float32{0, 0}, "test-embedding"); err != nil {
 		t.Fatal(err)
@@ -309,6 +340,163 @@ func TestSearchDenseSkipsNaNScoresFromZeroVectors(t *testing.T) {
 	if err != nil || len(none) != 0 {
 		t.Errorf("SearchDense with a zero query = %+v, %v; want nothing", none, err)
 	}
+}
+
+func TestSearchBM25MatchesFoldedSyllablesAndSkipsUnreadableDocuments(t *testing.T) {
+	s, ids := seeded(t)
+	ctx := context.Background()
+	searcher := NewChunkSearcher(s)
+
+	readable := document(t, s, ids["alice"])
+	readableChunks := replaceChunks(t, s, readable, []chunkSeed{
+		{header: "Chương I", content: "Người nộp thuế TNCN phải khai thuế thu nhập cá nhân."},
+		{content: "Điều 1. Phạm vi điều chỉnh của luật này."},
+		{content: "Thuế thu nhập cá nhân áp dụng cho cá nhân cư trú."},
+		{content: "Tờ khai thuế TNCN nộp theo mẫu."},
+		{content: "Thuế giá trị gia tăng."},
+	})
+	other := document(t, s, ids["alice"])
+	otherChunks := replaceChunks(t, s, other, []chunkSeed{
+		{content: "Thuế TNCN và thuế thu nhập doanh nghiệp."},
+	})
+	// The best match for the query, deliberately left out of the readable set.
+	secret := document(t, s, ids["alice"])
+	replaceChunks(t, s, secret, []chunkSeed{
+		{content: "Thuế TNCN thuế TNCN thuế TNCN thuế TNCN thuế TNCN."},
+	})
+	tied := document(t, s, ids["alice"])
+	tiedChunks := replaceChunks(t, s, tied, []chunkSeed{
+		{content: "Thuế TNCN."},
+		{content: "Thuế TNCN."},
+	})
+
+	documentIDs := []uuid.UUID{readable.ID, other.ID}
+
+	t.Run("folded match and rank", func(t *testing.T) {
+		got, err := searcher.SearchBM25(ctx, documentIDs, "thue tncn", 10)
+		if err != nil {
+			t.Fatalf("SearchBM25: %v", err)
+		}
+		gotIDs := chunkIDs(got)
+		for i, match := range got {
+			if match.Chunk.DocumentID != readable.ID && match.Chunk.DocumentID != other.ID {
+				t.Errorf("match %d is from %s, want only a readable Document", i, match.Chunk.DocumentID)
+			}
+			if match.Score <= 0 || math.IsNaN(match.Score) {
+				t.Errorf("match %d score = %v, want a positive BM25 score", i, match.Score)
+			}
+			if i > 0 && got[i-1].Score < match.Score {
+				t.Errorf("matches out of order at %d: %v then %v", i, got[i-1].Score, match.Score)
+			}
+		}
+		if slices.Contains(gotIDs, readableChunks[1].ID) {
+			t.Errorf("the unrelated Chunk %s matched %q", readableChunks[1].ID, "thue tncn")
+		}
+		// The Chunk with both query syllables ranks above the one that shares
+		// only "thue".
+		both, shared := slices.Index(gotIDs, readableChunks[0].ID), slices.Index(gotIDs, readableChunks[4].ID)
+		if both == -1 || shared == -1 {
+			t.Fatalf("matches = %v, want the Chunks with thuế TNCN (%s) and thuế alone (%s)",
+				gotIDs, readableChunks[0].ID, readableChunks[4].ID)
+		}
+		if both > shared {
+			t.Errorf("the thuế TNCN Chunk ranked below the thuế-only Chunk: %v", gotIDs)
+		}
+	})
+
+	t.Run("diacritic query", func(t *testing.T) {
+		// A query typed with diacritics matches the same Chunks: the exact
+		// field sees "thuế", the folded field folds the query too.
+		accented, err := searcher.SearchBM25(ctx, documentIDs, "thuế", 10)
+		if err != nil {
+			t.Fatalf("SearchBM25(thuế): %v", err)
+		}
+		accentedIDs := chunkIDs(accented)
+		if len(accentedIDs) == 0 {
+			t.Fatal("SearchBM25(thuế) found nothing, want the Chunks containing thuế")
+		}
+		for _, id := range []uuid.UUID{readableChunks[0].ID, readableChunks[2].ID, readableChunks[4].ID, otherChunks[0].ID} {
+			if !slices.Contains(accentedIDs, id) {
+				t.Errorf("SearchBM25(thuế) = %v, want Chunk %s", accentedIDs, id)
+			}
+		}
+	})
+
+	t.Run("context header", func(t *testing.T) {
+		// The context header is indexed with the content: "chuong" only
+		// occurs in the first Chunk's header.
+		header, err := searcher.SearchBM25(ctx, []uuid.UUID{readable.ID}, "chuong", 10)
+		if err != nil {
+			t.Fatalf("SearchBM25(chuong): %v", err)
+		}
+		if len(header) != 1 || header[0].Chunk.ID != readableChunks[0].ID {
+			t.Errorf("SearchBM25(chuong) = %+v, want only the Chunk headed Chương I", header)
+		}
+	})
+
+	t.Run("Access List top-K", func(t *testing.T) {
+		// The secret Chunk scores highest of all, so a top-K that ranked first
+		// and filtered afterwards would come back short.
+		readableOnly, err := searcher.SearchBM25(ctx, []uuid.UUID{readable.ID}, "thue tncn", 2)
+		if err != nil {
+			t.Fatalf("SearchBM25(readable only): %v", err)
+		}
+		if len(readableOnly) != 2 {
+			t.Fatalf("SearchBM25(readable only, top 2) returned %d matches, want the readable top 2", len(readableOnly))
+		}
+		for _, match := range readableOnly {
+			if match.Chunk.DocumentID != readable.ID {
+				t.Errorf("readable-only search returned a Chunk of %s", match.Chunk.DocumentID)
+			}
+		}
+	})
+
+	t.Run("punctuation", func(t *testing.T) {
+		// Query punctuation is only a token separator, never the Tantivy query
+		// grammar, so it cannot error or change which Chunks match.
+		plain, err := searcher.SearchBM25(ctx, documentIDs, "thue tncn", 10)
+		if err != nil {
+			t.Fatalf("SearchBM25(plain): %v", err)
+		}
+		special, err := searcher.SearchBM25(ctx, documentIDs, `thue: (tncn) "AND" - *`, 10)
+		if err != nil {
+			t.Fatalf("SearchBM25(special characters): %v", err)
+		}
+		plainIDs, specialIDs := chunkIDs(plain), chunkIDs(special)
+		if !slices.Equal(specialIDs, plainIDs) {
+			t.Errorf("results with query punctuation = %v, want the same Chunks as %q: %v",
+				specialIDs, "thue tncn", plainIDs)
+		}
+	})
+
+	t.Run("empty answers", func(t *testing.T) {
+		// No matching token, or a query with no tokens at all, is an empty
+		// answer, not an error. An empty readable set is one too.
+		for _, query := range []string{"zzzz qqqq", ":"} {
+			none, err := searcher.SearchBM25(ctx, documentIDs, query, 10)
+			if err != nil || none == nil || len(none) != 0 {
+				t.Errorf("SearchBM25(%q) = %+v, %v; want an empty non-nil slice", query, none, err)
+			}
+		}
+		if none, err := searcher.SearchBM25(ctx, nil, "thue tncn", 10); err != nil || len(none) != 0 {
+			t.Errorf("SearchBM25(no readable Documents) = %+v, %v; want nothing", none, err)
+		}
+	})
+
+	t.Run("ties ordered by Chunk ID", func(t *testing.T) {
+		tie, err := searcher.SearchBM25(ctx, []uuid.UUID{tied.ID}, "thue tncn", 10)
+		if err != nil {
+			t.Fatalf("SearchBM25(ties): %v", err)
+		}
+		if len(tie) != 2 || tie[0].Score != tie[1].Score {
+			t.Fatalf("SearchBM25(ties) = %+v, want two Chunks with the same score", tie)
+		}
+		want := []uuid.UUID{tiedChunks[0].ID, tiedChunks[1].ID}
+		slices.SortFunc(want, func(a, b uuid.UUID) int { return strings.Compare(a.String(), b.String()) })
+		if !slices.Equal(chunkIDs(tie), want) {
+			t.Errorf("ties ordered %v, want ascending Chunk ID %v", chunkIDs(tie), want)
+		}
+	})
 }
 
 // preFixSearchQuery is the pre-#143 dense search: it parses the text query

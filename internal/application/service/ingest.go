@@ -186,7 +186,11 @@ func (s *ingestService) Complete(ctx context.Context, documentID uuid.UUID) erro
 }
 
 // chunkText is the text a Chunk is embedded from: its ContextHeader, such as
-// a heading breadcrumb, above its source text when there is one.
+// a heading breadcrumb, above its source text when there is one. The BM25
+// index (migrations/00008_bm25_chunks.sql) and SearchBM25Chunks
+// (internal/db/queries/chunks.sql) index and search this same expression;
+// pg_search only uses the index on an exact match, so all three must change
+// together.
 func chunkText(c *types.Chunk) string {
 	if c.ContextHeader == "" {
 		return c.Content

@@ -390,7 +390,7 @@ const docTemplate = `{
                         "bearerAuth": []
                     }
                 ],
-                "description": "Runs the Retrieval Techniques named in retrieval_config (dense today) over the Documents the caller can read and returns the ranked Chunks with per-technique scores and a step trace. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values and unknown techniques are 400; a body over 64 KiB is 413; without models.embedding, dense retrieval is 503.",
+                "description": "Runs the Retrieval Technique named in retrieval_config (dense or bm25) over the Documents the caller can read and returns the ranked Chunks with per-technique scores and a step trace. A bm25 request needs no embedding model. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values, unknown techniques and more than one technique are 400; a body over 64 KiB is 413; without models.embedding, dense retrieval is 503.",
                 "consumes": [
                     "application/json"
                 ],
@@ -432,7 +432,7 @@ const docTemplate = `{
                         }
                     },
                     "400": {
-                        "description": "Body that is not one JSON object, an unknown field or wrong value type, a blank or too-long query, an out-of-range top_k or an invalid retrieval_config",
+                        "description": "Body that is not one JSON object, an unknown field or wrong value type, a blank or too-long query, an out-of-range top_k or an invalid retrieval_config (an unknown technique or more than one)",
                         "schema": {
                             "$ref": "#/definitions/handler.ErrorResponse"
                         }
@@ -456,7 +456,7 @@ const docTemplate = `{
                         }
                     },
                     "503": {
-                        "description": "models.embedding is not configured, so dense retrieval is unavailable",
+                        "description": "models.embedding is not configured, so dense retrieval is unavailable (bm25 still works)",
                         "schema": {
                             "$ref": "#/definitions/handler.ErrorResponse"
                         }
@@ -760,10 +760,12 @@ const docTemplate = `{
         "types.RetrievalTechnique": {
             "type": "string",
             "enum": [
-                "dense"
+                "dense",
+                "bm25"
             ],
             "x-enum-varnames": [
-                "RetrievalTechniqueDense"
+                "RetrievalTechniqueDense",
+                "RetrievalTechniqueBM25"
             ]
         },
         "types.RetrievedChunk": {

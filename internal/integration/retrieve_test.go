@@ -50,25 +50,25 @@ type retrievalAnswer struct {
 	} `json:"data"`
 }
 
-// retrieve POSTs /retrieve as key and returns the decoded answer, failing
-// unless the request succeeded.
-func (tr *trelis) retrieve(t *testing.T, key, query string) retrievalAnswer {
+// retrieve POSTs /retrieve asking for the named technique alone and returns
+// the decoded answer, failing unless the request succeeded.
+func (tr *trelis) retrieve(t *testing.T, key, query, technique string, topK int) retrievalAnswer {
 	t.Helper()
 	resp := tr.post(t, "/retrieve", key, map[string]any{
 		"query":            query,
-		"top_k":            10,
-		"retrieval_config": map[string]any{"techniques": []string{"dense"}},
+		"top_k":            topK,
+		"retrieval_config": map[string]any{"techniques": []string{technique}},
 	})
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("POST /retrieve = %d %s, want 200", resp.StatusCode, body)
+		t.Fatalf("POST /retrieve (%s) = %d %s, want 200", technique, resp.StatusCode, body)
 	}
 	var answer retrievalAnswer
 	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
-		t.Fatalf("decode /retrieve answer: %v", err)
+		t.Fatalf("decode /retrieve (%s) answer: %v", technique, err)
 	}
 	if !answer.Success {
-		t.Fatalf("POST /retrieve answered success = false")
+		t.Fatalf("POST /retrieve (%s) answered success = false", technique)
 	}
 	return answer
 }
@@ -171,7 +171,7 @@ func TestRetrieveReturnsOnlyChunksOfDocumentsTheCallerCanRead(t *testing.T) {
 	}
 	tr.provider.EmbedAs(retrieveQuery, vectors[0])
 
-	bobAnswer := tr.retrieve(t, bob, retrieveQuery)
+	bobAnswer := tr.retrieve(t, bob, retrieveQuery, "dense", 10)
 	bobDocs := map[string]bool{}
 	for _, result := range bobAnswer.Data.Results {
 		if result.DocumentID == secretID {
@@ -198,7 +198,7 @@ func TestRetrieveReturnsOnlyChunksOfDocumentsTheCallerCanRead(t *testing.T) {
 	}
 	checkTrace(t, bobAnswer.Data.Trace, len(bobAnswer.Data.Results))
 
-	aliceAnswer := tr.retrieve(t, alice, retrieveQuery)
+	aliceAnswer := tr.retrieve(t, alice, retrieveQuery, "dense", 10)
 	if len(aliceAnswer.Data.Results) == 0 {
 		t.Fatal("alice received no results, want her own Documents")
 	}
@@ -233,5 +233,110 @@ func TestRetrieveReturnsOnlyChunksOfDocumentsTheCallerCanRead(t *testing.T) {
 	}
 	if !sawQuery {
 		t.Error("the embedding provider never saw the query text on /embeddings")
+	}
+}
+
+// TestRetrieveBM25ReturnsOnlyChunksOfDocumentsTheCallerCanRead is the leakage
+// test for the BM25 path, and the acceptance case for a query typed without
+// diacritics: "thue tncn" must find "thuế TNCN". Alice's Restricted Document
+// repeats the query syllables and scores highest, so a search that ranked
+// globally and filtered afterwards would answer Bob with too few results.
+func TestRetrieveBM25ReturnsOnlyChunksOfDocumentsTheCallerCanRead(t *testing.T) {
+	tr := start(t)
+	alice := tr.principalKey(t, "alice")
+	bob := tr.principalKey(t, "bob")
+
+	const bm25Query = "thue tncn"
+	secretID := tr.upload(t, alice, "secret.md",
+		"# Secret\n\nThuế TNCN thuế TNCN thuế TNCN thuế TNCN thuế TNCN là thuế thu nhập cá nhân.\n")
+	// A Document Alice shares with Bob through its Access List.
+	sharedID := tr.uploadBytesWithFields(t, alice, "shared.md",
+		[]byte("# Shared\n\nThuế TNCN được khấu trừ tại nguồn.\n"), map[string]string{"principals": "bob"})
+	bobID := tr.upload(t, bob, "bob.md", "# Bob\n\nThuế TNCN của bob.\n")
+
+	for _, doc := range []struct{ id, key, name string }{
+		{secretID, alice, "Alice's secret"},
+		{sharedID, alice, "Alice's shared"},
+		{bobID, bob, "Bob's own"},
+	} {
+		if got := tr.waitForIngest(t, doc.key, doc.id); got.ParseStatus != "completed" {
+			t.Fatalf("%s Document parse_status = %q (%q), want completed", doc.name, got.ParseStatus, got.ParseError)
+		}
+	}
+
+	// One result is the readable top-K: the secret's repeated syllables would
+	// win the global first place and leave a post-filtered answer empty.
+	bobTop := tr.retrieve(t, bob, bm25Query, "bm25", 1)
+	if len(bobTop.Data.Results) != 1 {
+		t.Fatalf("bob's bm25 top 1 returned %d results, want the readable top 1", len(bobTop.Data.Results))
+	}
+	if got := bobTop.Data.Results[0].DocumentID; got == secretID {
+		t.Errorf("bob's top result is Alice's Restricted Document %s", got)
+	}
+
+	bobAnswer := tr.retrieve(t, bob, bm25Query, "bm25", 10)
+	bobDocs := map[string]bool{}
+	for _, result := range bobAnswer.Data.Results {
+		if result.DocumentID == secretID {
+			t.Errorf("bob received Chunk %s of alice's Restricted Document", result.ChunkID)
+		}
+		bobDocs[result.DocumentID] = true
+		if bm25, ok := result.Scores["bm25"]; !ok || math.Abs(bm25-result.Score) > 1e-9 {
+			t.Errorf("result %s scores = %v, score %v; want a matching bm25 entry", result.ChunkID, result.Scores, result.Score)
+		}
+		if _, ok := result.Scores["dense"]; ok {
+			t.Errorf("result %s carries a dense score, want bm25 alone: %v", result.ChunkID, result.Scores)
+		}
+		if result.Content == "" || result.ChunkID == "" {
+			t.Errorf("result = %+v, want a Chunk with an ID and content", result)
+		}
+	}
+	if !bobDocs[sharedID] {
+		t.Errorf("bob's results = %v, want the shared Document %s", bobDocs, sharedID)
+	}
+	if !bobDocs[bobID] {
+		t.Errorf("bob's results = %v, want his own Document %s", bobDocs, bobID)
+	}
+	if len(bobAnswer.Data.Trace) != 1 {
+		t.Fatalf("bm25 trace = %+v, want the search step alone", bobAnswer.Data.Trace)
+	}
+	if step := bobAnswer.Data.Trace[0]; step.Step != "search" || step.Technique != "bm25" ||
+		step.Candidates != len(bobAnswer.Data.Results) || step.DurationMS < 0 {
+		t.Errorf("bm25 trace[0] = %+v, want the search step with %d candidates", step, len(bobAnswer.Data.Results))
+	}
+
+	// A query typed with diacritics finds the same Document: the exact field
+	// sees thuế and the folded field folds the query too.
+	aliceAnswer := tr.retrieve(t, alice, "thuế TNCN", "bm25", 10)
+	if len(aliceAnswer.Data.Results) == 0 {
+		t.Fatal("alice received no bm25 results, want her own Documents")
+	}
+	sawSecret := false
+	for _, result := range aliceAnswer.Data.Results {
+		if result.DocumentID == secretID {
+			sawSecret = true
+		}
+	}
+	if !sawSecret {
+		t.Errorf("alice's bm25 results = %+v, want her secret Document %s", aliceAnswer.Data.Results, secretID)
+	}
+	if first := aliceAnswer.Data.Results[0]; first.DocumentID != secretID {
+		t.Errorf("alice's first bm25 result is from %s, want the secret Document %s its repeated syllables rank first",
+			first.DocumentID, secretID)
+	}
+
+	// BM25 never sends the query to the embedding provider.
+	for _, req := range tr.provider.Requests(modeltest.Embeddings) {
+		var body struct {
+			Input []string `json:"input"`
+		}
+		if json.Unmarshal(req.Body, &body) != nil {
+			continue
+		}
+		for _, text := range body.Input {
+			if text == bm25Query || text == "thuế TNCN" {
+				t.Errorf("the embedding provider saw a bm25 query text %q", text)
+			}
+		}
 	}
 }

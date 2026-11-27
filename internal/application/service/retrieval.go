@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
 	apperrors "github.com/phongnd2802/trelis/internal/errors"
 	"github.com/phongnd2802/trelis/internal/types"
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
@@ -12,18 +14,21 @@ import (
 
 // retrievalService answers a query with ranked Chunks. It resolves the
 // caller's readable Documents first and passes that set into the search, so a
-// Restricted Document can neither be found nor influence a count (ADR-0004).
+// Restricted Document is never returned or counted (ADR-0004). BM25's corpus
+// statistics are shared across the whole index, so a Restricted Document can
+// still shift a readable Chunk's score and rank (ADR-0009).
 type retrievalService struct {
 	documents interfaces.DocumentRepository
 	chunks    interfaces.ChunkSearcher
 	// embedder is nil when models.embedding is not configured, which makes
-	// dense retrieval unavailable rather than silently returning nothing.
+	// dense retrieval unavailable rather than silently returning nothing. BM25
+	// needs no embedding model.
 	embedder interfaces.Embedder
 }
 
 // NewRetrievalService returns the retrieval use case. embedder may be nil
-// when no embedding model is configured; Retrieve then answers a
-// service-unavailable error.
+// when no embedding model is configured; dense retrieval then answers a
+// service-unavailable error, while BM25 still runs.
 func NewRetrievalService(documents interfaces.DocumentRepository, chunks interfaces.ChunkSearcher,
 	embedder interfaces.Embedder,
 ) interfaces.RetrievalService {
@@ -31,10 +36,11 @@ func NewRetrievalService(documents interfaces.DocumentRepository, chunks interfa
 }
 
 // Retrieve validates req, resolves the caller's readable Documents and runs
-// the dense search over them. Reads only, so no transaction is needed: the
-// readable set is resolved on every request, never cached. A Principal who
-// can read nothing still gets the trace of the steps that ran, with empty
-// results, so the answer has the same shape as one that matched nothing.
+// the one Retrieval Technique req names over them. Reads only, so no
+// transaction is needed: the readable set is resolved on every request, never
+// cached. A Principal who can read nothing still gets the trace of the steps
+// that ran, with empty results, so the answer has the same shape as one that
+// matched nothing.
 func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalRequest) (*types.RetrievalResult, error) {
 	principal, err := caller(ctx)
 	if err != nil {
@@ -43,7 +49,9 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 	if err := req.Validate(); err != nil {
 		return nil, apperrors.NewValidationError(err.Error())
 	}
-	if s.embedder == nil {
+	// Validate admits exactly one known technique, so this is the one to run.
+	technique := req.RetrievalConfig.Techniques[0]
+	if technique == types.RetrievalTechniqueDense && s.embedder == nil {
 		return nil, apperrors.NewServiceUnavailableError(
 			"dense retrieval needs models.embedding to be configured")
 	}
@@ -57,7 +65,17 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 	if err != nil {
 		return nil, fmt.Errorf("list readable documents: %w", err)
 	}
+	if technique == types.RetrievalTechniqueBM25 {
+		return s.retrieveBM25(ctx, result, documentIDs, req)
+	}
+	return s.retrieveDense(ctx, result, documentIDs, req)
+}
 
+// retrieveDense embeds the query and ranks the readable Chunks by cosine
+// similarity, appending the embed and search steps to result's trace.
+func (s *retrievalService) retrieveDense(ctx context.Context, result *types.RetrievalResult,
+	documentIDs []uuid.UUID, req *types.RetrievalRequest,
+) (*types.RetrievalResult, error) {
 	model := s.embedder.GetModelName()
 	start := time.Now()
 	vectors, err := s.embedder.Embed(ctx, []string{req.Query})
@@ -86,8 +104,35 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 		DurationMS: time.Since(start).Milliseconds(),
 		Candidates: &candidates,
 	})
+	return appendMatches(result, types.RetrievalTechniqueDense, matches), nil
+}
 
-	technique := types.RetrievalTechniqueDense
+// retrieveBM25 ranks the readable Chunks by pg_search's BM25 score, with no
+// embedding call, and appends the search step to result's trace.
+func (s *retrievalService) retrieveBM25(ctx context.Context, result *types.RetrievalResult,
+	documentIDs []uuid.UUID, req *types.RetrievalRequest,
+) (*types.RetrievalResult, error) {
+	start := time.Now()
+	matches, err := s.chunks.SearchBM25(ctx, documentIDs, req.Query, *req.TopK)
+	if err != nil {
+		return nil, fmt.Errorf("search bm25 chunks: %w", err)
+	}
+	candidates := len(matches)
+	result.Trace = append(result.Trace, types.TraceStep{
+		Step:       types.TraceStepSearch,
+		Technique:  types.RetrievalTechniqueBM25,
+		DurationMS: time.Since(start).Milliseconds(),
+		Candidates: &candidates,
+	})
+	return appendMatches(result, types.RetrievalTechniqueBM25, matches), nil
+}
+
+// appendMatches adds matches to result in the order the repository returned
+// them, each with the score of the one technique that produced it. #34's RRF
+// adds a combined entry to Scores; one technique needs only its own.
+func appendMatches(result *types.RetrievalResult, technique types.RetrievalTechnique,
+	matches []*types.ChunkMatch,
+) *types.RetrievalResult {
 	for _, match := range matches {
 		result.Results = append(result.Results, types.RetrievedChunk{
 			ChunkID:       match.Chunk.ID,
@@ -96,11 +141,8 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 			Content:       match.Chunk.Content,
 			ContextHeader: match.Chunk.ContextHeader,
 			Score:         match.Score,
-			// #34's RRF adds its own entry here; dense alone has one.
-			Scores: map[types.RetrievalTechnique]float64{technique: match.Score},
+			Scores:        map[types.RetrievalTechnique]float64{technique: match.Score},
 		})
 	}
-	// The SQL orders the matches by score descending, ties by Chunk ID, and
-	// this loop keeps that order.
-	return result, nil
+	return result
 }

@@ -155,9 +155,9 @@ func TestAnInvalidRequestIsValidation(t *testing.T) {
 		body    string
 		wantMsg []string
 	}{
-		"bm25": {
-			body:    `{"query":"who won?","retrieval_config":{"techniques":["bm25"]}}`,
-			wantMsg: []string{"bm25", "dense"},
+		"two techniques": {
+			body:    `{"query":"who won?","retrieval_config":{"techniques":["bm25","dense"]}}`,
+			wantMsg: []string{"only one retrieval technique per request", "fusion"},
 		},
 		"foo": {
 			body:    `{"query":"who won?","retrieval_config":{"techniques":["foo"]}}`,
@@ -217,6 +217,28 @@ func TestARetrieveBodyOverTheLimitIs413(t *testing.T) {
 	e := decode(t, rec)
 	if e.Success || e.Error == nil || e.Error.Code != 1011 || !strings.Contains(e.Error.Message, "64KB") {
 		t.Errorf("body = %s, want a 1011 error naming the 64KB limit", rec.Body)
+	}
+}
+
+func TestRetrieveSendsTheBM25ConfigToTheService(t *testing.T) {
+	svc := &stubRetrieval{result: &types.RetrievalResult{
+		Results: []types.RetrievedChunk{},
+		Trace:   []types.TraceStep{{Step: types.TraceStepSearch, Technique: types.RetrievalTechniqueBM25}},
+	}}
+	h := newRetrieveRouter(svc)
+
+	rec := postJSON(t, h, "/retrieve",
+		`{"query":"thue tncn","retrieval_config":{"techniques":["bm25"]}}`, "Bearer trelis_alice")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /retrieve = %d %s, want 200", rec.Code, rec.Body)
+	}
+	if svc.got == nil || svc.got.Query != "thue tncn" || svc.got.RetrievalConfig == nil ||
+		len(svc.got.RetrievalConfig.Techniques) != 1 ||
+		svc.got.RetrievalConfig.Techniques[0] != types.RetrievalTechniqueBM25 {
+		t.Errorf("service got %+v, want the bm25 request", svc.got)
+	}
+	if !strings.Contains(rec.Body.String(), `"technique":"bm25"`) {
+		t.Errorf("body = %s, want the bm25 search step", rec.Body)
 	}
 }
 
