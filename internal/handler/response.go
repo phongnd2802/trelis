@@ -16,6 +16,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
@@ -56,12 +57,12 @@ type ErrorResponse struct {
 	Error   ErrorBody `json:"error"`
 }
 
-func writeData(w http.ResponseWriter, status int, data any) {
-	writeJSON(w, status, DataResponse{Success: true, Data: data})
+func writeData(ctx context.Context, w http.ResponseWriter, status int, data any) {
+	writeJSON(ctx, w, status, DataResponse{Success: true, Data: data})
 }
 
-func writePage(w http.ResponseWriter, page *types.PageResult) {
-	writeJSON(w, http.StatusOK, PageResponse{
+func writePage(ctx context.Context, w http.ResponseWriter, page *types.PageResult) {
+	writeJSON(ctx, w, http.StatusOK, PageResponse{
 		Success:  true,
 		Data:     page.Data,
 		Total:    page.Total,
@@ -74,7 +75,7 @@ func writePage(w http.ResponseWriter, page *types.PageResult) {
 // and answered as a generic 500, so internal detail never reaches the client.
 func writeError(w http.ResponseWriter, r *http.Request, err error) {
 	if appErr, ok := errors.IsAppError(err); ok {
-		writeJSON(w, appErr.HTTPCode, ErrorResponse{Error: ErrorBody{
+		writeJSON(r.Context(), w, appErr.HTTPCode, ErrorResponse{Error: ErrorBody{
 			Code:    appErr.Code,
 			Message: appErr.Message,
 			Details: appErr.Details,
@@ -85,7 +86,7 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 		zap.String("method", r.Method),
 		zap.String("route", routePattern(r)),
 		zap.Error(err))
-	writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: ErrorBody{
+	writeJSON(r.Context(), w, http.StatusInternalServerError, ErrorResponse{Error: ErrorBody{
 		Code:    errors.ErrInternalServer,
 		Message: "Internal server error",
 	}})
@@ -107,8 +108,22 @@ func routePattern(r *http.Request) string {
 	return route
 }
 
-func writeJSON(w http.ResponseWriter, status int, body any) {
+// internalErrorJSON is the envelope a body that cannot be encoded is answered
+// with; it is ErrorResponse's generic 500, written as a constant because the
+// normal encoder is what failed.
+const internalErrorJSON = `{"success":false,"error":{"code":1007,"message":"Internal server error","details":null}}`
+
+// writeJSON encodes body before touching the response, so a body that cannot
+// be encoded (for example a NaN score) still gets a complete 500 envelope
+// instead of a 200 header followed by a discarded encode error.
+func writeJSON(ctx context.Context, w http.ResponseWriter, status int, body any) {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		logger.Ctx(ctx).Error("encode response body", zap.Error(err))
+		raw, status = []byte(internalErrorJSON), http.StatusInternalServerError
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
+	// json.Encoder ended every body with a newline; keep that wire shape.
+	_, _ = w.Write(append(raw, '\n'))
 }

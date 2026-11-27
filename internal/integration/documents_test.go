@@ -39,8 +39,20 @@ func (tr *trelis) upload(t *testing.T, key, name, content string) string {
 // the new Document's ID.
 func (tr *trelis) uploadBytes(t *testing.T, key, name string, content []byte) string {
 	t.Helper()
+	return tr.uploadBytesWithFields(t, key, name, content, nil)
+}
+
+// uploadBytesWithFields POSTs one file and extra form fields, such as
+// "principals=bob", to /documents and returns the new Document's ID.
+func (tr *trelis) uploadBytesWithFields(t *testing.T, key, name string, content []byte, fields map[string]string) string {
+	t.Helper()
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
+	for field, value := range fields {
+		if err := mw.WriteField(field, value); err != nil {
+			t.Fatal(err)
+		}
+	}
 	w, err := mw.CreateFormFile("file", name)
 	if err != nil {
 		t.Fatal(err)

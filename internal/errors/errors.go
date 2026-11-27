@@ -95,6 +95,15 @@ func NewInternalServerError(message string) *AppError {
 	}
 }
 
+// NewServiceUnavailableError creates a service unavailable error
+func NewServiceUnavailableError(message string) *AppError {
+	return &AppError{
+		Code:     ErrServiceUnavailable,
+		Message:  message,
+		HTTPCode: http.StatusServiceUnavailable,
+	}
+}
+
 // NewValidationError creates a validation error
 func NewValidationError(message string) *AppError {
 	return &AppError{

@@ -35,5 +35,5 @@ func (h *PrincipalHandler) Me(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, p)
+	writeJSON(r.Context(), w, http.StatusOK, p)
 }

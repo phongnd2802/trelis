@@ -9,6 +9,7 @@
 package handler
 
 import (
+	"context"
 	stderrors "errors"
 	"fmt"
 	"io"
@@ -107,13 +108,13 @@ func (h *DocumentHandler) CreateDocumentFromFile(w http.ResponseWriter, r *http.
 	}
 	doc, err := h.service.CreateDocumentFromFile(r.Context(), file, accessList)
 	if err != nil {
-		if h.handleDuplicateDocumentError(w, err) {
+		if h.handleDuplicateDocumentError(r.Context(), w, err) {
 			return
 		}
 		writeError(w, r, err)
 		return
 	}
-	writeData(w, http.StatusOK, doc)
+	writeData(r.Context(), w, http.StatusOK, doc)
 }
 
 // DuplicateDocumentResponse is the 409 body when the caller already uploaded
@@ -128,12 +129,12 @@ type DuplicateDocumentResponse struct {
 // handleDuplicateDocumentError answers 409 with the existing Document, in
 // Omnisc's duplicate envelope. It reports whether err was a duplicate.
 // Omnisc's code is "duplicate_file"; GLOSSARY.md names the unit a Document.
-func (h *DocumentHandler) handleDuplicateDocumentError(w http.ResponseWriter, err error) bool {
+func (h *DocumentHandler) handleDuplicateDocumentError(ctx context.Context, w http.ResponseWriter, err error) bool {
 	dupErr, ok := stderrors.AsType[*types.DuplicateDocumentError](err)
 	if !ok {
 		return false
 	}
-	writeJSON(w, http.StatusConflict, DuplicateDocumentResponse{
+	writeJSON(ctx, w, http.StatusConflict, DuplicateDocumentResponse{
 		Message: dupErr.Error(),
 		Data:    dupErr.Document, // the existing Document
 		Code:    "duplicate_document",
@@ -167,7 +168,7 @@ func (h *DocumentHandler) GetDocument(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
-	writeData(w, http.StatusOK, doc)
+	writeData(r.Context(), w, http.StatusOK, doc)
 }
 
 // DownloadDocumentFile streams a Document's Source File to a caller who can
@@ -246,7 +247,7 @@ func (h *DocumentHandler) ListDocuments(w http.ResponseWriter, r *http.Request) 
 		writeError(w, r, err)
 		return
 	}
-	writePage(w, result)
+	writePage(r.Context(), w, result)
 }
 
 // parsePagination reads page and page_size from the query string; a missing

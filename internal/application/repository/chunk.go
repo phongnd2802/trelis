@@ -23,6 +23,12 @@ func NewChunkRepository(store db.Store) interfaces.ChunkRepository {
 	return &chunkRepository{store: store}
 }
 
+// NewChunkSearcher returns the read side of the Chunk repository: the dense
+// search the retrieval service runs.
+func NewChunkSearcher(store db.Store) interfaces.ChunkSearcher {
+	return &chunkRepository{store: store}
+}
+
 // ReplaceChunks deletes a Document's Chunks and inserts chunks in order. It
 // starts no transaction of its own: call it inside the service's ExecTx so a
 // failed insert leaves the previous set in place.
@@ -106,6 +112,40 @@ func (r *chunkRepository) SetChunkEmbedding(ctx context.Context, chunkID uuid.UU
 		return fmt.Errorf("set embedding of chunk %s: the Chunk no longer exists", chunkID)
 	}
 	return nil
+}
+
+// SearchDense returns the Chunks of documentIDs embedded by model, most
+// cosine-similar to queryVector first, ties broken by Chunk ID. The vector
+// travels as its text form and is cast in the query, like SetChunkEmbedding,
+// which keeps pgvector's type out of the Go code. A Chunk with no embedding,
+// or one produced by another model, is skipped: its vector may not share a
+// dimension with the query's.
+func (r *chunkRepository) SearchDense(ctx context.Context, documentIDs []uuid.UUID,
+	queryVector []float32, model string, topK int,
+) ([]*types.ChunkMatch, error) {
+	rows, err := r.store.Querier(ctx).SearchDenseChunks(ctx, sqlc.SearchDenseChunksParams{
+		QueryEmbedding: vectorText(queryVector),
+		DocumentIds:    documentIDs,
+		EmbeddingModel: model,
+		TopK:           int32(topK),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("search dense chunks of %d documents: %w", len(documentIDs), err)
+	}
+	matches := make([]*types.ChunkMatch, 0, len(rows))
+	for _, row := range rows {
+		matches = append(matches, &types.ChunkMatch{
+			Chunk: &types.Chunk{
+				ID:            row.ID,
+				DocumentID:    row.DocumentID,
+				Seq:           int(row.Seq),
+				Content:       row.Content,
+				ContextHeader: row.ContextHeader,
+			},
+			Score: row.Score,
+		})
+	}
+	return matches, nil
 }
 
 // vectorText renders vector in pgvector's text form, [0.1,0.2], which the
