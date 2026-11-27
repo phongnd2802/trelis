@@ -670,3 +670,73 @@ def test_retrieval_run_aborts_one_config_and_continues_with_the_next(tmp_path, m
     assert "config bm25: aborted:" in output
     assert "dense: scored=2 skipped=0 error=0" in output
     assert len(requests) == 3
+
+
+def test_retrieval_run_passes_request_timeout_and_concurrency(tmp_path, monkeypatch):
+    import trelis_eval.cli as cli
+
+    seen = {}
+    real_client = cli.TrelisClient
+
+    def spy_client(*args, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "TrelisClient", spy_client)
+    server = RetrievalServer({"Question mhr-0000?": [retrieval_chunk("doc-a", "chunk-1")]})
+
+    code, out_dir = run_retrieval(
+        tmp_path,
+        monkeypatch,
+        httpx.MockTransport(server),
+        "--request-timeout",
+        "90",
+        "--concurrency",
+        "3",
+    )
+
+    assert code == 0
+    assert seen["timeout"] == 90.0
+    header = json.loads(
+        (out_dir / "20260101T000000Z" / "dense.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert header["concurrency"] == 3
+
+
+def test_retrieval_run_defaults_to_a_120s_request_timeout_and_one_request_at_a_time(
+    tmp_path, monkeypatch
+):
+    import trelis_eval.cli as cli
+
+    seen = {}
+    real_client = cli.TrelisClient
+
+    def spy_client(*args, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "TrelisClient", spy_client)
+    code, out_dir = run_retrieval(tmp_path, monkeypatch, httpx.MockTransport(RetrievalServer({})))
+
+    assert code == 0
+    assert seen["timeout"] == 120.0
+    header = json.loads(
+        (out_dir / "20260101T000000Z" / "dense.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert header["concurrency"] == 1
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [("--concurrency", "0"), ("--concurrency", "33"), ("--request-timeout", "0")],
+)
+def test_retrieval_run_rejects_bad_timeout_or_concurrency(
+    tmp_path, monkeypatch, capsys, flag, value
+):
+    def should_not_be_called(request):
+        pytest.fail("a bad flag must fail before any request")
+
+    with pytest.raises(SystemExit) as caught:
+        run_retrieval(tmp_path, monkeypatch, httpx.MockTransport(should_not_be_called), flag, value)
+
+    assert caught.value.code == 2
