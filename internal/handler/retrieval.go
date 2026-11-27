@@ -34,23 +34,24 @@ func NewRetrievalHandler(service interfaces.RetrievalService) *RetrievalHandler 
 }
 
 // Retrieve answers POST /retrieve with the ranked Chunks of the Documents the
-// caller can read, the score of every Retrieval Technique that found them and
-// a trace of the steps. A caller who can read nothing gets an empty result,
-// never a 404, so the answer reveals nothing about what exists.
+// caller can read, the score and rank of every Retrieval Technique that found
+// them and a trace of the steps. Several techniques are fused with Reciprocal
+// Rank Fusion. A caller who can read nothing gets an empty result, never a
+// 404, so the answer reveals nothing about what exists.
 //
 //	@Summary		Retrieve Chunks for a query
-//	@Description	Runs the Retrieval Technique named in retrieval_config (dense or bm25) over the Documents the caller can read and returns the ranked Chunks with per-technique scores and a step trace. A bm25 request needs no embedding model. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values, unknown techniques and more than one technique are 400; a body over 64 KiB is 413; without models.embedding, dense retrieval is 503.
+//	@Description	Runs every Retrieval Technique named in retrieval_config (dense and/or bm25) over the Documents the caller can read. One technique answers in its own order with its own score; several run concurrently over max(top_k, 50) candidates each and are fused with Reciprocal Rank Fusion, score = the sum of 1/(rrf_k + rank) over the lists that carry the Chunk, then cut to top_k with equal fused scores ordered by chunk_id. rrf_k defaults to 60 and must be between 1 and 1000; it has no effect with one technique. Every result carries the score and 1-based rank of each technique whose list carried it. A bm25 request needs no embedding model. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values, an unknown or duplicate technique and an out-of-range rrf_k are 400; a body over 64 KiB is 413; without models.embedding, a dense request (alone or alongside bm25) is 503.
 //	@Tags			retrieval
 //	@Accept			json
 //	@Produce		json
 //	@Security		bearerAuth
-//	@Param			request	body		types.RetrievalRequest	true	"The query, how many Chunks to return and which Retrieval Techniques to run"
+//	@Param			request	body		types.RetrievalRequest	true	"The query, how many Chunks to return, which Retrieval Techniques to run and the RRF constant"
 //	@Success		200		{object}	handler.DataResponse{data=types.RetrievalResult}
-//	@Failure		400		{object}	handler.ErrorResponse	"Body that is not one JSON object, an unknown field or wrong value type, a blank or too-long query, an out-of-range top_k or an invalid retrieval_config (an unknown technique or more than one)"
+//	@Failure		400		{object}	handler.ErrorResponse	"Body that is not one JSON object, an unknown field or wrong value type, a blank or too-long query, an out-of-range top_k or an invalid retrieval_config (an unknown or duplicate technique, or an rrf_k outside 1..1000)"
 //	@Failure		401		{object}	router.ErrorResponse	"Missing or invalid API key"
 //	@Failure		413		{object}	handler.ErrorResponse	"Request body larger than 64 KiB"
 //	@Failure		500		{object}	handler.ErrorResponse	"Internal server error; a failed API key check answers the router's error body instead"
-//	@Failure		503		{object}	handler.ErrorResponse	"models.embedding is not configured, so dense retrieval is unavailable (bm25 still works)"
+//	@Failure		503		{object}	handler.ErrorResponse	"models.embedding is not configured, so a request naming dense is unavailable (bm25 alone still works)"
 //	@Router			/retrieve [post]
 func (h *RetrievalHandler) Retrieve(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, retrievalBodyLimit)

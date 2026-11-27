@@ -155,10 +155,6 @@ func TestAnInvalidRequestIsValidation(t *testing.T) {
 		body    string
 		wantMsg []string
 	}{
-		"two techniques": {
-			body:    `{"query":"who won?","retrieval_config":{"techniques":["bm25","dense"]}}`,
-			wantMsg: []string{"only one retrieval technique per request", "fusion"},
-		},
 		"foo": {
 			body:    `{"query":"who won?","retrieval_config":{"techniques":["foo"]}}`,
 			wantMsg: []string{"foo", "dense"},
@@ -170,6 +166,14 @@ func TestAnInvalidRequestIsValidation(t *testing.T) {
 		"duplicate": {
 			body:    `{"query":"who won?","retrieval_config":{"techniques":["dense","dense"]}}`,
 			wantMsg: []string{"dense", "more than once"},
+		},
+		"rrf_k zero": {
+			body:    `{"query":"who won?","retrieval_config":{"techniques":["bm25","dense"],"rrf_k":0}}`,
+			wantMsg: []string{"rrf_k", "1 and 1000"},
+		},
+		"rrf_k too large": {
+			body:    `{"query":"who won?","retrieval_config":{"techniques":["dense"],"rrf_k":1001}}`,
+			wantMsg: []string{"rrf_k", "1 and 1000"},
 		},
 		"blank query": {
 			body:    `{"query":"   "}`,
@@ -242,6 +246,29 @@ func TestRetrieveSendsTheBM25ConfigToTheService(t *testing.T) {
 	}
 }
 
+func TestRetrieveSendsSeveralTechniquesAndRRFKToTheService(t *testing.T) {
+	svc := &stubRetrieval{result: &types.RetrievalResult{
+		Results: []types.RetrievedChunk{},
+		Trace:   []types.TraceStep{},
+	}}
+	h := newRetrieveRouter(svc)
+
+	rec := postJSON(t, h, "/retrieve",
+		`{"query":"thue tncn","retrieval_config":{"techniques":["bm25","dense"],"rrf_k":10}}`, "Bearer trelis_alice")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /retrieve = %d %s, want 200", rec.Code, rec.Body)
+	}
+	config := svc.got.RetrievalConfig
+	if config == nil || len(config.Techniques) != 2 ||
+		config.Techniques[0] != types.RetrievalTechniqueBM25 ||
+		config.Techniques[1] != types.RetrievalTechniqueDense {
+		t.Fatalf("service got %+v, want bm25 and dense", config)
+	}
+	if config.RRFK == nil || *config.RRFK != 10 {
+		t.Errorf("service got rrf_k = %v, want 10", config.RRFK)
+	}
+}
+
 func TestRetrieveAnswersTheResultEnvelope(t *testing.T) {
 	chunkID := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
 	documentID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
@@ -250,6 +277,7 @@ func TestRetrieveAnswersTheResultEnvelope(t *testing.T) {
 			ChunkID: chunkID, DocumentID: documentID, Seq: 3, Content: "Điều 1.",
 			ContextHeader: "Chương I", Score: 0.83,
 			Scores: map[types.RetrievalTechnique]float64{types.RetrievalTechniqueDense: 0.83},
+			Ranks:  map[types.RetrievalTechnique]int{types.RetrievalTechniqueDense: 1},
 		}},
 		Trace: []types.TraceStep{
 			{Step: types.TraceStepEmbedQuery, Technique: types.RetrievalTechniqueDense, DurationMS: 12, Model: "test-embedding"},
@@ -278,12 +306,16 @@ func TestRetrieveAnswersTheResultEnvelope(t *testing.T) {
 	r := got.Results[0]
 	if r.ChunkID != chunkID || r.DocumentID != documentID || r.Seq != 3 || r.Content != "Điều 1." ||
 		r.ContextHeader != "Chương I" || r.Score != 0.83 ||
-		r.Scores[types.RetrievalTechniqueDense] != 0.83 {
-		t.Errorf("result = %+v, want the stub's Chunk and scores", r)
+		r.Scores[types.RetrievalTechniqueDense] != 0.83 ||
+		r.Ranks[types.RetrievalTechniqueDense] != 1 {
+		t.Errorf("result = %+v, want the stub's Chunk, scores and ranks", r)
 	}
 	if len(got.Trace) != 2 || got.Trace[0].Step != types.TraceStepEmbedQuery || got.Trace[0].Model != "test-embedding" ||
 		got.Trace[1].Candidates == nil || *got.Trace[1].Candidates != 1 {
 		t.Errorf("trace = %+v, want the embed and search steps", got.Trace)
+	}
+	if !strings.Contains(rec.Body.String(), `"ranks":{"dense":1}`) {
+		t.Errorf("body = %s, want the per-technique ranks in the result", rec.Body)
 	}
 	if svc.got == nil || svc.got.Query != "who won?" || svc.got.TopK == nil || *svc.got.TopK != 3 ||
 		svc.got.RetrievalConfig == nil || len(svc.got.RetrievalConfig.Techniques) != 1 ||

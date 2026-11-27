@@ -173,10 +173,18 @@ definitions:
     type: object
   types.RetrievalConfig:
     properties:
+      rrf_k:
+        description: |-
+          RRFK is the Reciprocal Rank Fusion constant k; nil means the default.
+          It only affects a request that runs more than one technique, so it is
+          accepted and ignored for a single one.
+        type: integer
       techniques:
         description: |-
           Techniques is the set of Retrieval Techniques to run, without
-          duplicates.
+          duplicates. More than one makes the request a fusion: each runs over
+          the readable Documents and their lists are combined with Reciprocal
+          Rank Fusion.
         items:
           $ref: '#/definitions/types.RetrievalTechnique'
         type: array
@@ -214,10 +222,12 @@ definitions:
     enum:
     - dense
     - bm25
+    - rrf
     type: string
     x-enum-varnames:
     - RetrievalTechniqueDense
     - RetrievalTechniqueBM25
+    - RetrievalTechniqueRRF
   types.RetrievedChunk:
     properties:
       chunk_id:
@@ -228,6 +238,10 @@ definitions:
         type: string
       document_id:
         type: string
+      ranks:
+        additionalProperties:
+          type: integer
+        type: object
       score:
         type: number
       scores:
@@ -242,9 +256,9 @@ definitions:
     properties:
       candidates:
         description: |-
-          Candidates is how many Chunks the search returned, on the search step.
-          It is a pointer so the search step reports 0 while the embed step,
-          which has no candidate count, leaves the field out.
+          Candidates is how many Chunks the step returned: the search step's own
+          matches, or the distinct Chunks a fuse step combined. It is a pointer so
+          a step with no candidate count leaves the field out.
         type: integer
       duration_ms:
         description: DurationMS is how long the step took, in milliseconds.
@@ -258,7 +272,9 @@ definitions:
       technique:
         allOf:
         - $ref: '#/definitions/types.RetrievalTechnique'
-        description: Technique is the Retrieval Technique the step belongs to.
+        description: |-
+          Technique is the Retrieval Technique the step belongs to, or
+          RetrievalTechniqueRRF on the fuse step.
     type: object
 info:
   contact: {}
@@ -518,16 +534,22 @@ paths:
     post:
       consumes:
       - application/json
-      description: Runs the Retrieval Technique named in retrieval_config (dense or
-        bm25) over the Documents the caller can read and returns the ranked Chunks
-        with per-technique scores and a step trace. A bm25 request needs no embedding
-        model. A caller who can read nothing gets 200 with an empty results list.
-        Malformed JSON, unknown fields, invalid values, unknown techniques and more
-        than one technique are 400; a body over 64 KiB is 413; without models.embedding,
-        dense retrieval is 503.
+      description: Runs every Retrieval Technique named in retrieval_config (dense
+        and/or bm25) over the Documents the caller can read. One technique answers
+        in its own order with its own score; several run concurrently over max(top_k,
+        50) candidates each and are fused with Reciprocal Rank Fusion, score = the
+        sum of 1/(rrf_k + rank) over the lists that carry the Chunk, then cut to top_k
+        with equal fused scores ordered by chunk_id. rrf_k defaults to 60 and must
+        be between 1 and 1000; it has no effect with one technique. Every result carries
+        the score and 1-based rank of each technique whose list carried it. A bm25
+        request needs no embedding model. A caller who can read nothing gets 200 with
+        an empty results list. Malformed JSON, unknown fields, invalid values, an
+        unknown or duplicate technique and an out-of-range rrf_k are 400; a body over
+        64 KiB is 413; without models.embedding, a dense request (alone or alongside
+        bm25) is 503.
       parameters:
-      - description: The query, how many Chunks to return and which Retrieval Techniques
-          to run
+      - description: The query, how many Chunks to return, which Retrieval Techniques
+          to run and the RRF constant
         in: body
         name: request
         required: true
@@ -548,7 +570,8 @@ paths:
         "400":
           description: Body that is not one JSON object, an unknown field or wrong
             value type, a blank or too-long query, an out-of-range top_k or an invalid
-            retrieval_config (an unknown technique or more than one)
+            retrieval_config (an unknown or duplicate technique, or an rrf_k outside
+            1..1000)
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
         "401":
@@ -565,8 +588,8 @@ paths:
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
         "503":
-          description: models.embedding is not configured, so dense retrieval is unavailable
-            (bm25 still works)
+          description: models.embedding is not configured, so a request naming dense
+            is unavailable (bm25 alone still works)
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
       security:
