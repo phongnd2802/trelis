@@ -40,7 +40,8 @@ type Delta struct {
 // StreamAssembler turns protocol deltas into the types.StreamResponse
 // sequence the answering code consumes. It owns the "reasoning then answer"
 // hand-off, tool-call fragment assembly and the early tool-call notification
-// (ResponseTypeToolCall) once a function name has stabilised.
+// (ResponseTypeToolCall) once a function name has stabilised. Exactly one
+// closing chunk is sent, by End, EndAtEOF or Fail.
 type StreamAssembler struct {
 	ctx              context.Context
 	model            string
@@ -54,7 +55,11 @@ type StreamAssembler struct {
 
 	// thinking is set while a thinking-done marker is owed.
 	thinking bool
-	aborted  bool
+	// closed is set once the one closing chunk has been emitted. Process,
+	// Emit, Finish, close and EndAtEOF respect it; End and Fail reach it
+	// through Finish and close.
+	closed  bool
+	aborted bool
 }
 
 // NewStreamAssembler creates an assembler for one stream.
@@ -126,10 +131,14 @@ func (a *StreamAssembler) OrderedToolCalls() []types.LLMToolCall {
 // SetUsage records usage from the vendor's final chunk.
 func (a *StreamAssembler) SetUsage(u types.TokenUsage) { a.Usage = &u }
 
-// Process consumes one delta and emits the resulting stream responses.
+// Process consumes one delta and emits its content, reasoning and tool-call
+// announcements. It records a finish reason but never closes the stream: End,
+// EndAtEOF or Fail sends the one closing chunk once the vendor stream is over.
 func (a *StreamAssembler) Process(ch chan<- types.StreamResponse, d Delta) {
-	isDone := d.FinishReason != ""
-	if isDone {
+	if a.closed {
+		return
+	}
+	if d.FinishReason != "" {
 		a.LastFinishReason = d.FinishReason
 	}
 
@@ -146,30 +155,6 @@ func (a *StreamAssembler) Process(ch chan<- types.StreamResponse, d Delta) {
 		a.emit(ch, types.StreamResponse{
 			ResponseType: types.ResponseTypeAnswer,
 			Content:      d.Content,
-			Done:         isDone,
-			ToolCalls:    a.OrderedToolCalls(),
-			FinishReason: d.FinishReason,
-		})
-	}
-
-	if isDone && len(a.toolCallMap) > 0 {
-		a.emit(ch, types.StreamResponse{
-			ResponseType: types.ResponseTypeAnswer,
-			Done:         true,
-			ToolCalls:    a.OrderedToolCalls(),
-			FinishReason: d.FinishReason,
-		})
-	}
-
-	if isDone {
-		a.Finish(ch)
-	}
-
-	if isDone && d.Content == "" && len(a.toolCallMap) == 0 {
-		a.emit(ch, types.StreamResponse{
-			ResponseType: types.ResponseTypeAnswer,
-			Done:         true,
-			FinishReason: d.FinishReason,
 		})
 	}
 }
@@ -177,6 +162,9 @@ func (a *StreamAssembler) Process(ch chan<- types.StreamResponse, d Delta) {
 // Emit forwards a reasoning chunk and records that a thinking-done marker is
 // still owed.
 func (a *StreamAssembler) Emit(ch chan<- types.StreamResponse, content string) {
+	if a.closed {
+		return
+	}
 	a.thinking = true
 	a.emit(ch, types.StreamResponse{ResponseType: types.ResponseTypeThinking, Content: content})
 }
@@ -184,18 +172,19 @@ func (a *StreamAssembler) Emit(ch chan<- types.StreamResponse, content string) {
 // Finish emits the single thinking-done marker if one is owed. Safe to call
 // multiple times; only the first call after an Emit sends anything.
 func (a *StreamAssembler) Finish(ch chan<- types.StreamResponse) {
-	if !a.thinking {
+	if a.closed || !a.thinking {
 		return
 	}
 	a.thinking = false
 	a.emit(ch, types.StreamResponse{ResponseType: types.ResponseTypeThinking, Done: true})
 }
 
-// End emits the closing chunk once the vendor stream is exhausted. It carries
-// the assembled tool calls and the usage.
+// End emits the one closing chunk once the vendor stream is exhausted. It
+// carries the assembled tool calls, the usage and the last finish reason.
+// Calling End, EndAtEOF or Fail again emits nothing.
 func (a *StreamAssembler) End(ch chan<- types.StreamResponse) {
 	a.Finish(ch)
-	a.emit(ch, types.StreamResponse{
+	a.close(ch, types.StreamResponse{
 		ResponseType: types.ResponseTypeAnswer,
 		Done:         true,
 		ToolCalls:    a.OrderedToolCalls(),
@@ -204,11 +193,23 @@ func (a *StreamAssembler) End(ch chan<- types.StreamResponse) {
 	})
 }
 
+// close sends the one closing chunk and records that the stream is closed.
+func (a *StreamAssembler) close(ch chan<- types.StreamResponse, resp types.StreamResponse) {
+	if a.closed {
+		return
+	}
+	a.closed = true
+	a.emit(ch, resp)
+}
+
 // EndAtEOF closes a stream whose body simply ran out. A vendor that finished
 // the message has reported a finish reason by then; without one the
 // connection was most likely cut by a proxy, and the answer is marked
 // incomplete instead of reaching the caller as a clean stop.
 func (a *StreamAssembler) EndAtEOF(ch chan<- types.StreamResponse) {
+	if a.closed {
+		return
+	}
 	if a.LastFinishReason == "" {
 		logctx.Ctx(a.ctx).Warn("stream ended without a finish reason; marking the response incomplete",
 			zap.String("model", a.model))
@@ -220,7 +221,7 @@ func (a *StreamAssembler) EndAtEOF(ch chan<- types.StreamResponse) {
 // Fail emits the error chunk for a broken stream.
 func (a *StreamAssembler) Fail(ch chan<- types.StreamResponse, err error) {
 	a.Finish(ch)
-	a.emit(ch, types.StreamResponse{
+	a.close(ch, types.StreamResponse{
 		ResponseType: types.ResponseTypeError,
 		Content:      err.Error(),
 		Done:         true,

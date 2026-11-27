@@ -240,7 +240,10 @@ func TestChatStreamLogsWhenTheStreamFinishes(t *testing.T) {
 	t.Cleanup(func() { zap.ReplaceGlobals(previous) })
 
 	p := modeltest.NewFakeProvider(t)
-	p.Reply(modeltest.Any(), modeltest.Text("secret answer"))
+	p.Reply(modeltest.Any(), modeltest.Reply{
+		Text:  "secret answer",
+		Usage: modeltest.Usage{Input: 11, Output: 7},
+	})
 	c, err := NewChat("chat", role(p.URL(), "m", "k"))
 	if err != nil {
 		t.Fatal(err)
@@ -257,8 +260,12 @@ func TestChatStreamLogsWhenTheStreamFinishes(t *testing.T) {
 		t.Fatalf("logger saw %d model call lines, want 1", len(entries))
 	}
 	entry := entries[0]
-	if got := entry.ContextMap()["status"]; got != "ok" {
+	fields := entry.ContextMap()
+	if got := fields["status"]; got != "ok" {
 		t.Errorf("status = %v, want ok", got)
+	}
+	if fields["input_tokens"] != int64(11) || fields["output_tokens"] != int64(7) {
+		t.Errorf("fields = %v, want input_tokens 11 and output_tokens 7", fields)
 	}
 	if s := fmt.Sprint(entry); strings.Contains(s, "secret prompt") || strings.Contains(s, "secret answer") {
 		t.Errorf("the model call log carries message content: %s", s)

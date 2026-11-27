@@ -351,10 +351,10 @@ func streamItem(raw json.RawMessage) (rawOutputItem, bool, error) {
 }
 
 // completeStream handles the terminal response.completed / response.incomplete
-// event: the terminal event carries the usage, and the assembler's closing
-// chunk carries the assembled tool calls. An incomplete response with no
-// usable details is still cut short, so it reports "length" rather than a
-// clean stop.
+// event: the terminal event carries the usage, Process records the mapped
+// finish reason, and the assembler's closing chunk carries the assembled tool
+// calls. An incomplete response with no usable details is still cut short, so
+// it reports "length" rather than a clean stop.
 func completeStream(ch chan<- types.StreamResponse, assembler *api.StreamAssembler, resp *rawResponse, incomplete bool) {
 	if resp != nil && resp.Usage != nil {
 		assembler.SetUsage(resp.Usage.toTokenUsage())
