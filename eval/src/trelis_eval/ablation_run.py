@@ -305,6 +305,27 @@ def run_ablation(
     )
 
 
+def step_latencies(run: AblationRun) -> dict[str, tuple[int, int]]:
+    """Return each trace step's p50 and p95 duration in ms, keyed ``technique/step``.
+
+    The request latency alone hides which step is slow: the first dense
+    baseline looked bound by the embedding provider while its search step
+    was the one taking 20 s (#143). Only scored questions count, like the
+    request latencies; keys are sorted so the printout is stable.
+    """
+    durations: dict[str, list[int]] = {}
+    for result in run.questions:
+        if result.status is not QuestionStatus.SCORED:
+            continue
+        for step in result.trace:
+            name = f"{step.technique}/{step.step}" if step.technique else step.step
+            durations.setdefault(name, []).append(step.duration_ms)
+    return {
+        name: (nearest_rank_percentile(values, 50), nearest_rank_percentile(values, 95))
+        for name, values in sorted(durations.items())
+    }
+
+
 def _score_questions(
     client: TrelisClient,
     golden: Sequence[GoldenQuestion],

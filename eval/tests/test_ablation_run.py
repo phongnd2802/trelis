@@ -780,3 +780,34 @@ def test_jsonl_round_trip_keeps_the_concurrency_latency_was_measured_under(tmp_p
     write_ablation_run(path, run_file)
 
     assert load_ablation_run(path).run.concurrency == 4
+
+
+def test_step_latencies_split_the_trace_by_technique_and_step():
+    from trelis_eval.ablation_run import step_latencies
+
+    golden = [question(f"q{i}", ["https://example.com/a"]) for i in range(4)]
+    golden.append(question("null", [], slices=("null_query", "hops-0")))
+    manifest = Manifest(
+        source_by_document={"doc-a": "https://example.com/a"},
+        completed_source_ids=frozenset({"https://example.com/a"}),
+    )
+    search_ms = [100, 200, 300, 20000]
+
+    def handler(request):
+        body = json.loads(request.content)
+        i = int(body["query"].removeprefix("Question q").removesuffix("?"))
+        trace = [
+            {"step": "embed_query", "technique": "dense", "duration_ms": 5, "model": "m"},
+            {"step": "search", "technique": "dense", "duration_ms": search_ms[i], "candidates": 1},
+        ]
+        return httpx.Response(200, json={"success": True, "data": {"results": [], "trace": trace}})
+
+    with make_client(handler) as client:
+        run = run_ablation(client, golden, manifest, RetrievalConfig("dense", ("dense",)))
+
+    # Nearest rank over the 4 scored questions: p50 is rank ceil(0.5*4)=2,
+    # p95 is rank ceil(0.95*4)=4. The skipped null query has no trace.
+    assert step_latencies(run) == {
+        "dense/embed_query": (5, 5),
+        "dense/search": (200, 20000),
+    }
