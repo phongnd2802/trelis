@@ -195,6 +195,7 @@ func TestAutoTierChains(t *testing.T) {
 	}
 	fragmented := "# Dài\n\n" + prose(2, 3) + "\n\n" + strings.Repeat("# Ngắn\n\nx\n\n", 4)
 	sparse := "# Mở đầu\n\n" + prose(20, 4)
+	legal := loadLegalSample(t)
 
 	// Fragmentation is the only validator rejection the real heading tier can
 	// reach through StrategyAuto: the profiler counts at least three headed
@@ -230,6 +231,20 @@ func TestAutoTierChains(t *testing.T) {
 			cfg:      SplitterConfig{Strategy: StrategyAuto},
 			chain:    []StrategyTier{TierRecursive},
 			selected: TierRecursive,
+		},
+		{
+			name:     "the heuristic tier is picked for a legal document",
+			text:     legal,
+			cfg:      SplitterConfig{ChunkSize: DefaultChunkSize, Strategy: StrategyAuto},
+			chain:    []StrategyTier{TierHeuristic, TierRecursive},
+			selected: TierHeuristic,
+		},
+		{
+			name:     "the heuristic tier is picked for uppercase titles",
+			text:     uppercaseTitledDocument(),
+			cfg:      SplitterConfig{ChunkSize: 200, Strategy: StrategyAuto},
+			chain:    []StrategyTier{TierHeuristic, TierRecursive},
+			selected: TierHeuristic,
 		},
 	}
 	for _, tt := range tests {
