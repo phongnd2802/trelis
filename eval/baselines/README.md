@@ -98,3 +98,59 @@ How they were produced (2026-11-27, Trelis `d4b4c0b`, harness 0.1.0):
   embedding call (p50 1.9 s); its search step is p50 209 ms, against 21 s in
   the dense baseline before #143. Compare latency only between runs that
   made, or replayed, the same model calls.
+
+## `bm25+dense+rerank-strat500-seed1.jsonl`
+
+The rerank row: BM25 and dense fused with Reciprocal Rank Fusion (`rrf_k`
+60), then reranked over the server's default 50-candidate pool.
+
+| Metric | Value (n = 441 scored) |
+|---|---|
+| Recall@5 | 0.736 |
+| Recall@10 | 0.840 |
+| MRR | 0.895 |
+| nDCG@10 | 0.774 |
+| Latency p50 / p95 | 1221 ms / 1410 ms at concurrency 4 |
+
+The 59 `null_query` questions are skipped, with 0 errors. Run
+`uv run --project eval trelis-eval report eval/baselines` for the 95%
+confidence interval on every value.
+
+Against `bm25+dense`, the regenerated report's intervals for MRR (0.895
+[0.872, 0.916] vs 0.828 [0.800, 0.856]), Recall@5 (0.736 [0.711, 0.762] vs
+0.666 [0.637, 0.694]) and nDCG@10 (0.774 [0.754, 0.793] vs 0.714 [0.692,
+0.736]) do not overlap; the Recall@10 intervals do (0.840 [0.820, 0.860] vs
+0.811 [0.788, 0.833]). These are per-row percentile bootstrap intervals over
+the scored questions, not a paired test, so non-overlapping intervals are
+consistent with a difference without being a significance test.
+
+How it was produced (2026-11-28, Trelis `2e87652`, harness 0.1.0, run
+`strat500-rerank-20261128b`):
+
+- **Corpus, Golden Set and embedding:** the same as the other rows, on the
+  same Trelis instance and the same 16,920 Chunks. The Golden Set sha256 is
+  `01496451…`, the same as the other baselines.
+- **Rerank:** `cohere/rerank-5-fast` through OpenRouter
+  (`https://openrouter.ai/api/v1`), over the server's default
+  `rerank_candidates` pool of 50, with `top_k` 10.
+- **Command:**
+
+  ```sh
+  scripts/eval-stack.sh up record --rerank
+
+  uv run --project eval trelis-eval retrieval run \
+    --golden eval/data/multihop-rag/strat500-golden.jsonl \
+    --manifest eval/data/multihop-rag/strat500-manifest.jsonl \
+    --config bm25+dense+rerank --concurrency 4
+  ```
+
+- **Model calls:** query embeddings replayed from the #41 proxy's fixtures
+  (`dense/embed_query` p50 2 ms); the rerank calls were made live and
+  recorded by `up record --rerank` (rerank step p50 991 ms, p95 1175 ms).
+  An earlier attempt was cut short by the provider answering 402 (no credit)
+  and discarded, so only this run is kept.
+- **Latency:** rerank adds about 1 s per question through the hosted
+  provider; the first stage is the hybrid row's dense search (p50 216 ms)
+  plus BM25 (p50 12 ms). A replayed run's rerank step is milliseconds, so
+  compare latency only between runs that made, or replayed, the same model
+  calls.

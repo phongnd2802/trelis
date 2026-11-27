@@ -150,10 +150,9 @@ be between 10 and 100; the header records it, and MRR is MRR@top-k in effect.
 
 `--config bm25+dense+rerank` adds the rerank row: it needs `models.rerank`
 configured on the server and scores the server's default pool of 50
-candidates, since the harness does not send `rerank_candidates`.
-`scripts/eval-stack.sh` does not yet route the rerank role through the
-record/replay proxy, so every run calls the configured rerank provider (a
-follow-up will fix it).
+candidates, since the harness does not send `rerank_candidates`. Start the
+eval stack with `--rerank` (see [Re-run a baseline](#re-run-a-baseline)) so a
+rerank call is recorded once and replayed for free afterwards.
 
 Each `POST /retrieve` includes Trelis's own call to the embedding model, so a
 slow hosted provider sets the pace. `--request-timeout` (default 120 s) keeps a
@@ -224,21 +223,32 @@ and a worked dense-baseline example.
 `scripts/eval-stack.sh` replaces `make dev` for an Ablation Run. It builds
 Trelis from the checkout and starts it on `:8080` against the dev database,
 with the embedding role routed through the proxy, and keeps both running in
-the background:
+the background. Add `--rerank` to route the rerank role too, so a
+`bm25+dense+rerank` run records and replays its rerank calls as well:
 
 ```sh
-# First run of a new question set: pay each query embedding once.
-TRELIS_MODELS_EMBEDDING_API_KEY=... scripts/eval-stack.sh up record
-# Every later run: fixtures only, no provider key, no cost.
-scripts/eval-stack.sh up replay
+# First run of a new question set: pay each query embedding once. With
+# --rerank, each rerank call is paid once too.
+TRELIS_MODELS_EMBEDDING_API_KEY=... TRELIS_MODELS_RERANK_API_KEY=... \
+  scripts/eval-stack.sh up record --rerank
+# Every later run: fixtures only, no provider keys, no cost.
+scripts/eval-stack.sh up replay --rerank
 
 uv run --project eval trelis-eval retrieval run \
   --golden eval/data/multihop-rag/strat500-golden.jsonl \
   --manifest eval/data/multihop-rag/strat500-manifest.jsonl \
-  --config bm25 --config dense --config bm25+dense --concurrency 4
+  --config bm25 --config dense --config bm25+dense --config bm25+dense+rerank \
+  --concurrency 4
 
 scripts/eval-stack.sh down
 ```
+
+The script exports `.local/models.env` when it exists, so the keys above can
+live there instead. Unlike `make dev`, where the file overrides the
+environment, a variable already in the environment wins here. Without
+`--rerank`, it warns when the rerank role is configured (in
+`config/trelis.yaml` or `TRELIS_MODELS_RERANK_BASE_URL`), because those calls
+would reach the provider unrecorded.
 
 The stratified-500 corpus in the dev database belongs to the Principal
 `eval`, so the run needs one of its keys (`admin key create eval`, see
