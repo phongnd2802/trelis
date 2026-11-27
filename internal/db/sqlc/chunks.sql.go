@@ -113,24 +113,25 @@ func (q *Queries) ListUnembeddedChunksByDocument(ctx context.Context, arg ListUn
 }
 
 const searchDenseChunks = `-- name: SearchDenseChunks :many
+WITH query_vec AS MATERIALIZED (SELECT $4::text::vector AS embedding)
 SELECT id, document_id, seq, content, context_header,
-       (1 - (embedding <=> $1::text::vector))::float8 AS score
-FROM chunks
-WHERE document_id = ANY($2::uuid[])
-  AND embedding_model = $3::text
-  AND embedding IS NOT NULL
+       (1 - (chunks.embedding <=> query_vec.embedding))::float8 AS score
+FROM chunks, query_vec
+WHERE document_id = ANY($1::uuid[])
+  AND embedding_model = $2::text
+  AND chunks.embedding IS NOT NULL
   -- A zero-norm vector makes cosine distance NaN; it can never be a match
   -- and would not survive JSON encoding either.
-  AND (embedding <=> $1::text::vector) <> 'NaN'::float8
-ORDER BY embedding <=> $1::text::vector, id
-LIMIT $4
+  AND (chunks.embedding <=> query_vec.embedding) <> 'NaN'::float8
+ORDER BY chunks.embedding <=> query_vec.embedding, id
+LIMIT $3
 `
 
 type SearchDenseChunksParams struct {
-	QueryEmbedding string
 	DocumentIds    []uuid.UUID
 	EmbeddingModel string
 	TopK           int32
+	QueryEmbedding string
 }
 
 type SearchDenseChunksRow struct {
@@ -147,12 +148,16 @@ type SearchDenseChunksRow struct {
 // so recall is perfect while the eval baseline is built; add the index when
 // latency, not recall, is the constraint. Only Chunks embedded by the same
 // model are comparable, and NULL embeddings cannot be searched at all.
+//
+// #143: the generic plan re-parsed the repeated query-vector ::text::vector
+// cast for every Chunk; query_vec casts it once. The readable-ID filter stays
+// in the scan so the Access List limits the work.
 func (q *Queries) SearchDenseChunks(ctx context.Context, arg SearchDenseChunksParams) ([]SearchDenseChunksRow, error) {
 	rows, err := q.db.Query(ctx, searchDenseChunks,
-		arg.QueryEmbedding,
 		arg.DocumentIds,
 		arg.EmbeddingModel,
 		arg.TopK,
+		arg.QueryEmbedding,
 	)
 	if err != nil {
 		return nil, err
