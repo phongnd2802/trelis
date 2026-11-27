@@ -47,6 +47,8 @@ How it was produced (2026-11-27, Trelis `6beccaa`, harness 0.1.0):
     --config dense --concurrency 4
   ```
 
-- **Latency:** almost entirely the hosted embedding call, since the Postgres
-  search takes about 0.5 s. Compare it only with runs at the same
+- **Latency:** the search step dominated the `/retrieve` trace (p50 21 s,
+  max 26 s), not the hosted embedding call (p50 2.5 s). The search saw a
+  Postgres generic plan that re-parsed the query vector once per Chunk;
+  #143 has the plan and timing numbers. Compare runs only at the same
   concurrency and provider.

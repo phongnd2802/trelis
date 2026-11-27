@@ -34,15 +34,20 @@ SELECT count(*) FROM chunks WHERE document_id = $1 AND embedding IS NULL;
 -- so recall is perfect while the eval baseline is built; add the index when
 -- latency, not recall, is the constraint. Only Chunks embedded by the same
 -- model are comparable, and NULL embeddings cannot be searched at all.
+--
+-- #143: the generic plan re-parsed the repeated query-vector ::text::vector
+-- cast for every Chunk; query_vec casts it once. The readable-ID filter stays
+-- in the scan so the Access List limits the work.
 -- name: SearchDenseChunks :many
+WITH query_vec AS MATERIALIZED (SELECT sqlc.arg(query_embedding)::text::vector AS embedding)
 SELECT id, document_id, seq, content, context_header,
-       (1 - (embedding <=> sqlc.arg(query_embedding)::text::vector))::float8 AS score
-FROM chunks
+       (1 - (chunks.embedding <=> query_vec.embedding))::float8 AS score
+FROM chunks, query_vec
 WHERE document_id = ANY(sqlc.arg(document_ids)::uuid[])
   AND embedding_model = sqlc.arg(embedding_model)::text
-  AND embedding IS NOT NULL
+  AND chunks.embedding IS NOT NULL
   -- A zero-norm vector makes cosine distance NaN; it can never be a match
   -- and would not survive JSON encoding either.
-  AND (embedding <=> sqlc.arg(query_embedding)::text::vector) <> 'NaN'::float8
-ORDER BY embedding <=> sqlc.arg(query_embedding)::text::vector, id
+  AND (chunks.embedding <=> query_vec.embedding) <> 'NaN'::float8
+ORDER BY chunks.embedding <=> query_vec.embedding, id
 LIMIT sqlc.arg(top_k);

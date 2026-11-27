@@ -53,6 +53,10 @@ type Querier interface {
 	// so recall is perfect while the eval baseline is built; add the index when
 	// latency, not recall, is the constraint. Only Chunks embedded by the same
 	// model are comparable, and NULL embeddings cannot be searched at all.
+	//
+	// #143: the generic plan re-parsed the repeated query-vector ::text::vector
+	// cast for every Chunk; query_vec casts it once. The readable-ID filter stays
+	// in the scan so the Access List limits the work.
 	SearchDenseChunks(ctx context.Context, arg SearchDenseChunksParams) ([]SearchDenseChunksRow, error)
 	// The vector goes in as its text form and is cast here, which is also what
 	// keeps sqlc from having to map the vector type. execrows lets the caller

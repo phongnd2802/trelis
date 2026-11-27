@@ -2,12 +2,16 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/phongnd2802/trelis/internal/db"
 	"github.com/phongnd2802/trelis/internal/db/dbtest"
@@ -290,6 +294,155 @@ func TestSearchDenseSkipsNaNScoresFromZeroVectors(t *testing.T) {
 	if err != nil || len(none) != 0 {
 		t.Errorf("SearchDense with a zero query = %+v, %v; want nothing", none, err)
 	}
+}
+
+// TestSearchDenseCastsTheQueryVectorOnceUnderAGenericPlan pins the #143
+// mechanism: a generic plan for the old query cast the text query vector once
+// for every Chunk it scanned. The control asserts the old shape still has
+// that per-Chunk cast; the repository query must cast the vector only once.
+func TestSearchDenseCastsTheQueryVectorOnceUnderAGenericPlan(t *testing.T) {
+	ctx := context.Background()
+	pool := dbtest.Migrated(t)
+
+	// One connection keeps the SearchDense prepared statement and the
+	// pg_prepared_statements lookup on the same session.
+	cfg := pool.Config()
+	cfg.MaxConns = 1
+	single, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("single-connection pool: %v", err)
+	}
+	t.Cleanup(single.Close)
+
+	const oldQuery = `SELECT id, document_id, seq, content, context_header,
+       (1 - (embedding <=> $1::text::vector))::float8 AS score
+FROM chunks
+WHERE document_id = ANY($2::uuid[])
+  AND embedding_model = $3::text
+  AND embedding IS NOT NULL
+  AND (embedding <=> $1::text::vector) <> 'NaN'::float8
+ORDER BY embedding <=> $1::text::vector, id
+LIMIT $4`
+	oldPlan := explainGeneric(t, ctx, single, oldQuery)
+	if !hasPerChunkCast(oldPlan) {
+		t.Fatalf("the pre-#143 query no longer casts its query vector per Chunk over chunks (%s); the old plan shape changed (for example after a Postgres upgrade), so re-check that this test still proves #143", planString(oldPlan))
+	}
+
+	// No seed: the cast is an expression in the generic plan, not a
+	// data-dependent choice, so an empty chunks table is enough.
+	searcher := NewChunkSearcher(db.NewStore(single))
+	if _, err := searcher.SearchDense(ctx, []uuid.UUID{uuid.New()}, []float32{1, 0, 0}, "test-embedding", 10); err != nil {
+		t.Fatalf("SearchDense: %v", err)
+	}
+	newPlan := explainGeneric(t, ctx, single, preparedStatementText(t, ctx, single, "SearchDenseChunks"))
+	if hasPerChunkCast(newPlan) {
+		t.Errorf("SearchDenseChunks casts its query vector per Chunk over chunks: %s; #143", planString(newPlan))
+	}
+}
+
+type planNode struct {
+	NodeType     string     `json:"Node Type"`
+	RelationName string     `json:"Relation Name"`
+	Filter       string     `json:"Filter"`
+	SortKey      []string   `json:"Sort Key"`
+	Output       []string   `json:"Output"`
+	Plans        []planNode `json:"Plans"`
+}
+
+var vectorCast = regexp.MustCompile(`\(\$\d+\)::vector`)
+
+// explainGeneric plans query as a generic plan, without arguments or
+// execution. Postgres 16+ supports GENERIC_PLAN.
+func explainGeneric(t *testing.T, ctx context.Context, pool *pgxpool.Pool, query string) planNode {
+	t.Helper()
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire for explain: %v", err)
+	}
+	defer conn.Release()
+	// PgConn.Exec sends a simple query, keeping the $n placeholders inside
+	// the explained query instead of making them parameters of EXPLAIN.
+	results, err := conn.Conn().PgConn().Exec(ctx, "EXPLAIN (GENERIC_PLAN, VERBOSE, FORMAT JSON) "+query).ReadAll()
+	if err != nil {
+		t.Fatalf("explain generic plan: %v", err)
+	}
+	if len(results) != 1 || len(results[0].Rows) != 1 || len(results[0].Rows[0]) != 1 {
+		t.Fatalf("explain generic plan: want one JSON row, got %d results", len(results))
+	}
+	var plans []struct {
+		Plan planNode `json:"Plan"`
+	}
+	if err := json.Unmarshal(results[0].Rows[0][0], &plans); err != nil {
+		t.Fatalf("decode explain: %v", err)
+	}
+	if len(plans) != 1 {
+		t.Fatalf("explain returned %d plans, want one", len(plans))
+	}
+	return plans[0].Plan
+}
+
+// preparedStatementText returns the SQL the repository prepared for queryName.
+// The lookup relies on sqlc's `-- name: SearchDenseChunks :many` comment
+// being part of the statement text.
+func preparedStatementText(t *testing.T, ctx context.Context, pool *pgxpool.Pool, queryName string) string {
+	t.Helper()
+	var statement string
+	if err := pool.QueryRow(ctx, `SELECT statement FROM pg_prepared_statements
+		WHERE statement LIKE '%' || $1 || '%'
+		ORDER BY prepare_time DESC LIMIT 1`, queryName).Scan(&statement); err != nil {
+		t.Fatalf("find the prepared statement for %s: %v", queryName, err)
+	}
+	return statement
+}
+
+// hasPerChunkCast reports whether an expression over chunks casts the query
+// vector to vector, which means the cast is evaluated per Chunk. It checks
+// the chunks scan and its ancestors; the cast-once CTE's Result is a sibling.
+func hasPerChunkCast(node planNode) bool {
+	if overChunks(node) {
+		for _, expr := range node.expressions() {
+			if vectorCast.MatchString(expr) {
+				return true
+			}
+		}
+	}
+	for _, child := range node.Plans {
+		if hasPerChunkCast(child) {
+			return true
+		}
+	}
+	return false
+}
+
+// overChunks reports whether node or a descendant scans chunks.
+func overChunks(node planNode) bool {
+	if node.RelationName == "chunks" {
+		return true
+	}
+	for _, child := range node.Plans {
+		if overChunks(child) {
+			return true
+		}
+	}
+	return false
+}
+
+func (n planNode) expressions() []string {
+	exprs := []string{n.Filter}
+	exprs = append(exprs, n.SortKey...)
+	exprs = append(exprs, n.Output...)
+	return exprs
+}
+
+func planString(node planNode) string {
+	parts := []string{node.NodeType}
+	if node.RelationName != "" {
+		parts = append(parts, "on "+node.RelationName)
+	}
+	for _, child := range node.Plans {
+		parts = append(parts, planString(child))
+	}
+	return strings.Join(parts, " > ")
 }
 
 func TestSetParseStatusKeepsAFailureReasonOnlyWhileFailed(t *testing.T) {
