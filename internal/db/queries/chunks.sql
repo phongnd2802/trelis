@@ -38,16 +38,24 @@ SELECT count(*) FROM chunks WHERE document_id = $1 AND embedding IS NULL;
 -- #143: the generic plan re-parsed the repeated query-vector ::text::vector
 -- cast for every Chunk; query_vec casts it once. The readable-ID filter stays
 -- in the scan so the Access List limits the work.
+--
+-- #139: the distance is guarded by CASE because a plan may evaluate it before
+-- the model filter, and a Chunk of another model may have another dimension.
+-- The model filter stays in the scan too, so it narrows the rows before any
+-- scoring. A NULL score (another model or no embedding) or a NaN score (a
+-- zero-norm vector) can never be a match; NaN would also break JSON encoding.
 -- name: SearchDenseChunks :many
 WITH query_vec AS MATERIALIZED (SELECT sqlc.arg(query_embedding)::text::vector AS embedding)
-SELECT id, document_id, seq, content, context_header,
-       (1 - (chunks.embedding <=> query_vec.embedding))::float8 AS score
-FROM chunks, query_vec
-WHERE document_id = ANY(sqlc.arg(document_ids)::uuid[])
-  AND embedding_model = sqlc.arg(embedding_model)::text
-  AND chunks.embedding IS NOT NULL
-  -- A zero-norm vector makes cosine distance NaN; it can never be a match
-  -- and would not survive JSON encoding either.
-  AND (chunks.embedding <=> query_vec.embedding) <> 'NaN'::float8
-ORDER BY chunks.embedding <=> query_vec.embedding, id
+SELECT id, document_id, seq, content, context_header, score
+FROM (
+    SELECT chunks.id, chunks.document_id, chunks.seq, chunks.content, chunks.context_header,
+           (1 - CASE WHEN chunks.embedding_model = sqlc.arg(embedding_model)::text
+                     THEN chunks.embedding <=> query_vec.embedding END)::float8 AS score
+    FROM chunks, query_vec
+    WHERE document_id = ANY(sqlc.arg(document_ids)::uuid[])
+      AND embedding_model = sqlc.arg(embedding_model)::text
+      AND chunks.embedding IS NOT NULL
+) ranked
+WHERE score <> 'NaN'::float8
+ORDER BY score DESC, id
 LIMIT sqlc.arg(top_k);
