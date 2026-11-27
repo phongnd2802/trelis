@@ -191,6 +191,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "header, since latency is measured under it)",
     )
     run_command.add_argument(
+        "--max-consecutive-errors",
+        type=_non_negative_int,
+        default=10,
+        help="abort a config after this many question errors in a row, 0 disables (default: 10)",
+    )
+    run_command.add_argument(
         "--request-timeout",
         type=_positive_float,
         default=DEFAULT_REQUEST_TIMEOUT,
@@ -389,6 +395,7 @@ def _run_retrieval(args: argparse.Namespace, transport: httpx.BaseTransport | No
                     args.top_k,
                     clock=time.monotonic,
                     concurrency=args.concurrency,
+                    max_consecutive_errors=args.max_consecutive_errors,
                 )
             except AblationAborted as exc:
                 print(f"config {config.name}: aborted: {exc}")

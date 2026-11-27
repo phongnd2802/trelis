@@ -11,7 +11,7 @@ import hashlib
 import json
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -64,9 +64,14 @@ class QuestionStatus(StrEnum):
 
 
 class AblationAborted(RuntimeError):
-    """A run stopped because Trelis rejected the Retrieval Config."""
+    """A run stopped because Trelis rejected the Retrieval Config or its
+    questions kept failing.
 
-    def __init__(self, status: int, message: str):
+    ``status`` is the HTTP status that rejected the config, or None when the
+    abort came from repeated question errors.
+    """
+
+    def __init__(self, status: int | None, message: str):
         self.status = status
         self.message = message
         super().__init__(message)
@@ -250,18 +255,22 @@ def run_ablation(
     *,
     clock: Callable[[], float] = time.monotonic,
     concurrency: int = 1,
+    max_consecutive_errors: int = 10,
 ) -> AblationRun:
     """Score every Golden question under one Retrieval Config.
 
     Questions with no evidence are skipped, and an ordinary request error is
     recorded on its question and excluded from the means. A 400 or 503 raises
     :class:`AblationAborted`, because Trelis rejected the config rather than the
-    question. Missing evidence Documents and a per-Principal question fail
-    before any request runs.
+    question; so does ``max_consecutive_errors`` question errors in a row,
+    because the run is failing rather than the questions (0 disables that
+    rule). A skipped question neither resets nor advances the streak. Missing
+    evidence Documents and a per-Principal question fail before any request
+    runs.
 
     With ``concurrency`` above 1, that many questions are in flight at once;
-    the results keep Golden Set order, and an abort cancels the questions not
-    yet sent.
+    errors are counted in the order their results arrive, the results keep
+    Golden Set order, and an abort cancels the questions not yet sent.
     """
     if (
         not isinstance(concurrency, int)
@@ -273,11 +282,21 @@ def run_ablation(
         )
     if not isinstance(top_k, int) or isinstance(top_k, bool) or not 10 <= top_k <= 100:
         raise ValueError(f"top_k must be between 10 and 100, got {top_k!r}")
+    if (
+        not isinstance(max_consecutive_errors, int)
+        or isinstance(max_consecutive_errors, bool)
+        or max_consecutive_errors < 0
+    ):
+        raise ValueError(
+            f"max_consecutive_errors must be a non-negative integer, got {max_consecutive_errors!r}"
+        )
     _check_principals(golden)
     _check_evidence(golden, manifest)
 
     started_at = _utc_now()
-    results = _score_questions(client, golden, manifest, config, top_k, clock, concurrency)
+    results = _score_questions(
+        client, golden, manifest, config, top_k, clock, concurrency, max_consecutive_errors
+    )
     finished_at = _utc_now()
 
     scored = [result for result in results if result.status is QuestionStatus.SCORED]
@@ -334,23 +353,93 @@ def _score_questions(
     top_k: int,
     clock: Callable[[], float],
     concurrency: int,
+    max_consecutive_errors: int,
 ) -> tuple[QuestionResult, ...]:
-    """Score the questions, ``concurrency`` at a time, in Golden Set order."""
+    """Score the questions, ``concurrency`` at a time, in Golden Set order.
+
+    Question errors are counted as they arrive; a scored question resets the
+    streak, a skipped one leaves it alone, and reaching
+    ``max_consecutive_errors`` raises :class:`AblationAborted` (0 disables the
+    rule). Once aborted, no further question is sent.
+    """
     if concurrency == 1:
-        return tuple(
-            _score_question(client, question, manifest, config, top_k, clock) for question in golden
-        )
+        results = []
+        consecutive_errors = 0
+        for question in golden:
+            result = _score_question(client, question, manifest, config, top_k, clock)
+            results.append(result)
+            consecutive_errors = _next_consecutive_errors(consecutive_errors, result)
+            _abort_after_errors(consecutive_errors, result, max_consecutive_errors)
+        return tuple(results)
+    return _score_concurrently(
+        client, golden, manifest, config, top_k, clock, concurrency, max_consecutive_errors
+    )
+
+
+def _score_concurrently(
+    client: TrelisClient,
+    golden: Sequence[GoldenQuestion],
+    manifest: Manifest,
+    config: RetrievalConfig,
+    top_k: int,
+    clock: Callable[[], float],
+    concurrency: int,
+    max_consecutive_errors: int,
+) -> tuple[QuestionResult, ...]:
+    """Score with at most ``concurrency`` questions in flight.
+
+    Only the next questions are submitted as earlier ones finish, so an abort
+    stops the set instead of queueing all of it; the results keep Golden Set
+    order even though the errors are counted in completion order.
+    """
+    results: dict[int, QuestionResult] = {}
+    consecutive_errors = 0
+    next_index = 0
+    pending: dict[Future[QuestionResult], int] = {}
     executor = ThreadPoolExecutor(max_workers=concurrency)
-    futures = [
-        executor.submit(_score_question, client, question, manifest, config, top_k, clock)
-        for question in golden
-    ]
+
+    def submit_next() -> None:
+        nonlocal next_index
+        pending[
+            executor.submit(
+                _score_question, client, golden[next_index], manifest, config, top_k, clock
+            )
+        ] = next_index
+        next_index += 1
+
     try:
-        return tuple(future.result() for future in futures)
+        while next_index < len(golden) and len(pending) < concurrency:
+            submit_next()
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                result = future.result()
+                results[pending.pop(future)] = result
+                consecutive_errors = _next_consecutive_errors(consecutive_errors, result)
+                _abort_after_errors(consecutive_errors, result, max_consecutive_errors)
+            while next_index < len(golden) and len(pending) < concurrency:
+                submit_next()
     finally:
-        # On an abort, drop the questions still queued instead of sending
-        # each one only to be rejected the same way.
+        # An abort drops the questions still queued instead of sending each
+        # one only to be rejected the same way.
         executor.shutdown(wait=True, cancel_futures=True)
+    return tuple(results[index] for index in range(len(golden)))
+
+
+def _next_consecutive_errors(count: int, result: QuestionResult) -> int:
+    """Return the error streak after result: a scored question resets it and a
+    skipped one leaves it as it was."""
+    if result.status is QuestionStatus.ERROR:
+        return count + 1
+    if result.status is QuestionStatus.SCORED:
+        return 0
+    return count
+
+
+def _abort_after_errors(count: int, result: QuestionResult, limit: int) -> None:
+    """Raise once the streak reaches limit; 0 disables the rule."""
+    if limit and count >= limit:
+        raise AblationAborted(None, f"{count} consecutive question errors; last: {result.error}")
 
 
 def _check_principals(golden: Sequence[GoldenQuestion]) -> None:

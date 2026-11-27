@@ -444,6 +444,181 @@ def test_a_rejected_config_aborts_the_run_at_the_first_request(status):
     assert len(server.requests) == 1
 
 
+def error_streak_fixture(count):
+    golden = [question(f"q{i}", ["https://example.com/a"]) for i in range(count)]
+    manifest = Manifest(
+        source_by_document={"doc-a": "https://example.com/a"},
+        completed_source_ids=frozenset({"https://example.com/a"}),
+    )
+    return golden, manifest
+
+
+def test_a_502_is_a_question_error_not_a_config_rejection():
+    golden, manifest = error_streak_fixture(1)
+    server = RetrievalServer({}, failing_queries={"Question q0?"}, failure_status=502)
+
+    with make_client(server) as client:
+        run = run_ablation(client, golden, manifest, RetrievalConfig("dense", ("dense",)))
+
+    (errored,) = run.questions
+    assert errored.status is QuestionStatus.ERROR
+    assert "HTTP 502" in errored.error
+    assert run.summary.scored == 0
+    assert run.summary.error == 1
+
+
+def test_repeated_question_errors_abort_the_run():
+    golden, manifest = error_streak_fixture(6)
+    server = RetrievalServer(
+        {}, failing_queries={f"Question q{i}?" for i in range(6)}, failure_status=502
+    )
+
+    with make_client(server) as client, pytest.raises(AblationAborted) as caught:
+        run_ablation(
+            client,
+            golden,
+            manifest,
+            RetrievalConfig("dense", ("dense",)),
+            max_consecutive_errors=3,
+        )
+
+    assert caught.value.status is None
+    assert "3 consecutive question errors; last: HTTP 502" in str(caught.value)
+    assert len(server.requests) == 3
+
+
+def test_nine_question_errors_do_not_abort_by_default():
+    golden, manifest = error_streak_fixture(9)
+    server = RetrievalServer(
+        {}, failing_queries={f"Question q{i}?" for i in range(9)}, failure_status=502
+    )
+
+    with make_client(server) as client:
+        run = run_ablation(client, golden, manifest, RetrievalConfig("dense", ("dense",)))
+
+    assert run.summary.error == 9
+
+
+def test_ten_question_errors_in_a_row_are_the_default_limit():
+    golden, manifest = error_streak_fixture(10)
+    server = RetrievalServer(
+        {}, failing_queries={f"Question q{i}?" for i in range(10)}, failure_status=502
+    )
+
+    with make_client(server) as client, pytest.raises(AblationAborted) as caught:
+        run_ablation(client, golden, manifest, RetrievalConfig("dense", ("dense",)))
+
+    assert "10 consecutive question errors" in str(caught.value)
+
+
+def test_question_errors_interleaved_with_scored_questions_do_not_abort():
+    golden, manifest = error_streak_fixture(4)
+    server = RetrievalServer(
+        {f"Question q{i}?": [chunk("doc-a", f"c{i}")] for i in (1, 3)},
+        failing_queries={"Question q0?", "Question q2?"},
+        failure_status=502,
+    )
+
+    with make_client(server) as client:
+        run = run_ablation(
+            client,
+            golden,
+            manifest,
+            RetrievalConfig("dense", ("dense",)),
+            max_consecutive_errors=2,
+        )
+
+    assert [result.status for result in run.questions] == [
+        QuestionStatus.ERROR,
+        QuestionStatus.SCORED,
+        QuestionStatus.ERROR,
+        QuestionStatus.SCORED,
+    ]
+    assert run.summary.error == 2
+    assert run.summary.scored == 2
+
+
+def test_a_skipped_question_neither_resets_nor_advances_the_error_streak():
+    golden = [
+        question("q0", ["https://example.com/a"]),
+        question("q1", []),
+        question("q2", ["https://example.com/a"]),
+    ]
+    manifest = Manifest(
+        source_by_document={"doc-a": "https://example.com/a"},
+        completed_source_ids=frozenset({"https://example.com/a"}),
+    )
+    server = RetrievalServer(
+        {}, failing_queries={"Question q0?", "Question q2?"}, failure_status=502
+    )
+
+    with make_client(server) as client, pytest.raises(AblationAborted) as caught:
+        run_ablation(
+            client,
+            golden,
+            manifest,
+            RetrievalConfig("dense", ("dense",)),
+            max_consecutive_errors=2,
+        )
+
+    assert "2 consecutive question errors" in str(caught.value)
+    assert len(server.requests) == 2
+
+
+def test_zero_max_consecutive_errors_disables_the_abort():
+    golden, manifest = error_streak_fixture(4)
+    server = RetrievalServer(
+        {}, failing_queries={f"Question q{i}?" for i in range(4)}, failure_status=502
+    )
+
+    with make_client(server) as client:
+        run = run_ablation(
+            client,
+            golden,
+            manifest,
+            RetrievalConfig("dense", ("dense",)),
+            max_consecutive_errors=0,
+        )
+
+    assert run.summary.error == 4
+
+
+def test_a_concurrent_run_aborts_after_repeated_errors():
+    golden, manifest = concurrency_fixture(50)
+    server = RetrievalServer(
+        {}, failing_queries={f"Question q{i}?" for i in range(50)}, failure_status=502
+    )
+
+    with make_client(server) as client, pytest.raises(AblationAborted) as caught:
+        run_ablation(
+            client,
+            golden,
+            manifest,
+            RetrievalConfig("dense", ("dense",)),
+            concurrency=2,
+            max_consecutive_errors=3,
+        )
+
+    assert "3 consecutive question errors" in str(caught.value)
+    assert len(server.requests) < 50
+
+
+@pytest.mark.parametrize("max_consecutive_errors", [-1, True])
+def test_max_consecutive_errors_must_be_a_non_negative_integer(max_consecutive_errors):
+    golden, manifest = error_streak_fixture(1)
+    with (
+        make_client(RetrievalServer({})) as client,
+        pytest.raises(ValueError, match="max_consecutive_errors"),
+    ):
+        run_ablation(
+            client,
+            golden,
+            manifest,
+            RetrievalConfig("dense", ("dense",)),
+            max_consecutive_errors=max_consecutive_errors,
+        )
+
+
 def test_summary_means_and_nearest_rank_percentiles_use_the_scored_calls():
     golden = [
         question("q1", ["https://example.com/a"]),

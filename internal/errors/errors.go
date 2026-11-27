@@ -3,7 +3,9 @@
 // License, by way of Omnisc. Modified for Trelis: the common code table is
 // kept whole so codes stay stable, the domain codes (tenants, agents, ...)
 // and the constructors Trelis does not call are dropped,
-// ErrRequestEntityTooLarge is added, and IsAppError unwraps. See NOTICE.
+// ErrRequestEntityTooLarge and ErrModelProvider are added, along with
+// NewModelProviderError and the AppError cause/Unwrap, and IsAppError unwraps.
+// See NOTICE.
 
 // Package errors is the application error a handler answers with: a stable
 // numeric code, a message fit for the client, and the HTTP status.
@@ -35,6 +37,11 @@ const (
 	// ErrRequestEntityTooLarge is Trelis's: Omnisc answers an oversized
 	// upload with ErrBadRequest.
 	ErrRequestEntityTooLarge ErrorCode = 1011
+	// ErrModelProvider is Trelis's: a model provider rejected a call made
+	// while serving a request, because of its credentials, credit, permission
+	// or rate limit. The failure is the provider's, not the caller's, so it is
+	// a bad gateway.
+	ErrModelProvider ErrorCode = 1012
 )
 
 // AppError defines the application error structure
@@ -43,11 +50,21 @@ type AppError struct {
 	Message  string    `json:"message"`
 	Details  any       `json:"details,omitempty"`
 	HTTPCode int       `json:"-"`
+
+	// cause is the error that led to this one, if any. Unwrap keeps it in the
+	// chain so callers can still recognise it, for example the provider's
+	// *api.HTTPError behind ErrModelProvider.
+	cause error
 }
 
 // Error implements the error interface
 func (e *AppError) Error() string {
 	return fmt.Sprintf("error code: %d, error message: %s", e.Code, e.Message)
+}
+
+// Unwrap returns the error behind this one, or nil.
+func (e *AppError) Unwrap() error {
+	return e.cause
 }
 
 // WithDetails adds error details
@@ -92,6 +109,20 @@ func NewInternalServerError(message string) *AppError {
 		Code:     ErrInternalServer,
 		Message:  message,
 		HTTPCode: http.StatusInternalServerError,
+	}
+}
+
+// NewModelProviderError creates the bad gateway error a model provider's
+// rejection reaches the client as. role names the model role ("embedding",
+// "rerank", ...) and status is the provider's HTTP status; cause, the provider
+// error itself, stays in the chain. The message never carries the provider's
+// body, which can echo the request.
+func NewModelProviderError(role string, status int, cause error) *AppError {
+	return &AppError{
+		Code:     ErrModelProvider,
+		Message:  fmt.Sprintf("the %s model provider rejected the call (HTTP %d)", role, status),
+		HTTPCode: http.StatusBadGateway,
+		cause:    cause,
 	}
 }
 

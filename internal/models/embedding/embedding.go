@@ -22,6 +22,7 @@ import (
 	"github.com/phongnd2802/trelis/internal/config"
 	"github.com/phongnd2802/trelis/internal/logger"
 	"github.com/phongnd2802/trelis/internal/models/api"
+	"github.com/phongnd2802/trelis/internal/models/providererror"
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
 
@@ -123,7 +124,8 @@ func (c *client) Embed(ctx context.Context, texts []string) ([][]float32, error)
 		batch := texts[start:min(start+c.batchSize, len(texts))]
 		got, err := c.embedBatch(ctx, batch, dims)
 		if err != nil {
-			return nil, fmt.Errorf("embed texts %d-%d: %w", start+1, start+len(batch), err)
+			return nil, fmt.Errorf("embed texts %d-%d: %w", start+1, start+len(batch),
+				providererror.Wrap("embedding", err))
 		}
 		// One Embed call feeds one index, so every batch has to come back in
 		// the same shape: a distance between two vectors of different lengths

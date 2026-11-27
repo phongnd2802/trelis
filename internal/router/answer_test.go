@@ -11,7 +11,12 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/phongnd2802/trelis/internal/application/service"
+	"github.com/phongnd2802/trelis/internal/config"
+	apperrors "github.com/phongnd2802/trelis/internal/errors"
 	"github.com/phongnd2802/trelis/internal/handler"
+	"github.com/phongnd2802/trelis/internal/models/api"
+	"github.com/phongnd2802/trelis/internal/models/chat"
+	"github.com/phongnd2802/trelis/internal/models/modeltest"
 	"github.com/phongnd2802/trelis/internal/types"
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
@@ -229,5 +234,41 @@ func TestAnInternalAnswerFailureIs500(t *testing.T) {
 	e := decode(t, rec)
 	if e.Success || e.Error == nil || e.Error.Code != 1007 || e.Error.Message != "Internal server error" {
 		t.Errorf("body = %s, want the generic internal error envelope", rec.Body)
+	}
+}
+
+func TestAChatProviderRejectionIs502WithoutTheVendorBody(t *testing.T) {
+	p := modeltest.NewFakeProvider(t)
+	p.FailNext(modeltest.ChatCompletions, http.StatusUnauthorized, 1)
+	c, err := chat.NewChat("chat", config.ChatRole{
+		Protocol: api.APIOpenAICompletions,
+		Endpoint: config.Endpoint{BaseURL: p.URL(), Model: "test-chat"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retrieval := &stubRetrieval{result: &types.RetrievalResult{
+		Results: []types.RetrievedChunk{{Content: "The election was in 2024."}},
+		Trace:   []types.TraceStep{},
+	}}
+	h := newAnswerRouter(service.NewAnswerService(retrieval, chat.Generator(c)))
+
+	rec := postJSON(t, h, "/answer", `{"query":"who won?"}`, "Bearer trelis_alice")
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("POST /answer = %d %s, want 502", rec.Code, rec.Body)
+	}
+	e := decode(t, rec)
+	if e.Success || e.Error == nil {
+		t.Fatalf("body = %s, want the error envelope", rec.Body)
+	}
+	if e.Error.Code != int(apperrors.ErrModelProvider) {
+		t.Errorf("code = %d, want %d", e.Error.Code, apperrors.ErrModelProvider)
+	}
+	if want := "the chat model provider rejected the call (HTTP 401)"; e.Error.Message != want {
+		t.Errorf("message = %q, want %q", e.Error.Message, want)
+	}
+	if strings.Contains(rec.Body.String(), "modeltest") {
+		t.Errorf("body = %s, want no provider error body", rec.Body)
 	}
 }

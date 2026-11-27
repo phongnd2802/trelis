@@ -12,7 +12,13 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/phongnd2802/trelis/internal/application/service"
+	"github.com/phongnd2802/trelis/internal/config"
+	apperrors "github.com/phongnd2802/trelis/internal/errors"
 	"github.com/phongnd2802/trelis/internal/handler"
+	"github.com/phongnd2802/trelis/internal/models/api"
+	"github.com/phongnd2802/trelis/internal/models/embedding"
+	"github.com/phongnd2802/trelis/internal/models/modeltest"
+	"github.com/phongnd2802/trelis/internal/models/rerank"
 	"github.com/phongnd2802/trelis/internal/types"
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
@@ -420,6 +426,104 @@ func TestAnInternalRetrievalFailureIs500(t *testing.T) {
 	}
 	e := decode(t, rec)
 	if e.Success || e.Error == nil || e.Error.Code != 1007 || e.Error.Message != "Internal server error" {
+		t.Errorf("body = %s, want the generic internal error envelope", rec.Body)
+	}
+}
+
+// newProviderRetrieveRouter wires the real embedding and rerank clients to p,
+// so a test can see how a provider's answer reaches the client through
+// POST /retrieve.
+func newProviderRetrieveRouter(t *testing.T, p *modeltest.FakeProvider) http.Handler {
+	t.Helper()
+	embedder, err := embedding.New(
+		config.EmbeddingRole{
+			Endpoint:  config.Endpoint{BaseURL: p.URL(), Model: "test-embedding"},
+			BatchSize: 8,
+		},
+		embedding.WithRetry(1, 0, 0),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reranker, err := rerank.New(
+		config.RerankRole{Endpoint: config.Endpoint{BaseURL: p.URL(), Model: "test-rerank"}},
+		rerank.WithRetry(api.Retry{MaxAttempts: 1}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	documentID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	chunkID := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+	svc := service.NewRetrievalService(
+		&callerReadableDocuments{readable: map[uuid.UUID][]uuid.UUID{alice.ID: {documentID}}},
+		&readableChunkSearch{matches: []*types.ChunkMatch{{
+			Chunk: &types.Chunk{ID: chunkID, DocumentID: documentID, Content: "Alice's readable Chunk"},
+			Score: 1,
+		}}},
+		embedder, reranker,
+	)
+	return newRetrieveRouter(svc)
+}
+
+// assertModelProviderRejection checks the 502 envelope and that the provider's
+// own body is nowhere in it.
+func assertModelProviderRejection(t *testing.T, rec *httptest.ResponseRecorder, wantMessage string) {
+	t.Helper()
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("POST /retrieve = %d %s, want 502", rec.Code, rec.Body)
+	}
+	e := decode(t, rec)
+	if e.Success || e.Error == nil {
+		t.Fatalf("body = %s, want the error envelope", rec.Body)
+	}
+	if e.Error.Code != int(apperrors.ErrModelProvider) {
+		t.Errorf("code = %d, want %d", e.Error.Code, apperrors.ErrModelProvider)
+	}
+	if e.Error.Message != wantMessage {
+		t.Errorf("message = %q, want %q", e.Error.Message, wantMessage)
+	}
+	if strings.Contains(rec.Body.String(), "modeltest") {
+		t.Errorf("body = %s, want no provider error body", rec.Body)
+	}
+}
+
+func TestARerankProviderRejectionIs502WithoutTheVendorBody(t *testing.T) {
+	p := modeltest.NewFakeProvider(t)
+	p.FailNext(modeltest.Rerank, http.StatusPaymentRequired, 1)
+	h := newProviderRetrieveRouter(t, p)
+
+	rec := postJSON(t, h, "/retrieve",
+		`{"query":"who won?","retrieval_config":{"techniques":["dense","rerank"]}}`,
+		"Bearer trelis_alice")
+
+	assertModelProviderRejection(t, rec, "the rerank model provider rejected the call (HTTP 402)")
+}
+
+func TestAnEmbeddingProviderRejectionIs502WithoutTheVendorBody(t *testing.T) {
+	p := modeltest.NewFakeProvider(t)
+	p.FailNext(modeltest.Embeddings, http.StatusUnauthorized, 1)
+	h := newProviderRetrieveRouter(t, p)
+
+	rec := postJSON(t, h, "/retrieve", `{"query":"who won?"}`, "Bearer trelis_alice")
+
+	assertModelProviderRejection(t, rec, "the embedding model provider rejected the call (HTTP 401)")
+}
+
+func TestAnotherProviderFailureIsStillAGeneric500(t *testing.T) {
+	p := modeltest.NewFakeProvider(t)
+	p.FailNext(modeltest.Rerank, http.StatusInternalServerError, 1)
+	h := newProviderRetrieveRouter(t, p)
+
+	rec := postJSON(t, h, "/retrieve",
+		`{"query":"who won?","retrieval_config":{"techniques":["dense","rerank"]}}`,
+		"Bearer trelis_alice")
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("POST /retrieve = %d %s, want 500", rec.Code, rec.Body)
+	}
+	e := decode(t, rec)
+	if e.Success || e.Error == nil || e.Error.Code != int(apperrors.ErrInternalServer) ||
+		e.Error.Message != "Internal server error" {
 		t.Errorf("body = %s, want the generic internal error envelope", rec.Body)
 	}
 }
