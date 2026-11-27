@@ -5,12 +5,28 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 
 import httpx
 
+from .ablation_run import (
+    HARNESS_VERSION,
+    AblationAborted,
+    AblationRun,
+    AblationRunFile,
+    GoldenSetRef,
+    ManifestRef,
+    QuestionStatus,
+    default_run_id,
+    file_sha256,
+    load_manifest,
+    parse_retrieval_config,
+    run_ablation,
+    write_ablation_run,
+)
 from .client import TrelisClient, TrelisError
 from .golden import GoldenSetError, load_golden_set, write_golden_set
 from .ingest import IngestRecord, IngestStatus, ingest, write_manifest
@@ -19,7 +35,9 @@ from .multihop import (
     fetch,
     load_corpus,
     load_questions,
+    select_evidence_documents,
     select_subset,
+    stratified_sample,
     to_golden_set,
 )
 
@@ -93,7 +111,13 @@ def _build_parser() -> argparse.ArgumentParser:
     ingest_command.add_argument(
         "--extra-docs", type=_non_negative_int, default=0, help="distractor documents"
     )
-    ingest_command.add_argument("--seed", type=int, default=0, help="distractor selection seed")
+    ingest_command.add_argument("--seed", type=int, default=0, help="selection seed")
+    ingest_command.add_argument(
+        "--sample",
+        choices=("first", "stratified"),
+        default="first",
+        help="take the first questions or a question-type-stratified sample",
+    )
     ingest_command.add_argument(
         "--principals", default="", help="comma-separated Principal names for the Access List"
     )
@@ -120,6 +144,37 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     validate_command.add_argument("path", type=Path)
     validate_command.set_defaults(handler=_run_golden_validate)
+
+    retrieval = commands.add_parser("retrieval", help="run retrieval ablations")
+    retrieval_commands = retrieval.add_subparsers(dest="retrieval_command", required=True)
+    run_command = retrieval_commands.add_parser(
+        "run", help="score a Golden Set under one or more Retrieval Configs"
+    )
+    run_command.add_argument("--golden", type=Path, required=True)
+    run_command.add_argument("--manifest", type=Path, required=True)
+    run_command.add_argument(
+        "--config",
+        action="append",
+        dest="configs",
+        metavar="TECHNIQUES",
+        help="Retrieval Techniques joined with '+' (repeatable; default: dense)",
+    )
+    run_command.add_argument(
+        "--top-k",
+        type=int,
+        default=10,
+        help="Chunks to retrieve per question, between 10 and 100",
+    )
+    run_command.add_argument(
+        "--out-dir", type=Path, default=Path("eval/runs"), help="directory for results files"
+    )
+    run_command.add_argument(
+        "--run-id", default=None, help="results directory name (default: UTC timestamp)"
+    )
+    run_command.add_argument(
+        "--base-url", default=None, help="Trelis base URL (default: $TRELIS_BASE_URL)"
+    )
+    run_command.set_defaults(handler=_run_retrieval)
 
     return parser
 
@@ -159,9 +214,15 @@ def _run_ingest(args: argparse.Namespace, transport: httpx.BaseTransport | None)
     documents = load_corpus(args.data_dir / "corpus.json")
     questions = load_questions(args.data_dir / "MultiHopRAG.json")
     golden = to_golden_set(questions)
-    selected_questions, selected_documents = select_subset(
-        documents, golden, args.questions, args.extra_docs, args.seed
-    )
+    if args.sample == "stratified":
+        selected_questions = stratified_sample(golden, args.questions, args.seed)
+        selected_documents = select_evidence_documents(
+            documents, selected_questions, args.extra_docs, args.seed
+        )
+    else:
+        selected_questions, selected_documents = select_subset(
+            documents, golden, args.questions, args.extra_docs, args.seed
+        )
 
     with TrelisClient(base_url, api_key, transport=transport) as client:
         records = ingest(
@@ -184,6 +245,98 @@ def _run_ingest(args: argparse.Namespace, transport: httpx.BaseTransport | None)
     ):
         return 1
     return 0
+
+
+def _run_retrieval(args: argparse.Namespace, transport: httpx.BaseTransport | None) -> int:
+    """Run every Retrieval Config in turn and write one results file each."""
+    configs = [parse_retrieval_config(value) for value in (args.configs or ["dense"])]
+    names = [config.name for config in configs]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise CliError(f"retrieval config {duplicates[0]!r} was given more than once")
+    if not 10 <= args.top_k <= 100:
+        raise CliError(f"--top-k must be between 10 and 100, got {args.top_k}")
+
+    golden = load_golden_set(args.golden)
+    manifest = load_manifest(args.manifest)
+    run_id = args.run_id or default_run_id()
+    paths = [args.out_dir / run_id / f"{config.name}.jsonl" for config in configs]
+    existing = [str(path) for path in paths if path.exists()]
+    if existing:
+        raise CliError(
+            "results file(s) already exist; choose another --run-id: " + ", ".join(existing)
+        )
+
+    base_url, api_key = _connection(args.base_url)
+    golden_set = GoldenSetRef(
+        path=str(args.golden),
+        sha256=file_sha256(args.golden),
+        questions=len(golden),
+    )
+    manifest_ref = ManifestRef(path=str(args.manifest), sha256=file_sha256(args.manifest))
+
+    exit_code = 0
+    with TrelisClient(base_url, api_key, transport=transport) as client:
+        for config, path in zip(configs, paths, strict=True):
+            try:
+                run = run_ablation(
+                    client,
+                    golden,
+                    manifest,
+                    config,
+                    args.top_k,
+                    clock=time.monotonic,
+                )
+            except AblationAborted as exc:
+                print(f"config {config.name}: aborted: {exc}")
+                exit_code = 1
+                continue
+            write_ablation_run(
+                path,
+                AblationRunFile(
+                    run_id=run_id,
+                    golden_set=golden_set,
+                    manifest=manifest_ref,
+                    base_url=base_url,
+                    harness_version=HARNESS_VERSION,
+                    run=run,
+                ),
+            )
+            _print_retrieval_summary(run, path)
+            if run.summary.scored == 0:
+                exit_code = 1
+    return exit_code
+
+
+def _print_retrieval_summary(run: AblationRun, path: Path) -> None:
+    """Print one Ablation Run's counts, metric means, latencies and file."""
+    summary = run.summary
+
+    def metric(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:.4f}"
+
+    def latency(value: float | None) -> str:
+        return "n/a" if value is None else f"{value:.1f}ms"
+
+    line = (
+        f"{run.config.name}: scored={summary.scored} skipped={summary.skipped} "
+        f"error={summary.error} recall@5={metric(summary.recall_at_5)} "
+        f"recall@10={metric(summary.recall_at_10)} mrr={metric(summary.mrr)} "
+        f"ndcg@10={metric(summary.ndcg_at_10)} p50={latency(summary.latency_p50)} "
+        f"p95={latency(summary.latency_p95)}"
+    )
+    first_error = next(
+        (
+            result.error
+            for result in run.questions
+            if result.status is QuestionStatus.ERROR and result.error is not None
+        ),
+        None,
+    )
+    if first_error is not None:
+        line += f" first_error={first_error!r}"
+    print(line)
+    print(f"  -> {path}")
 
 
 def _connection(base_url: str | None) -> tuple[str, str]:

@@ -7,6 +7,7 @@ import json
 import random
 import re
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -170,9 +171,50 @@ def select_subset(
         raise ValueError(f"asked for {questions} Golden questions but only {len(golden)} exist")
 
     selected_questions = list(golden[:questions])
-    wanted = {
-        evidence.source_id for question in selected_questions for evidence in question.evidence
-    }
+    return selected_questions, select_evidence_documents(
+        documents, selected_questions, extra_docs, seed
+    )
+
+
+def stratified_sample(golden: Sequence[GoldenQuestion], n: int, seed: int) -> list[GoldenQuestion]:
+    """Pick ``n`` questions proportionally from the question_type Slices.
+
+    Allocation uses the largest remainder method over each question's single
+    non-``hops-*`` Slice, with ties broken by Slice name. Within each Slice the
+    questions are sorted by id before one ``random.Random(seed)`` stream
+    samples them. The union is returned sorted by id.
+    """
+    if n < 0:
+        raise ValueError("n must not be negative")
+    if n > len(golden):
+        raise ValueError(f"asked for {n} Golden questions but only {len(golden)} exist")
+
+    slices_by_type = _slices_by_question_type(golden)
+    total = len(golden)
+    allocation = {name: n * len(questions) // total for name, questions in slices_by_type.items()}
+    remainders = {name: n * len(questions) % total for name, questions in slices_by_type.items()}
+    left = n - sum(allocation.values())
+    for name in sorted(slices_by_type, key=lambda name: (-remainders[name], name))[:left]:
+        allocation[name] += 1
+
+    selected: list[GoldenQuestion] = []
+    rng = random.Random(seed)
+    for name in sorted(slices_by_type):
+        pool = sorted(slices_by_type[name], key=lambda question: question.id)
+        selected.extend(rng.sample(pool, allocation[name]))
+    return sorted(selected, key=lambda question: question.id)
+
+
+def select_evidence_documents(
+    documents: list[BenchmarkDocument],
+    questions: list[GoldenQuestion],
+    extra_docs: int,
+    seed: int,
+) -> list[BenchmarkDocument]:
+    """Include every evidence Document of ``questions`` plus seeded distractors."""
+    if extra_docs < 0:
+        raise ValueError("extra_docs must not be negative")
+    wanted = {evidence.source_id for question in questions for evidence in question.evidence}
     by_source_id = {document.source_id: document for document in documents}
     missing = sorted(wanted - set(by_source_id))
     if missing:
@@ -187,7 +229,23 @@ def select_subset(
             f"not enough documents for {extra_docs} distractors: only {len(others)} left"
         )
     distractors = random.Random(seed).sample(others, extra_docs)
-    return selected_questions, cited + distractors
+    return cited + distractors
+
+
+def _slices_by_question_type(
+    golden: Sequence[GoldenQuestion],
+) -> dict[str, list[GoldenQuestion]]:
+    """Group questions by the one Slice that names their question type."""
+    slices_by_type: dict[str, list[GoldenQuestion]] = {}
+    for question in golden:
+        names = [name for name in question.slices if not name.startswith("hops-")]
+        if len(names) != 1:
+            raise ValueError(
+                f"Golden question {question.id!r} must have exactly one non-hops-* "
+                f"Slice naming its question type, got {names!r}"
+            )
+        slices_by_type.setdefault(names[0], []).append(question)
+    return slices_by_type
 
 
 def document_markdown(document: BenchmarkDocument) -> tuple[str, bytes]:

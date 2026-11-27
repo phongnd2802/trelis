@@ -82,8 +82,9 @@ the admin CLI. Setup and the fetch → ingest walkthrough are in `eval/README.md
 
 | Feature | Status | Where | Entry points | Tests | Decisions / issues |
 |---|---|---|---|---|---|
-| MultiHop-RAG Benchmark Corpus: fetch, load, subset selection, one-command ingest as Documents, polling and a `source_id` → Document manifest | done | `eval/src/trelis_eval/multihop.py`, `eval/src/trelis_eval/client.py`, `eval/src/trelis_eval/ingest.py`, `eval/src/trelis_eval/cli.py` | `trelis-eval multihop fetch`, `trelis-eval multihop ingest` | `eval/tests/test_multihop.py`, `eval/tests/test_client.py`, `eval/tests/test_ingest.py`, `eval/tests/test_cli.py` | ADR-0001, #38 |
+| MultiHop-RAG Benchmark Corpus: fetch, load, first or stratified subset selection, one-command ingest as Documents, polling and a `source_id` → Document manifest | done | `eval/src/trelis_eval/multihop.py`, `eval/src/trelis_eval/client.py`, `eval/src/trelis_eval/ingest.py`, `eval/src/trelis_eval/cli.py` | `trelis-eval multihop fetch`, `trelis-eval multihop ingest` | `eval/tests/test_multihop.py`, `eval/tests/test_client.py`, `eval/tests/test_ingest.py`, `eval/tests/test_cli.py` | ADR-0001, #38 |
 | Golden Set JSONL: load with collected validation, write losslessly, document Slices and the MultiHop-RAG mapping | done | `eval/src/trelis_eval/golden.py`, `eval/docs/golden-set.md` | `trelis-eval multihop golden`, `trelis-eval golden validate` | `eval/tests/test_golden.py`, `eval/tests/test_cli.py` | ADR-0001, #38 |
+| Retrieval Ablation Runs: score a Golden Set under one or more Retrieval Configs with Recall@5, Recall@10, MRR and nDCG@10, one versioned JSONL file per run | done | `eval/src/trelis_eval/ablation_run.py`, `eval/src/trelis_eval/metrics.py`, `eval/src/trelis_eval/client.py`, `eval/src/trelis_eval/cli.py`, `eval/docs/metrics.md` | `trelis-eval retrieval run` | `eval/tests/test_ablation_run.py`, `eval/tests/test_metrics.py`, `eval/tests/test_client.py`, `eval/tests/test_cli.py`, `eval/tests/test_multihop.py` | ADR-0001, #39 |
 
 ## Platform
 
@@ -106,5 +107,5 @@ One line per roadmap milestone (#1); the issues hold the detail.
 - **GraphRAG**: Extractions, cross-document Entity Resolution, Neo4j projection, graph read API: Week 4 (#5), ADR-0003, #56, #60, #61.
 - **Agent Answer, tools, MCP server**: Week 5 (#6), #66, #67, #69, #70.
 - **Wiki** (Summary, Entity and Index Pages), **MCP client** with Tool Approval: Week 6 (#7), #62–#65, #71–#73.
-- **Eval harness** (external Python, Golden Set, Ablation Matrix): skeleton in [Eval harness](#eval-harness) (#38); retrieval metrics, stratified sampling and the record/replay proxy follow (#39, #41); #81, #88.
+- **Eval harness** (external Python, Golden Set, Ablation Matrix): the skeleton is in [Eval harness](#eval-harness) (#38) and Retrieval Ablation Runs are done (#39); the record/replay proxy follows (#41); #81, #88.
 - **Frontend, demo**: Week 8 (#9), #83, #84, #86, #87, #89.

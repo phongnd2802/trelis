@@ -13,6 +13,15 @@ from urllib.parse import quote
 
 import httpx
 
+from ._fields import (
+    float_field,
+    float_map_field,
+    int_field,
+    optional_int_field,
+    optional_string_field,
+    string_field,
+)
+
 
 class TrelisError(Exception):
     """A failed API call: a non-2xx answer or a malformed success body.
@@ -65,6 +74,82 @@ class UploadResult:
 
     document: Document
     duplicate: bool
+
+
+@dataclass(frozen=True)
+class RetrievedChunk:
+    """One ranked Chunk from POST /retrieve, with its per-technique scores."""
+
+    chunk_id: str
+    document_id: str
+    seq: int
+    content: str
+    context_header: str
+    score: float
+    scores: dict[str, float]
+
+    @classmethod
+    def from_json(cls, value: Any) -> RetrievedChunk:
+        """Read one retrieved Chunk, rejecting a malformed object."""
+        if not isinstance(value, dict):
+            raise ValueError("retrieved Chunk must be a JSON object")
+        return cls(
+            chunk_id=string_field(value, "chunk_id"),
+            document_id=string_field(value, "document_id"),
+            seq=int_field(value, "seq"),
+            content=string_field(value, "content"),
+            context_header=string_field(value, "context_header"),
+            score=float_field(value, "score"),
+            scores=float_map_field(value, "scores"),
+        )
+
+
+@dataclass(frozen=True)
+class TraceStep:
+    """One timed step of one POST /retrieve call; optional fields depend on the step."""
+
+    step: str
+    technique: str | None
+    duration_ms: int
+    model: str | None
+    candidates: int | None
+
+    @classmethod
+    def from_json(cls, value: Any) -> TraceStep:
+        """Read one trace step, rejecting a malformed object."""
+        if not isinstance(value, dict):
+            raise ValueError("trace step must be a JSON object")
+        return cls(
+            step=string_field(value, "step"),
+            technique=optional_string_field(value, "technique"),
+            duration_ms=int_field(value, "duration_ms"),
+            model=optional_string_field(value, "model"),
+            candidates=optional_int_field(value, "candidates"),
+        )
+
+
+@dataclass(frozen=True)
+class RetrievalAnswer:
+    """The ranked Chunks and step trace from POST /retrieve."""
+
+    results: tuple[RetrievedChunk, ...]
+    trace: tuple[TraceStep, ...]
+
+    @classmethod
+    def from_json(cls, value: Any) -> RetrievalAnswer:
+        """Read a retrieval result payload, rejecting a malformed one."""
+        if not isinstance(value, dict):
+            raise ValueError("retrieval data must be a JSON object")
+        raw_results = value.get("results")
+        if not isinstance(raw_results, list):
+            raise ValueError("field 'results' must be a list")
+        raw_trace = value.get("trace")
+        if not isinstance(raw_trace, list):
+            raise ValueError("field 'trace' must be a list")
+        return cls(
+            results=tuple(RetrievedChunk.from_json(item) for item in raw_results),
+            trace=tuple(TraceStep.from_json(item) for item in raw_trace),
+        )
 
 
 class TrelisClient:
@@ -140,6 +225,25 @@ class TrelisClient:
         """Read one Document's current parse state from GET /documents/{id}."""
         response = self._request("GET", f"/documents/{quote(document_id, safe='')}")
         return self._document(self._data(response), response.status_code)
+
+    def retrieve(self, query: str, top_k: int, techniques: Sequence[str]) -> RetrievalAnswer:
+        """Run the named Retrieval Techniques over POST /retrieve."""
+        response = self._request(
+            "POST",
+            "/retrieve",
+            json={
+                "query": query,
+                "top_k": top_k,
+                "retrieval_config": {"techniques": list(techniques)},
+            },
+        )
+        data = self._data(response)
+        try:
+            return RetrievalAnswer.from_json(data)
+        except ValueError as exc:
+            raise TrelisError(
+                response.status_code, None, f"malformed retrieval answer: {exc}"
+            ) from exc
 
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         return self._client.request(

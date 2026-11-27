@@ -41,6 +41,7 @@ go.work.sum
 
 # Eval harness (eval/, external Python per ADR-0001)
 /eval/data/
+/eval/runs/
 __pycache__/
 .venv/
 .pytest_cache/
