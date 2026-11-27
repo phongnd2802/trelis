@@ -280,20 +280,20 @@ func TestHeadingTierCountsTheBreadcrumbInTheBudget(t *testing.T) {
 
 func TestSectionBudget(t *testing.T) {
 	tests := []struct {
-		name        string
-		size        int
-		headerRunes int
-		want        int
+		name   string
+		size   int
+		header string
+		want   int
 	}{
-		{"no header", 120, 0, 120},
-		{"a header is deducted with its blank line", 120, 30, 88},
-		{"a huge header keeps half the size", 120, 200, 60},
-		{"a tiny size never reaches zero", 1, 5, 1},
+		{"no header", 120, "", 120},
+		{"a header is deducted with its blank line", 120, strings.Repeat("x", 30), 88},
+		{"a huge header keeps half the size", 120, strings.Repeat("x", 200), 60},
+		{"a tiny size never reaches zero", 1, strings.Repeat("x", 5), 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := sectionBudget(SplitterConfig{ChunkSize: tt.size}, tt.headerRunes); got != tt.want {
-				t.Fatalf("sectionBudget(size %d, header %d) = %d, want %d", tt.size, tt.headerRunes, got, tt.want)
+			if got := sectionBudget(SplitterConfig{ChunkSize: tt.size}, tt.header); got != tt.want {
+				t.Fatalf("sectionBudget(size %d, header %d runes) = %d, want %d", tt.size, utf8.RuneCountInString(tt.header), got, tt.want)
 			}
 		})
 	}

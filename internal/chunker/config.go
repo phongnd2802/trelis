@@ -20,6 +20,9 @@ const (
 const (
 	DefaultChunkSize    = 512
 	DefaultChunkOverlap = 80
+	// DefaultParentChunkSize is the default size of a parent window in
+	// parent-child mode. #31 will set it as the config default.
+	DefaultParentChunkSize = 2048
 )
 
 // SplitterConfig configures how text is split into Chunks.
@@ -45,6 +48,12 @@ type SplitterConfig struct {
 	// Languages hints the language for token estimates. Empty means
 	// detect it from the text.
 	Languages []string
+	// ParentChunkSize turns on parent-child splitting when over 0: parents
+	// pack consecutive child Chunks into windows of at most this many runes.
+	// NormalizeSplitterConfig raises a set value below twice ChunkSize,
+	// because a parent barely larger than a child makes the mode pointless.
+	// A negative value means off, like 0.
+	ParentChunkSize int
 }
 
 // DefaultConfig returns the default SplitterConfig.
@@ -63,9 +72,10 @@ func defaultSeparators() []string {
 }
 
 // NormalizeSplitterConfig fills unset size, overlap and separator fields
-// with the defaults and caps the overlap, the same way Split does, so
-// callers that store or show a config see what will run. Split further
-// lowers ChunkSize to fit TokenLimit, which can depend on the text.
+// with the defaults, caps the overlap, and raises a set ParentChunkSize to
+// at least twice ChunkSize, the same way Split does, so callers that store
+// or show a config see what will run. Split further lowers ChunkSize to fit
+// TokenLimit, which can depend on the text.
 func NormalizeSplitterConfig(cfg SplitterConfig) SplitterConfig {
 	if cfg.ChunkSize <= 0 {
 		// A config that sets neither size nor overlap wants both defaults;
@@ -80,6 +90,10 @@ func NormalizeSplitterConfig(cfg SplitterConfig) SplitterConfig {
 	}
 	if len(cfg.Separators) == 0 {
 		cfg.Separators = defaultSeparators()
+	}
+	cfg.ParentChunkSize = max(cfg.ParentChunkSize, 0)
+	if cfg.ParentChunkSize > 0 {
+		cfg.ParentChunkSize = max(cfg.ParentChunkSize, 2*cfg.ChunkSize)
 	}
 	return capOverlap(cfg)
 }

@@ -122,9 +122,9 @@ func fencedCodeSpans(text string) []span {
 }
 
 // tableSpans finds runs of table rows in text[from:to]: lines that, without
-// surrounding whitespace, start and end with "|". A table is kept whole;
-// splitting a table too large for one Chunk at row boundaries, with its
-// header carried over, is a separate step (#30).
+// surrounding whitespace, start and end with "|". The recursive tier keeps a
+// table that fits ChunkSize whole and splits a larger one at its row
+// boundaries, repeating its header (see tableUnits).
 func tableSpans(text string, from, to int) []span {
 	var out []span
 	open := false
