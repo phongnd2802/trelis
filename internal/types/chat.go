@@ -38,11 +38,12 @@ type ChatResponse struct {
 type ResponseType string
 
 const (
-	// ResponseTypeAnswer carries answer text; the closing chunk is an answer
-	// with Done set.
+	// ResponseTypeAnswer carries answer text. The closing chunk of a healthy
+	// stream is an answer chunk with Done set; a broken stream closes with an
+	// error chunk instead.
 	ResponseTypeAnswer ResponseType = "answer"
 	// ResponseTypeThinking carries reasoning text; one Done marker closes it
-	// before the first answer token.
+	// before the first answer token. That marker is not a stream close.
 	ResponseTypeThinking ResponseType = "thinking"
 	// ResponseTypeToolCall announces a tool call as soon as its name is known.
 	ResponseTypeToolCall ResponseType = "tool_call"
@@ -50,9 +51,11 @@ const (
 	ResponseTypeError ResponseType = "error"
 )
 
-// StreamResponse is one chunk of a streaming chat call. The closing chunk has
-// Done set and carries the assembled ToolCalls, the Usage and the
-// FinishReason.
+// StreamResponse is one chunk of a streaming chat call. A stream has exactly
+// one closing chunk: the answer chunk with Done set, or the error chunk when
+// the stream broke. It carries the assembled ToolCalls, the Usage and the
+// FinishReason. The thinking-done marker is the only other chunk with Done
+// set, and it does not close the stream; content chunks never set Done.
 type StreamResponse struct {
 	ID           string                 `json:"id"`
 	ResponseType ResponseType           `json:"response_type"`

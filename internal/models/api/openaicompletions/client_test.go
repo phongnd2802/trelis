@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/phongnd2802/trelis/internal/models/api"
+	"github.com/phongnd2802/trelis/internal/models/modeltest"
 	"github.com/phongnd2802/trelis/internal/types"
 )
 
@@ -233,9 +234,18 @@ func TestChatStream_CutOffIsIncomplete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ChatStream: %v", err)
 	}
-	answer, last := drain(t, ch)
-	if answer != "Hà" || last.FinishReason != types.FinishReasonIncomplete {
-		t.Errorf("answer/finish = %q/%q, want Hà/%s", answer, last.FinishReason, types.FinishReasonIncomplete)
+	chunks := modeltest.Collect(t, ch)
+	idx := modeltest.CloseIndex(t, chunks)
+	closing := chunks[idx]
+
+	var answer string
+	for _, chunk := range chunks {
+		if chunk.ResponseType == types.ResponseTypeAnswer {
+			answer += chunk.Content
+		}
+	}
+	if answer != "Hà" || closing.FinishReason != types.FinishReasonIncomplete {
+		t.Errorf("answer/finish = %q/%q, want Hà/%s", answer, closing.FinishReason, types.FinishReasonIncomplete)
 	}
 }
 

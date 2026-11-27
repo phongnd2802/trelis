@@ -39,11 +39,11 @@ type Chat interface {
 	Chat(ctx context.Context, messages []Message, opts *ChatOptions) (*types.ChatResponse, error)
 
 	// ChatStream performs a streaming chat. Drain the channel until it
-	// closes: answer chunks may have Done set as soon as the provider sends
-	// a finish reason, but the last chunk is the one that carries the tool
-	// calls and the usage. A broken stream ends with a ResponseTypeError
-	// chunk. Stopping early leaves the reader goroutine parked until ctx is
-	// cancelled, so cancel ctx when abandoning a stream.
+	// closes: exactly one closing chunk (an answer, or an error when the
+	// stream broke) has Done set and carries the tool calls, the usage and
+	// the finish reason. The thinking-done marker also sets Done but does not
+	// close the stream. Stopping early leaves the reader goroutine parked
+	// until ctx is cancelled, so cancel ctx when abandoning a stream.
 	ChatStream(ctx context.Context, messages []Message, opts *ChatOptions) (<-chan types.StreamResponse, error)
 
 	// GetModelName returns the model name sent on the wire.

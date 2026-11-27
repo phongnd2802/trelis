@@ -6,10 +6,12 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/phongnd2802/trelis/internal/models/modeltest"
 	"github.com/phongnd2802/trelis/internal/types"
 )
 
@@ -86,7 +88,7 @@ func TestStreamAssembler_ThinkingHandoffSequence(t *testing.T) {
 	want := []step{
 		{types.ResponseTypeThinking, false, "think"},
 		{types.ResponseTypeThinking, true, ""},
-		{types.ResponseTypeAnswer, true, "answer"},
+		{types.ResponseTypeAnswer, false, "answer"},
 		{types.ResponseTypeAnswer, true, ""},
 	}
 	if len(got) != len(want) {
@@ -96,6 +98,30 @@ func TestStreamAssembler_ThinkingHandoffSequence(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("chunk %d = %#v, want %#v", i, got[i], want[i])
 		}
+	}
+}
+
+// A protocol loop may close defensively after it has already closed, and a
+// failure can arrive after the vendor finished. The consumer must still see
+// exactly one closing chunk and no error chunk after it.
+func TestStreamAssembler_ClosesOnlyOnce(t *testing.T) {
+	a := NewStreamAssembler(context.Background(), "m")
+	ch := make(chan types.StreamResponse, 8)
+
+	a.Process(ch, Delta{Content: "answer"})
+	a.End(ch)
+	a.End(ch)
+	a.Fail(ch, errors.New("late failure"))
+	a.EndAtEOF(ch)
+	close(ch)
+
+	chunks := modeltest.Collect(t, ch)
+	idx := modeltest.CloseIndex(t, chunks)
+	if idx != len(chunks)-1 {
+		t.Errorf("closing chunk at %d of %d, want the last chunk: %+v", idx, len(chunks), chunks)
+	}
+	if closing := chunks[idx]; closing.ResponseType != types.ResponseTypeAnswer {
+		t.Errorf("closing chunk = %+v, want the answer close: a late Fail must emit nothing", closing)
 	}
 }
 
