@@ -10,8 +10,8 @@
 #          internal/db/sqlc/chunks.sql.go
 #
 # <file>... are the fix: usually the changed source, or its generated output
-# (sqlc, swag). A file absent at <ref> is removed for the run. DB tests need
-# TRELIS_TEST_POSTGRES_DSN, as for go test.
+# (sqlc, swag). A file absent at <ref> is removed for the run. DB tests use
+# the same DSN as make test (scripts/test-db-env.sh).
 #
 # Exit codes: 0 red (the test failed on an assertion) · 1 the test passed ·
 #             2 build failed · 3 the test was skipped or did not run · 64 usage
@@ -29,6 +29,10 @@ pkg=$1 pattern=$2; shift 2
 
 root=$(git rev-parse --show-toplevel)
 cd "$root"
+# The same DSN make test uses: an explicit TRELIS_TEST_POSTGRES_DSN wins,
+# otherwise the dev Postgres when it is up. Without one a DB test skips, which
+# this script reports as not red.
+export TRELIS_TEST_POSTGRES_DSN="$(scripts/test-db-env.sh)"
 git rev-parse --verify --quiet "$ref^{commit}" >/dev/null || { echo "red-check.sh: unknown ref $ref" >&2; exit 64; }
 
 backup=$(mktemp -d "$root/.scratch/red-check.XXXXXX")
