@@ -26,6 +26,17 @@ func TestRetrievalRequestValidateFillsTheDefaults(t *testing.T) {
 	if req.RetrievalConfig.RRFK == nil || *req.RetrievalConfig.RRFK != RetrievalRRFKDefault {
 		t.Errorf("rrf_k = %v, want a pointer to the default %d", req.RetrievalConfig.RRFK, RetrievalRRFKDefault)
 	}
+	if req.RetrievalConfig.RerankCandidates == nil ||
+		*req.RetrievalConfig.RerankCandidates != RetrievalRerankCandidatesDefault {
+		t.Errorf("rerank_candidates = %v, want a pointer to the default %d",
+			req.RetrievalConfig.RerankCandidates, RetrievalRerankCandidatesDefault)
+	}
+}
+
+func TestRerankIsAKnownRetrievalTechnique(t *testing.T) {
+	if !RetrievalTechniqueRerank.Known() {
+		t.Errorf("%q is not known, want rerank registered as a technique", RetrievalTechniqueRerank)
+	}
 }
 
 func TestRetrievalRequestValidateKeepsAConfiguredTechnique(t *testing.T) {
@@ -100,6 +111,100 @@ func TestRetrievalConfigValidateChecksRRFK(t *testing.T) {
 		if err := config.Validate(); err != nil {
 			t.Errorf("rrf_k %d: Validate = %v, want it accepted", k, err)
 		}
+	}
+}
+
+func TestRetrievalConfigValidateAcceptsRerankNextToACandidateTechnique(t *testing.T) {
+	for _, techniques := range [][]RetrievalTechnique{
+		{RetrievalTechniqueRerank, RetrievalTechniqueBM25},
+		{RetrievalTechniqueDense, RetrievalTechniqueRerank},
+	} {
+		config := RetrievalConfig{Techniques: techniques}
+		if err := config.Validate(); err != nil {
+			t.Errorf("Validate(%v) = %v, want rerank accepted as a second stage", techniques, err)
+		}
+		if config.RerankCandidates == nil || *config.RerankCandidates != RetrievalRerankCandidatesDefault {
+			t.Errorf("%v: rerank_candidates = %v, want a pointer to the default %d",
+				techniques, config.RerankCandidates, RetrievalRerankCandidatesDefault)
+		}
+	}
+}
+
+func TestRetrievalConfigValidateRejectsRerankAlone(t *testing.T) {
+	config := RetrievalConfig{Techniques: []RetrievalTechnique{RetrievalTechniqueRerank}}
+	err := config.Validate()
+	if err == nil {
+		t.Fatalf("Validate(%v) = nil, want rerank alone rejected", config.Techniques)
+	}
+	for _, want := range []string{"rerank", "at least one", `"dense"`, `"bm25"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+	// The candidate list must not offer rerank itself as a candidate.
+	if count := strings.Count(err.Error(), `"rerank"`); count != 1 {
+		t.Errorf("error %q names rerank %d times, want once plus a candidate list without it", err, count)
+	}
+}
+
+func TestRetrievalConfigValidateChecksRerankCandidates(t *testing.T) {
+	for _, candidates := range []int{0, -1, RetrievalRerankCandidatesMax + 1} {
+		config := RetrievalConfig{
+			Techniques:       []RetrievalTechnique{RetrievalTechniqueBM25, RetrievalTechniqueRerank},
+			RerankCandidates: intPointer(candidates),
+		}
+		if err := config.Validate(); err == nil || !strings.Contains(err.Error(), "rerank_candidates") {
+			t.Errorf("rerank_candidates %d: Validate = %v, want an error naming rerank_candidates", candidates, err)
+		}
+	}
+	for _, candidates := range []int{1, RetrievalRerankCandidatesMax} {
+		config := RetrievalConfig{
+			Techniques:       []RetrievalTechnique{RetrievalTechniqueBM25, RetrievalTechniqueRerank},
+			RerankCandidates: intPointer(candidates),
+		}
+		if err := config.Validate(); err != nil {
+			t.Errorf("rerank_candidates %d: Validate = %v, want it accepted", candidates, err)
+		}
+	}
+}
+
+func TestRetrievalRequestValidateRejectsARerankPoolSmallerThanTopK(t *testing.T) {
+	req := RetrievalRequest{
+		Query: "who won?",
+		TopK:  intPointer(10),
+		RetrievalConfig: &RetrievalConfig{
+			Techniques:       []RetrievalTechnique{RetrievalTechniqueBM25, RetrievalTechniqueRerank},
+			RerankCandidates: intPointer(5),
+		},
+	}
+	err := req.Validate()
+	if err == nil {
+		t.Fatal("Validate = nil, want a pool smaller than top_k rejected")
+	}
+	for _, want := range []string{"rerank_candidates", "top_k"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+
+	// A pool exactly top_k large can fill the answer.
+	req.RetrievalConfig.RerankCandidates = intPointer(10)
+	if err := req.Validate(); err != nil {
+		t.Errorf("rerank_candidates = top_k: Validate = %v, want it accepted", err)
+	}
+}
+
+func TestRetrievalRequestValidateIgnoresRerankCandidatesWhenRerankIsOff(t *testing.T) {
+	req := RetrievalRequest{
+		Query: "who won?",
+		TopK:  intPointer(10),
+		RetrievalConfig: &RetrievalConfig{
+			Techniques:       []RetrievalTechnique{RetrievalTechniqueBM25},
+			RerankCandidates: intPointer(5),
+		},
+	}
+	if err := req.Validate(); err != nil {
+		t.Errorf("Validate = %v, want a valid rerank_candidates ignored without rerank", err)
 	}
 }
 

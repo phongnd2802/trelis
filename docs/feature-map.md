@@ -36,6 +36,7 @@ Status: **done** (built, tested, reachable), **partial** (code exists but nothin
 | Dense retrieval-only: rank the caller's readable Chunks by cosine similarity, with a score per Retrieval Technique and a step trace | done | `internal/application/service/retrieval.go`, `internal/handler/retrieval.go`, `internal/types/retrieval.go`, `internal/application/repository/chunk.go`, `internal/application/repository/document.go`, `internal/db/queries/chunks.sql`, `internal/db/queries/documents.sql` | `POST /retrieve` | `internal/types/retrieval_test.go`, `internal/application/service/retrieval_test.go`, `internal/router/retrieve_test.go`, `internal/application/repository/chunk_test.go`, `internal/application/repository/document_test.go`, `internal/integration/retrieve_test.go` | ADR-0004, ADR-0007, #32 |
 | BM25 retrieval-only: rank the caller's readable Chunks by pg_search's BM25 score at Vietnamese syllable level, with a diacritics-free field so "thue tncn" finds "thuế TNCN"; no embedding model needed | done | `internal/application/service/retrieval.go`, `internal/handler/retrieval.go`, `internal/types/retrieval.go`, `internal/application/repository/chunk.go`, `internal/db/queries/chunks.sql`, `migrations/00008_bm25_chunks.sql` | `POST /retrieve` with `retrieval_config.techniques: ["bm25"]` | `internal/types/retrieval_test.go`, `internal/application/service/retrieval_test.go`, `internal/router/retrieve_test.go`, `internal/application/repository/chunk_test.go`, `internal/integration/retrieve_test.go` | ADR-0004, ADR-0007, [ADR-0009](adr/0009-bm25-over-a-shared-pg-search-index.md), #33 |
 | Hybrid retrieval: run every named Retrieval Technique concurrently over the caller's readable Chunks, fuse their ranked lists with Reciprocal Rank Fusion (score = the sum of 1/(rrf_k + rank) over the lists that carry the Chunk, rrf_k per request, default 60) and answer each Chunk with every technique's score and 1-based rank | done | `internal/application/service/retrieval.go`, `internal/handler/retrieval.go`, `internal/types/retrieval.go`, `internal/application/repository/chunk.go`, `internal/application/repository/document.go`, `internal/db/queries/chunks.sql`, `internal/db/queries/documents.sql`, `migrations/00008_bm25_chunks.sql` | `POST /retrieve` with `retrieval_config.techniques: ["bm25","dense"]` and optional `rrf_k` | `internal/types/retrieval_test.go`, `internal/application/service/retrieval_test.go`, `internal/router/retrieve_test.go`, `internal/integration/retrieve_test.go` | ADR-0004, ADR-0007, [ADR-0009](adr/0009-bm25-over-a-shared-pg-search-index.md), #34 |
+| Rerank: score the candidate pool with the rerank role, order by its score (ties by chunk_id) and cut to top_k, keeping the first stage's scores and ranks and adding the rerank score and rank; the pool is the single list or the fused list cut to `rerank_candidates` (default 50, 1..100, at least top_k); rerank alone is 400 | done | `internal/application/service/retrieval.go`, `internal/handler/retrieval.go`, `internal/types/retrieval.go`, `internal/models/rerank/`, `cmd/server/main.go` | `POST /retrieve` with `retrieval_config.techniques: [..., "rerank"]` and optional `rerank_candidates`; `models.rerank` | `internal/types/retrieval_test.go`, `internal/application/service/retrieval_test.go`, `internal/router/retrieve_test.go`, `internal/integration/retrieve_test.go` | ADR-0004, ADR-0007, #18, #35 |
 
 ## Ingest
 
@@ -53,7 +54,7 @@ Status: **done** (built, tested, reachable), **partial** (code exists but nothin
 
 ## Model clients
 
-Each role (`models.chat`, `models.extraction`, `models.judge`, `models.embedding`, `models.rerank`) points at its own OpenAI-compatible provider; config in `internal/config/models.go`, documented in `config/trelis.yaml`. Every call logs one `model call` line (`internal/logger/modelcall.go`). The embedding client is the only one the running service calls, from the ingest embed-batch activities; the others are **partial**.
+Each role (`models.chat`, `models.extraction`, `models.judge`, `models.embedding`, `models.rerank`) points at its own OpenAI-compatible provider; config in `internal/config/models.go`, documented in `config/trelis.yaml`. Every call logs one `model call` line (`internal/logger/modelcall.go`). The embedding client is called by the ingest embed-batch activities and dense retrieval; the rerank client is called by retrieval when a request names rerank. The chat, extraction and judge clients are **partial**.
 
 | Feature | Status | Where | Tests | Decisions / issues |
 |---|---|---|---|---|
@@ -62,7 +63,7 @@ Each role (`models.chat`, `models.extraction`, `models.judge`, `models.embedding
 | Responses protocol | partial | `internal/models/api/openairesponses/` | `internal/models/api/openairesponses/client_test.go`, `internal/models/api/openairesponses/golden_test.go` | #19 |
 | Shared wire code: retry with backoff and `Retry-After`, SSE reader, stream assembler, capped reads | partial | `internal/models/api/` | `internal/models/api/retry_test.go`, `internal/models/api/sse_test.go`, `internal/models/api/stream_assembler_test.go` | — |
 | Embeddings client (batching, dimension checks) | done | `internal/models/embedding/` | `internal/models/embedding/embedding_test.go` | #16, #22 |
-| Rerank client (Jina/Cohere schema) | partial | `internal/models/rerank/` | `internal/models/rerank/rerank_test.go` | #18 |
+| Rerank client (Jina/Cohere schema) | done | `internal/models/rerank/` | `internal/models/rerank/rerank_test.go` | #18, #35 |
 | Fake OpenAI-compatible provider for tests | done | `internal/models/modeltest/` | its own tests | #15 |
 | Agent engine | partial (stub) | `internal/agent/engine.go` | — | Week 5 (#6): #66 |
 
@@ -107,7 +108,7 @@ the admin CLI. Setup and the fetch → ingest walkthrough are in `eval/README.md
 
 One line per roadmap milestone (#1); the issues hold the detail.
 
-- **Retrieval** (BM25 + vector hybrid, RRF fusion, rerank, query techniques): dense retrieval-only, BM25 alone and hybrid RRF fusion are [done](#retrieval) (#32, #33, #34); the rest is Week 2 (#3), Week 3 (#4).
+- **Retrieval** (BM25 + vector hybrid, RRF fusion, rerank, query techniques): dense retrieval-only, BM25 alone, hybrid RRF fusion and the rerank stage are [done](#retrieval) (#32, #33, #34, #35); query techniques and the rest are Week 2 (#3), Week 3 (#4).
 - **Pipeline Answer** with citations, generation graders: Week 3 (#4), #42.
 - **GraphRAG**: Extractions, cross-document Entity Resolution, Neo4j projection, graph read API: Week 4 (#5), ADR-0003, #56, #60, #61.
 - **Agent Answer, tools, MCP server**: Week 5 (#6), #66, #67, #69, #70.

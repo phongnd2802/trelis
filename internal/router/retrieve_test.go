@@ -150,7 +150,7 @@ func TestAnUnknownFieldOrWrongTypeIsValidation(t *testing.T) {
 func TestAnInvalidRequestIsValidation(t *testing.T) {
 	// Validation runs before any repository or model call, so the service
 	// needs neither here.
-	h := newRetrieveRouter(service.NewRetrievalService(nil, nil, nil))
+	h := newRetrieveRouter(service.NewRetrievalService(nil, nil, nil, nil))
 	for name, tc := range map[string]struct {
 		body    string
 		wantMsg []string
@@ -174,6 +174,18 @@ func TestAnInvalidRequestIsValidation(t *testing.T) {
 		"rrf_k too large": {
 			body:    `{"query":"who won?","retrieval_config":{"techniques":["dense"],"rrf_k":1001}}`,
 			wantMsg: []string{"rrf_k", "1 and 1000"},
+		},
+		"rerank alone": {
+			body:    `{"query":"who won?","retrieval_config":{"techniques":["rerank"]}}`,
+			wantMsg: []string{"rerank", "at least one"},
+		},
+		"rerank_candidates below top_k": {
+			body:    `{"query":"who won?","top_k":10,"retrieval_config":{"techniques":["bm25","rerank"],"rerank_candidates":5}}`,
+			wantMsg: []string{"rerank_candidates", "top_k"},
+		},
+		"rerank_candidates too large": {
+			body:    `{"query":"who won?","retrieval_config":{"techniques":["bm25","rerank"],"rerank_candidates":101}}`,
+			wantMsg: []string{"rerank_candidates", "1 and 100"},
 		},
 		"blank query": {
 			body:    `{"query":"   "}`,
@@ -346,8 +358,48 @@ func TestTheSearchStepAlwaysReportsItsCandidateCount(t *testing.T) {
 	}
 }
 
+func TestRetrieveSendsRerankCandidatesToTheService(t *testing.T) {
+	svc := &stubRetrieval{result: &types.RetrievalResult{
+		Results: []types.RetrievedChunk{},
+		Trace:   []types.TraceStep{},
+	}}
+	h := newRetrieveRouter(svc)
+
+	rec := postJSON(t, h, "/retrieve",
+		`{"query":"thue tncn","retrieval_config":{"techniques":["bm25","rerank"],"rerank_candidates":7}}`,
+		"Bearer trelis_alice")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /retrieve = %d %s, want 200", rec.Code, rec.Body)
+	}
+	config := svc.got.RetrievalConfig
+	if config == nil || len(config.Techniques) != 2 ||
+		config.Techniques[0] != types.RetrievalTechniqueBM25 ||
+		config.Techniques[1] != types.RetrievalTechniqueRerank {
+		t.Fatalf("service got %+v, want bm25 and rerank", config)
+	}
+	if config.RerankCandidates == nil || *config.RerankCandidates != 7 {
+		t.Errorf("service got rerank_candidates = %v, want 7", config.RerankCandidates)
+	}
+}
+
+func TestRetrieveWithoutARerankModelIs503(t *testing.T) {
+	// Dense is available, so the request reaches the rerank check; the rerank
+	// role is not configured.
+	h := newRetrieveRouter(service.NewRetrievalService(nil, nil, &fixedEmbedder{model: "test-embedding"}, nil))
+
+	rec := postJSON(t, h, "/retrieve",
+		`{"query":"who won?","retrieval_config":{"techniques":["dense","rerank"]}}`, "Bearer trelis_alice")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("POST /retrieve = %d %s, want 503", rec.Code, rec.Body)
+	}
+	e := decode(t, rec)
+	if e.Success || e.Error == nil || e.Error.Code != 1008 || !strings.Contains(e.Error.Message, "models.rerank") {
+		t.Errorf("body = %s, want a 1008 error naming models.rerank", rec.Body)
+	}
+}
+
 func TestRetrieveWithoutAnEmbeddingModelIs503(t *testing.T) {
-	h := newRetrieveRouter(service.NewRetrievalService(nil, nil, nil))
+	h := newRetrieveRouter(service.NewRetrievalService(nil, nil, nil, nil))
 
 	rec := postJSON(t, h, "/retrieve", `{"query":"who won?"}`, "Bearer trelis_alice")
 	if rec.Code != http.StatusServiceUnavailable {
@@ -393,7 +445,7 @@ func TestAnotherPrincipalNeverReceivesAChunkAtTheRouterSeam(t *testing.T) {
 			bob.ID:   {bobDoc},
 		}},
 		&readableChunkSearch{matches: []*types.ChunkMatch{aliceChunk, bobChunk}},
-		&fixedEmbedder{model: "test-embedding"},
+		&fixedEmbedder{model: "test-embedding"}, nil,
 	)
 	me := handler.NewPrincipalHandler(service.NewPrincipalService(nil, nil, nil))
 	h := New(Readiness{}, keyring{"trelis_alice": alice, "trelis_bob": bob}, me, nil,

@@ -3,7 +3,9 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -87,6 +89,38 @@ func (f *fakeEmbedder) Embed(_ context.Context, texts []string) ([][]float32, er
 
 func (f *fakeEmbedder) GetModelName() string { return f.model }
 
+// fakeReranker answers fixed scores in the texts' order and records what it
+// was asked to score. It runs once, after the candidate techniques, so its
+// fields need no locking.
+type fakeReranker struct {
+	scores   []float64
+	err      error
+	model    string
+	calls    int
+	gotQuery string
+	gotTexts []string
+}
+
+func (f *fakeReranker) Rerank(_ context.Context, query string, texts []string) ([]float64, error) {
+	f.calls++
+	f.gotQuery = query
+	f.gotTexts = append([]string(nil), texts...)
+	return f.scores, f.err
+}
+
+func (f *fakeReranker) GetModelName() string { return f.model }
+
+// forbiddenReranker fails the test when the service calls the rerank role
+// with rerank off, or with an empty pool.
+type forbiddenReranker struct{ t *testing.T }
+
+func (f *forbiddenReranker) Rerank(context.Context, string, []string) ([]float64, error) {
+	f.t.Error("reranker called when there was nothing to rerank")
+	return nil, nil
+}
+
+func (f *forbiddenReranker) GetModelName() string { return "forbidden" }
+
 // callerContext is ctx with a Principal, as the router's middleware leaves it.
 func callerContext(principalID uuid.UUID) context.Context {
 	return types.WithPrincipal(context.Background(), types.Principal{ID: principalID, Name: "alice"})
@@ -108,12 +142,15 @@ func hybridRequest(query string) *types.RetrievalRequest {
 
 // TestEveryKnownTechniqueHasARunner guards the runner map from drifting away
 // from the techniques validation admits.
-func TestEveryKnownTechniqueHasARunner(t *testing.T) {
-	retrieval, ok := NewRetrievalService(nil, nil, nil).(*retrievalService)
+func TestEveryKnownCandidateTechniqueHasARunner(t *testing.T) {
+	retrieval, ok := NewRetrievalService(nil, nil, nil, nil).(*retrievalService)
 	if !ok {
 		t.Fatal("NewRetrievalService did not return a *retrievalService")
 	}
 	for _, technique := range types.KnownRetrievalTechniques() {
+		if technique == types.RetrievalTechniqueRerank {
+			continue // rerank reorders another technique's candidates; it has no runner.
+		}
 		if retrieval.runners[technique] == nil {
 			t.Errorf("retrieval technique %q has no runner", technique)
 		}
@@ -137,7 +174,7 @@ func TestRetrieveSearchesOnlyTheCallersReadableDocuments(t *testing.T) {
 		{Chunk: &types.Chunk{ID: chunkLow, DocumentID: docA, Seq: 2, Content: "far"}, Score: 0.25},
 	}}
 	embedder := &fakeEmbedder{vectors: [][]float32{{0.1, 0.2}}, model: "fake-embedding"}
-	retrieval := NewRetrievalService(docs, chunks, embedder)
+	retrieval := NewRetrievalService(docs, chunks, embedder, nil)
 
 	req := &types.RetrievalRequest{Query: "  who won?  ", TopK: intPointer(5)}
 	got, err := retrieval.Retrieve(callerContext(principalID), req)
@@ -204,7 +241,7 @@ func TestRetrieveWithoutReadableDocumentsStillEmbedsAndSearches(t *testing.T) {
 	docs := &fakeReadableDocuments{readable: []uuid.UUID{}}
 	chunks := &fakeChunkSearch{}
 	embedder := &fakeEmbedder{vectors: [][]float32{{1, 0}}, model: "fake-embedding"}
-	retrieval := NewRetrievalService(docs, chunks, embedder)
+	retrieval := NewRetrievalService(docs, chunks, embedder, nil)
 
 	got, err := retrieval.Retrieve(callerContext(uuid.New()), &types.RetrievalRequest{Query: "who won?"})
 	if err != nil {
@@ -242,7 +279,7 @@ func TestRetrieveBM25RunsWithoutAnEmbeddingModel(t *testing.T) {
 		{Chunk: &types.Chunk{ID: chunkLow, DocumentID: docB, Seq: 0, Content: "thuế giá trị gia tăng"}, Score: 1.25},
 	}}
 	// nil embedder: a bm25-only request must not need models.embedding.
-	retrieval := NewRetrievalService(docs, chunks, nil)
+	retrieval := NewRetrievalService(docs, chunks, nil, nil)
 
 	req := &types.RetrievalRequest{
 		Query:           "  thue tncn  ",
@@ -302,7 +339,7 @@ func TestRetrieveBM25RunsWithoutAnEmbeddingModel(t *testing.T) {
 func TestRetrieveBM25WrapsASearchFailure(t *testing.T) {
 	searchErr := errors.New("postgres down")
 	chunks := &fakeChunkSearch{bm25Err: searchErr}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{uuid.New()}}, chunks, nil)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{uuid.New()}}, chunks, nil, nil)
 
 	_, err := retrieval.Retrieve(callerContext(uuid.New()), &types.RetrievalRequest{
 		Query:           "thue tncn",
@@ -316,7 +353,7 @@ func TestRetrieveBM25WrapsASearchFailure(t *testing.T) {
 func TestRetrieveWithoutAnEmbeddingModelIsServiceUnavailable(t *testing.T) {
 	docs := &fakeReadableDocuments{err: errors.New("must not be reached")}
 	var embedder interfaces.Embedder // nil: no embedding role configured
-	retrieval := NewRetrievalService(docs, &fakeChunkSearch{}, embedder)
+	retrieval := NewRetrievalService(docs, &fakeChunkSearch{}, embedder, nil)
 
 	_, err := retrieval.Retrieve(callerContext(uuid.New()), &types.RetrievalRequest{Query: "who won?"})
 	appErr, ok := apperrors.IsAppError(err)
@@ -337,7 +374,7 @@ func TestRetrieveWithoutAnEmbeddingModelIsServiceUnavailable(t *testing.T) {
 func TestRetrieveWrapsAnEmbeddingFailure(t *testing.T) {
 	embedErr := errors.New("provider down")
 	embedder := &fakeEmbedder{err: embedErr}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{uuid.New()}}, &fakeChunkSearch{}, embedder)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{uuid.New()}}, &fakeChunkSearch{}, embedder, nil)
 
 	_, err := retrieval.Retrieve(callerContext(uuid.New()), &types.RetrievalRequest{Query: "who won?"})
 	if !errors.Is(err, embedErr) || !strings.Contains(err.Error(), "embed query") {
@@ -352,7 +389,7 @@ func TestRetrieveWrapsASearchFailure(t *testing.T) {
 	searchErr := errors.New("postgres down")
 	chunks := &fakeChunkSearch{denseErr: searchErr}
 	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{uuid.New()}},
-		chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"})
+		chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
 
 	_, err := retrieval.Retrieve(callerContext(uuid.New()), &types.RetrievalRequest{Query: "who won?"})
 	if !errors.Is(err, searchErr) || !strings.Contains(err.Error(), "search") {
@@ -366,15 +403,24 @@ func TestRetrieveRejectsAnInvalidRequestBeforeTouchingItsDependencies(t *testing
 		"top_k zero":        {Query: "who won?", TopK: intPointer(0)},
 		"top_k too large":   {Query: "who won?", TopK: intPointer(101)},
 		"no techniques":     {Query: "who won?", RetrievalConfig: &types.RetrievalConfig{}},
-		"unknown technique": {Query: "who won?", RetrievalConfig: &types.RetrievalConfig{Techniques: []types.RetrievalTechnique{"rerank"}}},
-		"duplicate":         {Query: "who won?", RetrievalConfig: &types.RetrievalConfig{Techniques: []types.RetrievalTechnique{types.RetrievalTechniqueDense, types.RetrievalTechniqueDense}}},
-		"rrf_k zero":        {Query: "who won?", RetrievalConfig: &types.RetrievalConfig{Techniques: []types.RetrievalTechnique{types.RetrievalTechniqueBM25}, RRFK: intPointer(0)}},
+		"unknown technique": {Query: "who won?", RetrievalConfig: &types.RetrievalConfig{Techniques: []types.RetrievalTechnique{"foo"}}},
+		"rerank alone":      {Query: "who won?", RetrievalConfig: &types.RetrievalConfig{Techniques: []types.RetrievalTechnique{types.RetrievalTechniqueRerank}}},
+		"rerank_candidates too small": {
+			Query: "who won?",
+			TopK:  intPointer(10),
+			RetrievalConfig: &types.RetrievalConfig{
+				Techniques:       []types.RetrievalTechnique{types.RetrievalTechniqueBM25, types.RetrievalTechniqueRerank},
+				RerankCandidates: intPointer(5),
+			},
+		},
+		"duplicate":  {Query: "who won?", RetrievalConfig: &types.RetrievalConfig{Techniques: []types.RetrievalTechnique{types.RetrievalTechniqueDense, types.RetrievalTechniqueDense}}},
+		"rrf_k zero": {Query: "who won?", RetrievalConfig: &types.RetrievalConfig{Techniques: []types.RetrievalTechnique{types.RetrievalTechniqueBM25}, RRFK: intPointer(0)}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			docs := &fakeReadableDocuments{err: errors.New("must not be reached")}
 			chunks := &fakeChunkSearch{}
 			embedder := &fakeEmbedder{}
-			retrieval := NewRetrievalService(docs, chunks, embedder)
+			retrieval := NewRetrievalService(docs, chunks, embedder, nil)
 
 			_, err := retrieval.Retrieve(callerContext(uuid.New()), req)
 			appErr, ok := apperrors.IsAppError(err)
@@ -523,7 +569,7 @@ func TestRetrieveHybridRunsBothOverTheReadableSetAndFuses(t *testing.T) {
 		},
 	}
 	embedder := &fakeEmbedder{vectors: [][]float32{{0.1, 0.2}}, model: "fake-embedding"}
-	retrieval := NewRetrievalService(docs, chunks, embedder)
+	retrieval := NewRetrievalService(docs, chunks, embedder, nil)
 
 	req := hybridRequest("  who won?  ")
 	req.TopK = intPointer(2)
@@ -606,7 +652,7 @@ func TestRetrieveHybridRunsBothOverTheReadableSetAndFuses(t *testing.T) {
 func TestRetrieveHybridFetchesTopKWhenItExceedsTheFusionDepth(t *testing.T) {
 	chunks := &fakeChunkSearch{}
 	retrieval := NewRetrievalService(&fakeReadableDocuments{}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"})
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
 
 	req := hybridRequest("who won?")
 	req.TopK = intPointer(80)
@@ -622,7 +668,7 @@ func TestRetrieveHybridFetchesTopKWhenItExceedsTheFusionDepth(t *testing.T) {
 
 func TestRetrieveHybridWithoutAnEmbeddingModelIsServiceUnavailable(t *testing.T) {
 	docs := &fakeReadableDocuments{err: errors.New("must not be reached")}
-	retrieval := NewRetrievalService(docs, &fakeChunkSearch{}, nil)
+	retrieval := NewRetrievalService(docs, &fakeChunkSearch{}, nil, nil)
 
 	_, err := retrieval.Retrieve(callerContext(uuid.New()), hybridRequest("who won?"))
 	appErr, ok := apperrors.IsAppError(err)
@@ -641,7 +687,7 @@ func TestRetrieveHybridFailsWhenOneTechniqueFails(t *testing.T) {
 	searchErr := errors.New("postgres down")
 	chunks := &fakeChunkSearch{bm25Err: searchErr}
 	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{uuid.New()}}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"})
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
 
 	_, err := retrieval.Retrieve(callerContext(uuid.New()), hybridRequest("who won?"))
 	if !errors.Is(err, searchErr) || !strings.Contains(err.Error(), "bm25") {
@@ -649,8 +695,388 @@ func TestRetrieveHybridFailsWhenOneTechniqueFails(t *testing.T) {
 	}
 }
 
+// rerankRequest is a request that runs the named candidate techniques and
+// then rerank; top_k and rerank_candidates are set by the test.
+func rerankRequest(query string, techniques ...types.RetrievalTechnique) *types.RetrievalRequest {
+	return &types.RetrievalRequest{
+		Query: query,
+		RetrievalConfig: &types.RetrievalConfig{
+			Techniques: append(append([]types.RetrievalTechnique(nil), techniques...), types.RetrievalTechniqueRerank),
+		},
+	}
+}
+
+func TestRetrieveSingleTechniqueReranksByTheRerankScores(t *testing.T) {
+	principalID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000a1")
+	docA := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	docB := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b2")
+	chunkA := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+	chunkB := uuid.MustParse("0190d2a8-0000-7000-8000-000000000002")
+
+	docs := &fakeReadableDocuments{readable: []uuid.UUID{docA, docB}}
+	chunks := &fakeChunkSearch{denseMatches: []*types.ChunkMatch{
+		{Chunk: &types.Chunk{ID: chunkA, DocumentID: docA, Seq: 0, Content: "near A", ContextHeader: "Chương I"}, Score: 0.9},
+		{Chunk: &types.Chunk{ID: chunkB, DocumentID: docB, Seq: 0, Content: "near B"}, Score: 0.8},
+	}}
+	reranker := &fakeReranker{scores: []float64{0.1, 0.95}, model: "fake-rerank"}
+	retrieval := NewRetrievalService(docs, chunks,
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker)
+
+	req := rerankRequest("  who won?  ", types.RetrievalTechniqueDense)
+	req.TopK = intPointer(5)
+	got, err := retrieval.Retrieve(callerContext(principalID), req)
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+
+	// The search runs deep enough to fill the default rerank pool.
+	if chunks.denseTopK != types.RetrievalRerankCandidatesDefault {
+		t.Errorf("dense top_k = %d, want the rerank pool %d", chunks.denseTopK, types.RetrievalRerankCandidatesDefault)
+	}
+	if reranker.calls != 1 || reranker.gotQuery != "who won?" {
+		t.Errorf("reranker called %d times with query %q, want once with the trimmed query",
+			reranker.calls, reranker.gotQuery)
+	}
+	// The reranker scores the same text the Chunk was embedded from.
+	if want := []string{"Chương I\n\nnear A", "near B"}; !slices.Equal(reranker.gotTexts, want) {
+		t.Errorf("reranked texts = %q, want %q", reranker.gotTexts, want)
+	}
+
+	if len(got.Results) != 2 || got.Results[0].ChunkID != chunkB || got.Results[1].ChunkID != chunkA {
+		t.Fatalf("result order = %+v, want B then A by rerank score", got.Results)
+	}
+	first := got.Results[0]
+	if first.Score != 0.95 || first.Scores[types.RetrievalTechniqueRerank] != 0.95 {
+		t.Errorf("first score = %v, scores = %v; want the rerank score 0.95", first.Score, first.Scores)
+	}
+	if first.Scores[types.RetrievalTechniqueDense] != 0.8 {
+		t.Errorf("first scores = %v, want the first-stage dense score 0.8 kept", first.Scores)
+	}
+	if first.Ranks[types.RetrievalTechniqueRerank] != 1 || first.Ranks[types.RetrievalTechniqueDense] != 2 {
+		t.Errorf("first ranks = %v, want rerank 1 and dense 2", first.Ranks)
+	}
+	second := got.Results[1]
+	if second.Score != 0.1 || second.Scores[types.RetrievalTechniqueDense] != 0.9 {
+		t.Errorf("second score/scores = %v/%v, want rerank 0.1 over dense 0.9", second.Score, second.Scores)
+	}
+	if second.Ranks[types.RetrievalTechniqueRerank] != 2 || second.Ranks[types.RetrievalTechniqueDense] != 1 {
+		t.Errorf("second ranks = %v, want rerank 2 and dense 1", second.Ranks)
+	}
+
+	// The rerank step comes after the search steps and reports what it scored.
+	if len(got.Trace) != 3 {
+		t.Fatalf("trace = %+v, want the embed, search and rerank steps", got.Trace)
+	}
+	step := got.Trace[2]
+	if step.Step != types.TraceStepRerank || step.Technique != types.RetrievalTechniqueRerank ||
+		step.Model != "fake-rerank" || step.Candidates == nil || *step.Candidates != 2 || step.DurationMS < 0 {
+		t.Errorf("trace[2] = %+v, want the rerank step naming fake-rerank and 2 candidates", step)
+	}
+}
+
+func TestRetrieveHybridReranksTheFusedPool(t *testing.T) {
+	docA := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	docB := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b2")
+	chunkA := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001") // fused first
+	chunkB := uuid.MustParse("0190d2a8-0000-7000-8000-000000000002") // fused second
+	chunkC := uuid.MustParse("0190d2a8-0000-7000-8000-000000000003") // fused third, cut by the pool
+
+	chunks := &fakeChunkSearch{
+		bm25Matches: []*types.ChunkMatch{
+			{Chunk: &types.Chunk{ID: chunkA, DocumentID: docA, Seq: 0, Content: "near A"}, Score: 4},
+			{Chunk: &types.Chunk{ID: chunkC, DocumentID: docB, Seq: 0, Content: "far C"}, Score: 2},
+		},
+		denseMatches: []*types.ChunkMatch{
+			{Chunk: &types.Chunk{ID: chunkB, DocumentID: docB, Seq: 0, Content: "near B"}, Score: 0.9},
+			{Chunk: &types.Chunk{ID: chunkA, DocumentID: docA, Seq: 0, Content: "near A"}, Score: 0.8},
+		},
+	}
+	reranker := &fakeReranker{scores: []float64{0.2, 0.7}, model: "fake-rerank"}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docA, docB}}, chunks,
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker)
+
+	req := rerankRequest("who won?", types.RetrievalTechniqueBM25, types.RetrievalTechniqueDense)
+	req.TopK = intPointer(1)
+	req.RetrievalConfig.RerankCandidates = intPointer(2)
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), req)
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+
+	// Fusion still fetches its usual depth; the pool cut is what rerank
+	// changes.
+	if chunks.bm25TopK != types.RetrievalFusionCandidates || chunks.denseTopK != types.RetrievalFusionCandidates {
+		t.Errorf("search top_k = %d/%d, want the fusion depth %d",
+			chunks.bm25TopK, chunks.denseTopK, types.RetrievalFusionCandidates)
+	}
+	// The pool is the fused list cut to rerank_candidates, in fused order.
+	if want := []string{"near A", "near B"}; !slices.Equal(reranker.gotTexts, want) {
+		t.Errorf("reranked texts = %q, want the fused pool %q", reranker.gotTexts, want)
+	}
+	if len(got.Results) != 1 || got.Results[0].ChunkID != chunkB {
+		t.Fatalf("results = %+v, want B first after rerank and cut to top_k 1", got.Results)
+	}
+	first := got.Results[0]
+	if first.Score != 0.7 || first.Scores[types.RetrievalTechniqueDense] != 0.9 ||
+		first.Ranks[types.RetrievalTechniqueRerank] != 1 || first.Ranks[types.RetrievalTechniqueDense] != 1 {
+		t.Errorf("first = %+v, want rerank 0.7 first with its dense score and ranks kept", first)
+	}
+
+	if len(got.Trace) != 5 {
+		t.Fatalf("trace = %+v, want bm25's search, dense's two steps, the fuse and the rerank steps", got.Trace)
+	}
+	if step := got.Trace[3]; step.Step != types.TraceStepFuse || step.Candidates == nil || *step.Candidates != 3 {
+		t.Errorf("trace[3] = %+v, want the fuse step over 3 distinct Chunks", step)
+	}
+	if step := got.Trace[4]; step.Step != types.TraceStepRerank || step.Technique != types.RetrievalTechniqueRerank ||
+		step.Model != "fake-rerank" || step.Candidates == nil || *step.Candidates != 2 {
+		t.Errorf("trace[4] = %+v, want the rerank step after the fuse step with 2 candidates", step)
+	}
+}
+
+func TestRetrieveRerankCandidatesCapsThePoolAndDeepensTheSearch(t *testing.T) {
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	matches := make([]*types.ChunkMatch, 5)
+	for i := range matches {
+		matches[i] = &types.ChunkMatch{
+			Chunk: &types.Chunk{ID: uuid.MustParse(fmt.Sprintf("0190d2a8-0000-7000-8000-%012d", i+1)),
+				DocumentID: docID, Seq: i, Content: fmt.Sprintf("chunk %d", i+1)},
+			Score: float64(5 - i),
+		}
+	}
+	chunks := &fakeChunkSearch{denseMatches: matches}
+	reranker := &fakeReranker{scores: []float64{0.1, 0.2, 0.9}, model: "fake-rerank"}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker)
+
+	req := rerankRequest("who won?", types.RetrievalTechniqueDense)
+	req.TopK = intPointer(1)
+	req.RetrievalConfig.RerankCandidates = intPointer(3)
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), req)
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+
+	// The candidate techniques fetch at least the pool size, and only the
+	// pool reaches the reranker.
+	if chunks.denseTopK != 3 {
+		t.Errorf("dense top_k = %d, want the pool size 3", chunks.denseTopK)
+	}
+	if len(reranker.gotTexts) != 3 {
+		t.Fatalf("reranked %d texts, want the pool capped at 3: %q", len(reranker.gotTexts), reranker.gotTexts)
+	}
+	if want := []string{"chunk 1", "chunk 2", "chunk 3"}; !slices.Equal(reranker.gotTexts, want) {
+		t.Errorf("reranked texts = %q, want the first 3 in first-stage order %q", reranker.gotTexts, want)
+	}
+	if len(got.Results) != 1 || got.Results[0].ChunkID != matches[2].Chunk.ID {
+		t.Errorf("results = %+v, want the third pool Chunk its rerank score ranks first", got.Results)
+	}
+}
+
+func TestRetrieveRerankOrdersScoreTiesByChunkID(t *testing.T) {
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	chunkA := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+	chunkB := uuid.MustParse("0190d2a8-0000-7000-8000-000000000002")
+	chunks := &fakeChunkSearch{denseMatches: []*types.ChunkMatch{
+		// B comes first from the search; an equal rerank score must order by
+		// Chunk ID, so A leads.
+		{Chunk: &types.Chunk{ID: chunkB, DocumentID: docID, Content: "near B"}, Score: 0.9},
+		{Chunk: &types.Chunk{ID: chunkA, DocumentID: docID, Content: "near A"}, Score: 0.8},
+	}}
+	reranker := &fakeReranker{scores: []float64{0.5, 0.5}, model: "fake-rerank"}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker)
+
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), rerankRequest("who won?", types.RetrievalTechniqueDense))
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if len(got.Results) != 2 || got.Results[0].ChunkID != chunkA || got.Results[1].ChunkID != chunkB {
+		t.Fatalf("result order = %+v, want the smaller Chunk ID first on a rerank score tie", got.Results)
+	}
+	if got.Results[0].Ranks[types.RetrievalTechniqueRerank] != 1 ||
+		got.Results[1].Ranks[types.RetrievalTechniqueRerank] != 2 {
+		t.Errorf("rerank ranks = %v/%v, want 1/2 in the tied order",
+			got.Results[0].Ranks, got.Results[1].Ranks)
+	}
+}
+
+func TestRetrieveWithRerankOffNeverCallsTheRerankModel(t *testing.T) {
+	docA := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	chunkA := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+	chunkB := uuid.MustParse("0190d2a8-0000-7000-8000-000000000002")
+	chunks := &fakeChunkSearch{denseMatches: []*types.ChunkMatch{
+		{Chunk: &types.Chunk{ID: chunkA, DocumentID: docA, Content: "near A"}, Score: 0.9},
+		{Chunk: &types.Chunk{ID: chunkB, DocumentID: docA, Content: "near B"}, Score: 0.8},
+	}}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docA}}, chunks,
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, &forbiddenReranker{t: t})
+
+	req := &types.RetrievalRequest{Query: "who won?", TopK: intPointer(5)}
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), req)
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	// Nothing about a rerank-off request changes: depth, order and trace are
+	// the ones it had before rerank existed.
+	if chunks.denseTopK != 5 {
+		t.Errorf("dense top_k = %d, want top_k 5 without rerank", chunks.denseTopK)
+	}
+	if len(got.Results) != 2 || got.Results[0].ChunkID != chunkA || got.Results[1].ChunkID != chunkB {
+		t.Errorf("results = %+v, want the dense order A then B", got.Results)
+	}
+	if got.Results[0].Score != 0.9 || got.Results[0].Ranks[types.RetrievalTechniqueDense] != 1 {
+		t.Errorf("first result = %+v, want its dense score and rank", got.Results[0])
+	}
+	if len(got.Trace) != 2 {
+		t.Errorf("trace = %+v, want the embed and search steps alone", got.Trace)
+	}
+}
+
+func TestRetrieveHybridWithRerankOffIgnoresRerankCandidates(t *testing.T) {
+	docA := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	docB := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b2")
+	chunkA := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+	chunkB := uuid.MustParse("0190d2a8-0000-7000-8000-000000000002")
+	chunks := &fakeChunkSearch{
+		bm25Matches: []*types.ChunkMatch{
+			{Chunk: &types.Chunk{ID: chunkA, DocumentID: docA, Content: "near A"}, Score: 4},
+		},
+		denseMatches: []*types.ChunkMatch{
+			{Chunk: &types.Chunk{ID: chunkB, DocumentID: docB, Content: "near B"}, Score: 0.9},
+		},
+	}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docA, docB}}, chunks,
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, &forbiddenReranker{t: t})
+
+	without := hybridRequest("who won?")
+	without.TopK = intPointer(2)
+	gotWithout, err := retrieval.Retrieve(callerContext(uuid.New()), without)
+	if err != nil {
+		t.Fatalf("Retrieve without rerank_candidates: %v", err)
+	}
+	if chunks.bm25TopK != types.RetrievalFusionCandidates || chunks.denseTopK != types.RetrievalFusionCandidates {
+		t.Errorf("search top_k = %d/%d, want the fusion depth %d without rerank",
+			chunks.bm25TopK, chunks.denseTopK, types.RetrievalFusionCandidates)
+	}
+
+	with := hybridRequest("who won?")
+	with.TopK = intPointer(2)
+	with.RetrievalConfig.RerankCandidates = intPointer(3)
+	gotWith, err := retrieval.Retrieve(callerContext(uuid.New()), with)
+	if err != nil {
+		t.Fatalf("Retrieve with rerank_candidates: %v", err)
+	}
+	if chunks.bm25TopK != types.RetrievalFusionCandidates || chunks.denseTopK != types.RetrievalFusionCandidates {
+		t.Errorf("search top_k = %d/%d, want the fusion depth %d with rerank off",
+			chunks.bm25TopK, chunks.denseTopK, types.RetrievalFusionCandidates)
+	}
+
+	if !reflect.DeepEqual(gotWith.Results, gotWithout.Results) {
+		t.Errorf("results with rerank_candidates = %+v, want the same as without %+v",
+			gotWith.Results, gotWithout.Results)
+	}
+	if len(gotWith.Trace) != len(gotWithout.Trace) {
+		t.Fatalf("trace with rerank_candidates = %+v, want the same steps as without %+v",
+			gotWith.Trace, gotWithout.Trace)
+	}
+	for i := range gotWith.Trace {
+		with, without := gotWith.Trace[i], gotWithout.Trace[i]
+		// Durations are wall-clock and may differ between runs.
+		with.DurationMS, without.DurationMS = 0, 0
+		if !reflect.DeepEqual(with, without) {
+			t.Errorf("trace[%d] with rerank_candidates = %+v, want the same as without %+v", i, with, without)
+		}
+	}
+}
+
+func TestRetrieveWithRerankWithoutARerankModelIsServiceUnavailable(t *testing.T) {
+	docs := &fakeReadableDocuments{err: errors.New("must not be reached")}
+	retrieval := NewRetrievalService(docs, &fakeChunkSearch{},
+		&fakeEmbedder{model: "fake-embedding"}, nil)
+
+	req := rerankRequest("who won?", types.RetrievalTechniqueDense)
+	_, err := retrieval.Retrieve(callerContext(uuid.New()), req)
+	appErr, ok := apperrors.IsAppError(err)
+	if !ok {
+		t.Fatalf("Retrieve = %v, want an AppError", err)
+	}
+	if appErr.Code != apperrors.ErrServiceUnavailable || appErr.HTTPCode != 503 {
+		t.Errorf("error code/status = %d/%d, want %d/503", appErr.Code, appErr.HTTPCode, apperrors.ErrServiceUnavailable)
+	}
+	if !strings.Contains(appErr.Message, "models.rerank") {
+		t.Errorf("message %q does not name models.rerank", appErr.Message)
+	}
+	if docs.calls != 0 {
+		t.Errorf("readable Documents asked %d times without a rerank model, want none", docs.calls)
+	}
+}
+
+func TestRetrieveWrapsARerankFailure(t *testing.T) {
+	rerankErr := errors.New("provider down")
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	chunks := &fakeChunkSearch{denseMatches: []*types.ChunkMatch{{
+		Chunk: &types.Chunk{ID: uuid.MustParse("0190d2a8-0000-7000-8000-000000000001"), DocumentID: docID, Content: "near"},
+		Score: 0.9,
+	}}}
+	reranker := &fakeReranker{err: rerankErr}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker)
+
+	_, err := retrieval.Retrieve(callerContext(uuid.New()), rerankRequest("who won?", types.RetrievalTechniqueDense))
+	if !errors.Is(err, rerankErr) || !strings.Contains(err.Error(), "rerank") {
+		t.Errorf("Retrieve = %v, want the reranker's error wrapped with what it was doing", err)
+	}
+	if _, ok := apperrors.IsAppError(err); ok {
+		t.Errorf("Retrieve = %v, want a plain error so the handler answers 500", err)
+	}
+}
+
+func TestRetrieveRejectsARerankScoreCountMismatch(t *testing.T) {
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	chunks := &fakeChunkSearch{denseMatches: []*types.ChunkMatch{
+		{Chunk: &types.Chunk{ID: uuid.MustParse("0190d2a8-0000-7000-8000-000000000001"), DocumentID: docID, Content: "one"}, Score: 0.9},
+		{Chunk: &types.Chunk{ID: uuid.MustParse("0190d2a8-0000-7000-8000-000000000002"), DocumentID: docID, Content: "two"}, Score: 0.8},
+	}}
+	reranker := &fakeReranker{scores: []float64{1}}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker)
+
+	_, err := retrieval.Retrieve(callerContext(uuid.New()), rerankRequest("who won?", types.RetrievalTechniqueDense))
+	if err == nil || !strings.Contains(err.Error(), "1 scores") || !strings.Contains(err.Error(), "2 candidates") {
+		t.Errorf("Retrieve = %v, want an error naming the score count and the candidate count", err)
+	}
+	if _, ok := apperrors.IsAppError(err); ok {
+		t.Errorf("Retrieve = %v, want a plain error so the handler answers 500", err)
+	}
+}
+
+func TestRetrieveWithRerankAndAnEmptyPoolSkipsTheCall(t *testing.T) {
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, &fakeChunkSearch{},
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, &forbiddenReranker{t: t})
+
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), rerankRequest("who won?", types.RetrievalTechniqueDense))
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if len(got.Results) != 0 {
+		t.Errorf("results = %+v, want none", got.Results)
+	}
+	// The step is still recorded so the answer keeps its shape; no model was
+	// called, so it names none.
+	if len(got.Trace) != 3 {
+		t.Fatalf("trace = %+v, want the embed, search and rerank steps", got.Trace)
+	}
+	step := got.Trace[2]
+	if step.Step != types.TraceStepRerank || step.Technique != types.RetrievalTechniqueRerank ||
+		step.Model != "" || step.Candidates == nil || *step.Candidates != 0 {
+		t.Errorf("trace[2] = %+v, want the rerank step with 0 candidates and no model", step)
+	}
+}
+
 func TestRetrieveNeedsTheAuthenticatedPrincipal(t *testing.T) {
-	retrieval := NewRetrievalService(&fakeReadableDocuments{}, &fakeChunkSearch{}, &fakeEmbedder{})
+	retrieval := NewRetrievalService(&fakeReadableDocuments{}, &fakeChunkSearch{}, &fakeEmbedder{}, nil)
 
 	_, err := retrieval.Retrieve(context.Background(), &types.RetrievalRequest{Query: "who won?"})
 	if err == nil || !strings.Contains(err.Error(), "principal") {

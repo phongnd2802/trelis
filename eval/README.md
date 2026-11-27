@@ -148,6 +148,13 @@ Each value is Retrieval Techniques joined with `+`; techniques are sorted, so
 also the results file name. The default is one `dense` config. `--top-k` must
 be between 10 and 100; the header records it, and MRR is MRR@top-k in effect.
 
+`--config bm25+dense+rerank` adds the rerank row: it needs `models.rerank`
+configured on the server and scores the server's default pool of 50
+candidates, since the harness does not send `rerank_candidates`.
+`scripts/eval-stack.sh` does not yet route the rerank role through the
+record/replay proxy, so every run calls the configured rerank provider (a
+follow-up will fix it).
+
 Each `POST /retrieve` includes Trelis's own call to the embedding model, so a
 slow hosted provider sets the pace. `--request-timeout` (default 120 s) keeps a
 slow answer from becoming a question error, and `--concurrency N` (default 1,

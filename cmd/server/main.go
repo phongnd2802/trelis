@@ -45,6 +45,7 @@ import (
 	"github.com/phongnd2802/trelis/internal/ingest"
 	"github.com/phongnd2802/trelis/internal/logger"
 	"github.com/phongnd2802/trelis/internal/models/embedding"
+	"github.com/phongnd2802/trelis/internal/models/rerank"
 	"github.com/phongnd2802/trelis/internal/parser"
 	"github.com/phongnd2802/trelis/internal/router"
 )
@@ -254,6 +255,16 @@ func run(configPath string, args []string) (err error) {
 	} else {
 		logger.Ctx(ctx).Warn("no embedding model configured; Documents will fail ingest until one is set")
 	}
+	// The reranker is optional too: without a configured rerank role, a
+	// request that names rerank answers service unavailable instead of
+	// silently skipping the stage.
+	var reranker rerank.Reranker
+	if cfg.Models.Rerank.Configured() {
+		reranker, err = rerank.New(cfg.Models.Rerank)
+		if err != nil {
+			return fmt.Errorf("rerank model: %w", err)
+		}
+	}
 	ingestActivities := ingest.NewActivities(service.NewIngestService(dbStore, docRepo,
 		repository.NewChunkRepository(dbStore), files, parser.NewFormatRouter(false), embedder))
 	stopIngestWorker := startWorker(ctx, "ingest", cfg.Temporal.TaskQueue, func() worker.Worker {
@@ -272,7 +283,7 @@ func run(configPath string, args []string) (err error) {
 		cfg.Storage.MaxFileSize(),
 	)
 	retrieval := handler.NewRetrievalHandler(
-		service.NewRetrievalService(docRepo, repository.NewChunkSearcher(dbStore), embedder))
+		service.NewRetrievalService(docRepo, repository.NewChunkSearcher(dbStore), embedder, reranker))
 
 	ready := router.Readiness{Timeout: readyTimeout, Checks: []router.Check{
 		{Name: "postgres", Probe: pool.Ping},

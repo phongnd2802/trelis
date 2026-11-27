@@ -45,6 +45,9 @@ const (
 	// embeddingModel is the model name Trelis is configured with; the fake
 	// provider echoes whatever name a role sends.
 	embeddingModel = "test-embedding"
+	// rerankModel is the rerank role's model name, served by the same fake
+	// provider.
+	rerankModel = "test-rerank"
 	// bootTimeout bounds how long a Trelis process may take to migrate and
 	// start listening.
 	bootTimeout = 30 * time.Second
@@ -345,9 +348,9 @@ func freshDatabase(t *testing.T) string {
 // shell are dropped, so every key Trelis reads is either set here or its
 // default. Every test shares the package's Temporal dev server; the task
 // queues are named after the test's database, so concurrent Trelis processes
-// never take each other's workflow or model tasks. embeddingURL is the fake
-// provider the embedding role calls.
-func trelisEnv(dbname, bucket, embeddingURL string) []string {
+// never take each other's workflow or model tasks. modelURL is the fake
+// provider the embedding and rerank roles call.
+func trelisEnv(dbname, bucket, modelURL string) []string {
 	var env []string
 	for _, kv := range os.Environ() {
 		if !strings.HasPrefix(kv, "TRELIS_") {
@@ -376,8 +379,10 @@ func trelisEnv(dbname, bucket, embeddingURL string) []string {
 		"TRELIS_TEMPORAL_PORT="+deps.temporal.port,
 		"TRELIS_TEMPORAL_TASK_QUEUE="+dbname,
 		"TRELIS_TEMPORAL_MODEL_TASK_QUEUE="+dbname+"-models",
-		"TRELIS_MODELS_EMBEDDING_BASE_URL="+embeddingURL,
+		"TRELIS_MODELS_EMBEDDING_BASE_URL="+modelURL,
 		"TRELIS_MODELS_EMBEDDING_MODEL="+embeddingModel,
+		"TRELIS_MODELS_RERANK_BASE_URL="+modelURL,
+		"TRELIS_MODELS_RERANK_MODEL="+rerankModel,
 		"TRELIS_STORAGE_S3_ENDPOINT="+deps.s3,
 		"TRELIS_STORAGE_S3_BUCKET="+bucket,
 		"TRELIS_STORAGE_S3_ACCESS_KEY_ID="+s3User,
