@@ -7,6 +7,7 @@ package sqlc
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -29,6 +30,50 @@ DELETE FROM chunks WHERE document_id = $1
 func (q *Queries) DeleteChunksByDocument(ctx context.Context, documentID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteChunksByDocument, documentID)
 	return err
+}
+
+const getReadableChunk = `-- name: GetReadableChunk :one
+SELECT c.id, c.document_id, c.seq, c.content, c.context_header,
+       c.start_offset, c.end_offset, c.created_at
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+WHERE c.id = $1 AND can_read_document(d.id, $2::uuid)
+`
+
+type GetReadableChunkParams struct {
+	ID          uuid.UUID
+	PrincipalID uuid.UUID
+}
+
+type GetReadableChunkRow struct {
+	ID            uuid.UUID
+	DocumentID    uuid.UUID
+	Seq           int32
+	Content       string
+	ContextHeader string
+	StartOffset   int32
+	EndOffset     int32
+	CreatedAt     time.Time
+}
+
+// One Chunk by ID, only when the caller can read its Document. A Chunk of a
+// Document the caller cannot read, and one that does not exist, answer the
+// same no-row result, so the caller cannot tell them apart (ADR-0004). The
+// embedding is left out: no read path serves it.
+func (q *Queries) GetReadableChunk(ctx context.Context, arg GetReadableChunkParams) (GetReadableChunkRow, error) {
+	row := q.db.QueryRow(ctx, getReadableChunk, arg.ID, arg.PrincipalID)
+	var i GetReadableChunkRow
+	err := row.Scan(
+		&i.ID,
+		&i.DocumentID,
+		&i.Seq,
+		&i.Content,
+		&i.ContextHeader,
+		&i.StartOffset,
+		&i.EndOffset,
+		&i.CreatedAt,
+	)
+	return i, err
 }
 
 const insertChunk = `-- name: InsertChunk :exec

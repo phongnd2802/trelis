@@ -44,10 +44,12 @@ import (
 	"github.com/phongnd2802/trelis/internal/handler"
 	"github.com/phongnd2802/trelis/internal/ingest"
 	"github.com/phongnd2802/trelis/internal/logger"
+	"github.com/phongnd2802/trelis/internal/models/chat"
 	"github.com/phongnd2802/trelis/internal/models/embedding"
 	"github.com/phongnd2802/trelis/internal/models/rerank"
 	"github.com/phongnd2802/trelis/internal/parser"
 	"github.com/phongnd2802/trelis/internal/router"
+	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
 
 // bucketRetry is how long ensureBucket waits between attempts.
@@ -265,6 +267,18 @@ func run(configPath string, args []string) (err error) {
 			return fmt.Errorf("rerank model: %w", err)
 		}
 	}
+	// The chat role is optional as well: without it /answer answers service
+	// unavailable instead of inventing an answer.
+	var answerGenerator interfaces.Generator
+	if cfg.Models.Chat.Configured() {
+		chatClient, err := chat.NewChat("models.chat", cfg.Models.Chat)
+		if err != nil {
+			return fmt.Errorf("chat model: %w", err)
+		}
+		answerGenerator = chat.Generator(chatClient)
+	} else {
+		logger.Ctx(ctx).Warn("no chat model configured; pipeline answers will answer service unavailable")
+	}
 	ingestActivities := ingest.NewActivities(service.NewIngestService(dbStore, docRepo,
 		repository.NewChunkRepository(dbStore), files, parser.NewFormatRouter(false), embedder))
 	stopIngestWorker := startWorker(ctx, "ingest", cfg.Temporal.TaskQueue, func() worker.Worker {
@@ -282,8 +296,10 @@ func run(configPath string, args []string) (err error) {
 			ingest.NewStarter(temporal, cfg.Temporal.TaskQueue)),
 		cfg.Storage.MaxFileSize(),
 	)
-	retrieval := handler.NewRetrievalHandler(
-		service.NewRetrievalService(docRepo, repository.NewChunkSearcher(dbStore), embedder, reranker))
+	retrievalService := service.NewRetrievalService(docRepo, repository.NewChunkSearcher(dbStore), embedder, reranker)
+	retrieval := handler.NewRetrievalHandler(retrievalService)
+	answers := handler.NewAnswerHandler(service.NewAnswerService(retrievalService, answerGenerator))
+	chunks := handler.NewChunkHandler(service.NewChunkService(repository.NewChunkReader(dbStore)))
 
 	ready := router.Readiness{Timeout: readyTimeout, Checks: []router.Check{
 		{Name: "postgres", Probe: pool.Ping},
@@ -304,7 +320,8 @@ func run(configPath string, args []string) (err error) {
 	logger.Ctx(ctx).Info("trelis listening", zap.String("addr", ln.Addr().String()), zap.String("config", configPath))
 
 	if err := router.Serve(ctx, ln, router.New(ready, service.NewAuthService(principalRepo, keyRepo),
-		handler.NewPrincipalHandler(principals), docs, retrieval, cfg.Server.Swagger), cfg.Server.ShutdownTimeout); err != nil {
+		handler.NewPrincipalHandler(principals), docs, retrieval, answers, chunks,
+		cfg.Server.Swagger), cfg.Server.ShutdownTimeout); err != nil {
 		return err
 	}
 	logger.Ctx(ctx).Info("trelis stopped")

@@ -685,6 +685,49 @@ func explainGeneric(t *testing.T, ctx context.Context, pool *pgxpool.Pool, query
 	return plans[0].Plan
 }
 
+// TestGetReadableChunkReturnsOnlyAReadableDocumentsChunk is the access case
+// for the Chunk read endpoint: a reader gets the Chunk of a Document shared
+// with them, while a Chunk of another Document is the same not-found error as
+// an unknown ID (ADR-0004).
+func TestGetReadableChunkReturnsOnlyAReadableDocumentsChunk(t *testing.T) {
+	s, ids := seeded(t)
+	ctx := context.Background()
+	reader := NewChunkReader(s)
+
+	shared := documentGranted(t, s, ids["alice"], types.AccessGrants{PrincipalIDs: []uuid.UUID{ids["bob"]}})
+	sharedChunks := replaceChunks(t, s, shared, []chunkSeed{{header: "Chương I", content: "Điều 1. Phạm vi điều chỉnh."}})
+	secret := document(t, s, ids["alice"])
+	secretChunks := replaceChunks(t, s, secret, []chunkSeed{{content: "Mã ra mắt là 1234."}})
+
+	got, err := reader.GetReadableChunk(ctx, ids["bob"], sharedChunks[0].ID)
+	if err != nil {
+		t.Fatalf("GetReadableChunk(shared): %v", err)
+	}
+	if got.ID != sharedChunks[0].ID || got.DocumentID != shared.ID || got.Seq != 0 ||
+		got.Content != "Điều 1. Phạm vi điều chỉnh." || got.ContextHeader != "Chương I" ||
+		got.StartOffset != sharedChunks[0].StartOffset || got.EndOffset != sharedChunks[0].EndOffset {
+		t.Errorf("chunk = %+v, want the stored shared Chunk %+v", got, sharedChunks[0])
+	}
+	if got.CreatedAt.IsZero() {
+		t.Error("created_at = zero, want the stored creation time")
+	}
+
+	// The owner still reads her own Document's Chunk.
+	if _, err := reader.GetReadableChunk(ctx, ids["alice"], secretChunks[0].ID); err != nil {
+		t.Errorf("GetReadableChunk(own Document) = %v, want the Chunk", err)
+	}
+	// A Chunk of a Document Bob cannot read and an unknown ID are the same
+	// not-found error, so the answer reveals nothing about what exists.
+	for name, id := range map[string]uuid.UUID{
+		"restricted Document": secretChunks[0].ID,
+		"unknown Chunk":       uuid.New(),
+	} {
+		if _, err := reader.GetReadableChunk(ctx, ids["bob"], id); !errors.Is(err, ErrChunkNotFound) {
+			t.Errorf("GetReadableChunk(%s) = %v, want ErrChunkNotFound", name, err)
+		}
+	}
+}
+
 // preparedStatementText returns the SQL the repository prepared for queryName.
 // The lookup relies on sqlc's `-- name: SearchDenseChunks :many` comment
 // being part of the statement text.

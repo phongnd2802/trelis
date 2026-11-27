@@ -53,3 +53,22 @@ type ChunkSearcher interface {
 	// place.
 	SearchBM25(ctx context.Context, documentIDs []uuid.UUID, query string, topK int) ([]*types.ChunkMatch, error)
 }
+
+// ChunkReader reads one Chunk for a Principal, always within the Documents
+// they can read (ADR-0004).
+type ChunkReader interface {
+	// GetReadableChunk returns the Chunk when principalID can read its
+	// Document, else ErrChunkNotFound. A Chunk that does not exist and one
+	// the Principal cannot read are the same error, so the answer reveals
+	// nothing about what exists.
+	GetReadableChunk(ctx context.Context, principalID, id uuid.UUID) (*types.Chunk, error)
+}
+
+// ChunkService is the Chunk read use case, always on behalf of the Principal
+// in ctx (types.WithPrincipal). It answers with *errors.AppError for anything
+// the client should see.
+type ChunkService interface {
+	// GetChunkByID returns a Chunk the caller can read; one that does not
+	// exist and one they cannot read are the same not-found error.
+	GetChunkByID(ctx context.Context, id uuid.UUID) (*types.Chunk, error)
+}

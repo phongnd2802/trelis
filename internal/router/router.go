@@ -19,12 +19,13 @@ import (
 // so orchestrators can probe them, as are /swagger/* (the UI and its spec)
 // when swagger is true. Everything else, unknown paths and methods included,
 // needs an API key that authn accepts, so a caller without one cannot map
-// the routes. principals serves /me, docs /documents and retrieval
-// /retrieve; any may be nil only where its routes are never called.
+// the routes. principals serves /me, docs /documents, retrieval /retrieve,
+// answers /answer and chunks /chunks; any may be nil only where its routes
+// are never called.
 //
 //	@title						Trelis API
 //	@version					0.1.0
-//	@description				HTTP API for uploading, reading and searching Documents. Every route except the probes needs an API key.
+//	@description				HTTP API for uploading, reading, searching and questioning Documents. Every route except the probes needs an API key.
 //	@BasePath					/
 //
 //	@securityDefinitions.apikey	bearerAuth
@@ -33,7 +34,8 @@ import (
 //	@description				Paste "Bearer <key>", with a key from `trelis admin key create <principal>` (`go run ./cmd/server admin key create <principal>` in dev).
 func New(ready Readiness, authn interfaces.AuthService,
 	principals *handler.PrincipalHandler, docs *handler.DocumentHandler,
-	retrieval *handler.RetrievalHandler, swagger bool,
+	retrieval *handler.RetrievalHandler, answers *handler.AnswerHandler,
+	chunks *handler.ChunkHandler, swagger bool,
 ) http.Handler {
 	r := chi.NewRouter()
 	// Outermost first: every response gets an ID and a log line, and a panic
@@ -61,6 +63,8 @@ func New(ready Readiness, authn interfaces.AuthService,
 		r.Get("/documents/{id}", docs.GetDocument)
 		r.Get("/documents/{id}/file", docs.DownloadDocumentFile)
 		r.Post("/retrieve", retrieval.Retrieve)
+		r.Post("/answer", answers.Answer)
+		r.Get("/chunks/{id}", chunks.GetChunk)
 	})
 	return r
 }

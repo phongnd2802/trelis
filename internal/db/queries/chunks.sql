@@ -29,6 +29,17 @@ WHERE id = sqlc.arg(id);
 -- name: CountChunksWithoutEmbedding :one
 SELECT count(*) FROM chunks WHERE document_id = $1 AND embedding IS NULL;
 
+-- One Chunk by ID, only when the caller can read its Document. A Chunk of a
+-- Document the caller cannot read, and one that does not exist, answer the
+-- same no-row result, so the caller cannot tell them apart (ADR-0004). The
+-- embedding is left out: no read path serves it.
+-- name: GetReadableChunk :one
+SELECT c.id, c.document_id, c.seq, c.content, c.context_header,
+       c.start_offset, c.end_offset, c.created_at
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+WHERE c.id = @id AND can_read_document(d.id, @principal_id::uuid);
+
 -- Dense retrieval: rank the Chunks of the readable Documents by cosine
 -- similarity to the query vector. Exact scan on purpose: no HNSW index yet,
 -- so recall is perfect while the eval baseline is built; add the index when

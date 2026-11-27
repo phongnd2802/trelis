@@ -15,6 +15,158 @@ const docTemplate = `{
     "host": "{{.Host}}",
     "basePath": "{{.BasePath}}",
     "paths": {
+        "/answer": {
+            "post": {
+                "security": [
+                    {
+                        "bearerAuth": []
+                    }
+                ],
+                "description": "Retrieves the Documents the caller can read, then asks models.chat for one answer that cites the retrieved Chunks. Sources are numbered [1]..[n] in retrieval order; each claim is cited with its source numbers in square brackets, the answer text keeps the valid markers, and citations lists each cited source once in order of first appearance. A marker outside 1..n is removed from the text and never cited; a marker inside Markdown code or a Markdown link is left untouched and never cited. When retrieval finds nothing the answer is a fixed sentence in the question's language and no chat call is made. debug adds the retrieved Chunks (exactly as POST /retrieve answers them), the trace with a final generate step, and the chat call's token usage. Malformed JSON, unknown fields, invalid values and the retrieval rules are 400; a body over 64 KiB is 413; without models.chat the route answers 503 before any retrieval, and retrieval's own 503 (models.embedding for dense, models.rerank for rerank) passes through; a chat failure is a generic 500.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "answering"
+                ],
+                "summary": "Answer a question from readable Documents",
+                "parameters": [
+                    {
+                        "description": "The query, how many Chunks to retrieve, which Retrieval Techniques to run and whether to return the debug object",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/types.AnswerRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/handler.DataResponse"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/types.AnswerResult"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "400": {
+                        "description": "Body that is not one JSON object, an unknown field or wrong value type, a blank or too-long query, an out-of-range top_k or an invalid retrieval_config",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Missing or invalid API key",
+                        "schema": {
+                            "$ref": "#/definitions/router.ErrorResponse"
+                        }
+                    },
+                    "413": {
+                        "description": "Request body larger than 64 KiB",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error; a failed API key check answers the router's error body instead",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "models.chat is not configured, or retrieval is unavailable (models.embedding for dense, models.rerank for rerank)",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/chunks/{id}": {
+            "get": {
+                "security": [
+                    {
+                        "bearerAuth": []
+                    }
+                ],
+                "description": "Returns the Chunk, without its embedding, when the caller can read its Document. A Chunk that does not exist and one whose Document the caller cannot read answer the same 404, so a Restricted Document's existence is not revealed.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "chunks"
+                ],
+                "summary": "Get a Chunk",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Chunk ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/handler.DataResponse"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/types.Chunk"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "400": {
+                        "description": "ID that is not a UUID",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Missing or invalid API key",
+                        "schema": {
+                            "$ref": "#/definitions/router.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "No readable Chunk with that ID",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error; a failed API key check answers the router's error body instead",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/documents": {
             "get": {
                 "security": [
@@ -626,6 +778,136 @@ const docTemplate = `{
                 }
             }
         },
+        "types.AnswerDebug": {
+            "type": "object",
+            "properties": {
+                "results": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/types.RetrievedChunk"
+                    }
+                },
+                "trace": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/types.TraceStep"
+                    }
+                },
+                "usage": {
+                    "description": "Usage is the chat call's token accounting; zeros when no call was made.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/types.TokenUsage"
+                        }
+                    ]
+                }
+            }
+        },
+        "types.AnswerRequest": {
+            "type": "object",
+            "properties": {
+                "debug": {
+                    "description": "Debug asks the answer to carry the retrieved Chunks, the trace and the\nchat call's token usage; false leaves the debug object out entirely.",
+                    "type": "boolean"
+                },
+                "query": {
+                    "description": "Query is the question to find Chunks for.",
+                    "type": "string"
+                },
+                "retrieval_config": {
+                    "description": "RetrievalConfig is the combination of techniques to run; nil means\ndense alone.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/types.RetrievalConfig"
+                        }
+                    ]
+                },
+                "top_k": {
+                    "description": "TopK is how many Chunks to return; nil means the default. An explicit\n0 is invalid, so a client that sends it learns it is out of range\ninstead of silently getting the default.",
+                    "type": "integer"
+                }
+            }
+        },
+        "types.AnswerResult": {
+            "type": "object",
+            "properties": {
+                "answer": {
+                    "type": "string"
+                },
+                "citations": {
+                    "description": "Citations is never null: an answer with no source cites nothing.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/types.Citation"
+                    }
+                },
+                "debug": {
+                    "description": "Debug is present only when the request set debug; nil leaves the key\nout.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/types.AnswerDebug"
+                        }
+                    ]
+                },
+                "finish_reason": {
+                    "type": "string"
+                }
+            }
+        },
+        "types.Chunk": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "description": "Content is the source text of the Chunk",
+                    "type": "string"
+                },
+                "context_header": {
+                    "description": "ContextHeader is context that is not in the source at the offsets,\nsuch as a heading breadcrumb or a repeated table header",
+                    "type": "string"
+                },
+                "created_at": {
+                    "description": "Creation time of the Chunk",
+                    "type": "string"
+                },
+                "document_id": {
+                    "description": "Document this Chunk belongs to",
+                    "type": "string"
+                },
+                "end_offset": {
+                    "description": "EndOffset is the rune just past the last one in Content",
+                    "type": "integer"
+                },
+                "id": {
+                    "description": "Unique identifier of the Chunk",
+                    "type": "string"
+                },
+                "seq": {
+                    "description": "Seq orders the Chunks of one Document, starting at 0",
+                    "type": "integer"
+                },
+                "start_offset": {
+                    "description": "StartOffset is the first rune of the Document's Markdown in Content",
+                    "type": "integer"
+                }
+            }
+        },
+        "types.Citation": {
+            "type": "object",
+            "properties": {
+                "chunk_id": {
+                    "description": "ChunkID is the retrieved Chunk the marker stands for.",
+                    "type": "string"
+                },
+                "document_id": {
+                    "description": "DocumentID is the Document that Chunk belongs to.",
+                    "type": "string"
+                },
+                "marker": {
+                    "description": "Marker is the source number the answer text cites, e.g. 2 for [2].",
+                    "type": "integer"
+                }
+            }
+        },
         "types.Document": {
             "type": "object",
             "properties": {
@@ -816,6 +1098,20 @@ const docTemplate = `{
                 }
             }
         },
+        "types.TokenUsage": {
+            "type": "object",
+            "properties": {
+                "completion_tokens": {
+                    "type": "integer"
+                },
+                "prompt_tokens": {
+                    "type": "integer"
+                },
+                "total_tokens": {
+                    "type": "integer"
+                }
+            }
+        },
         "types.TraceStep": {
             "type": "object",
             "properties": {
@@ -863,7 +1159,7 @@ var SwaggerInfo = &swag.Spec{
 	BasePath:         "/",
 	Schemes:          []string{},
 	Title:            "Trelis API",
-	Description:      "HTTP API for uploading, reading and searching Documents. Every route except the probes needs an API key.",
+	Description:      "HTTP API for uploading, reading, searching and questioning Documents. Every route except the probes needs an API key.",
 	InfoInstanceName: "swagger",
 	SwaggerTemplate:  docTemplate,
 	LeftDelim:        "{{",

@@ -10,6 +10,23 @@ type TokenUsage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
+// ChatTurn is one message of a non-streaming chat call: a role and its text.
+// It is the narrow shape interfaces.Generator takes, so the application layer
+// sends a chat request without importing a model client.
+type ChatTurn struct {
+	Role    string
+	Content string
+}
+
+// The chat roles a Pipeline Answer sends.
+const (
+	// ChatRoleSystem carries the instructions that constrain the answer to
+	// its sources and their citation markers.
+	ChatRoleSystem = "system"
+	// ChatRoleUser carries the numbered sources and the question.
+	ChatRoleUser = "user"
+)
+
 // LLMToolCall represents a function/tool call from the LLM
 type LLMToolCall struct {
 	ID       string       `json:"id"`

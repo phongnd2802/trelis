@@ -48,6 +48,9 @@ const (
 	// rerankModel is the rerank role's model name, served by the same fake
 	// provider.
 	rerankModel = "test-rerank"
+	// chatModel is the chat role's model name, served by the same fake
+	// provider.
+	chatModel = "test-chat"
 	// bootTimeout bounds how long a Trelis process may take to migrate and
 	// start listening.
 	bootTimeout = 30 * time.Second
@@ -202,8 +205,9 @@ func endpoint(ctx context.Context, c testcontainers.Container, port string) (hos
 type trelis struct {
 	// url is the base URL of its HTTP API, e.g. http://127.0.0.1:41234.
 	url string
-	// provider is the fake model provider this Trelis calls: the embedding
-	// role points at it, so tests can fail embedding requests on purpose.
+	// provider is the fake model provider this Trelis calls: the chat,
+	// embedding and rerank roles point at it, so tests can fail their requests
+	// on purpose.
 	provider *modeltest.FakeProvider
 	// env is the process environment of every command run as this Trelis.
 	env []string
@@ -349,7 +353,7 @@ func freshDatabase(t *testing.T) string {
 // default. Every test shares the package's Temporal dev server; the task
 // queues are named after the test's database, so concurrent Trelis processes
 // never take each other's workflow or model tasks. modelURL is the fake
-// provider the embedding and rerank roles call.
+// provider the chat, embedding and rerank roles call.
 func trelisEnv(dbname, bucket, modelURL string) []string {
 	var env []string
 	for _, kv := range os.Environ() {
@@ -379,6 +383,8 @@ func trelisEnv(dbname, bucket, modelURL string) []string {
 		"TRELIS_TEMPORAL_PORT="+deps.temporal.port,
 		"TRELIS_TEMPORAL_TASK_QUEUE="+dbname,
 		"TRELIS_TEMPORAL_MODEL_TASK_QUEUE="+dbname+"-models",
+		"TRELIS_MODELS_CHAT_BASE_URL="+modelURL,
+		"TRELIS_MODELS_CHAT_MODEL="+chatModel,
 		"TRELIS_MODELS_EMBEDDING_BASE_URL="+modelURL,
 		"TRELIS_MODELS_EMBEDDING_MODEL="+embeddingModel,
 		"TRELIS_MODELS_RERANK_BASE_URL="+modelURL,
