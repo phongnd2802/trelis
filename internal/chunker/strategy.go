@@ -9,18 +9,24 @@ import (
 // StrategyTier names one chunking implementation in a tier chain.
 type StrategyTier string
 
-// TierRecursive is the recursive tier. It ends every chain. The heading
-// tier and the heuristic tier (#29) may run before it.
+// TierRecursive is the recursive tier. It ends every chain. The heading and
+// heuristic tiers may run before it.
 const TierRecursive StrategyTier = "recursive"
 
 // TierHeading is the heading tier. It splits a Markdown Document at its ATX
 // headings and puts the heading context its Content lacks in ContextHeader.
 const TierHeading StrategyTier = "heading"
 
+// TierHeuristic is the heuristic tier. It finds section boundaries in plain
+// lines, Vietnamese legal structure first, and puts that path in
+// ContextHeader the same way the heading tier does.
+const TierHeuristic StrategyTier = "heuristic"
+
 // tierSplitters maps each tier to its implementation. Each receives a
 // config with defaults applied.
 var tierSplitters = map[StrategyTier]func(text string, cfg SplitterConfig) []Chunk{
 	TierHeading:   splitHeading,
+	TierHeuristic: splitHeuristic,
 	TierRecursive: splitRecursive,
 }
 
@@ -67,11 +73,13 @@ func SplitWithDiagnostics(text string, cfg SplitterConfig) ([]Chunk, *Diagnostic
 // recursive tier, and the profile that chose them (nil unless StrategyAuto).
 // An empty Strategy means recursive, so configs stored before strategies
 // existed keep their behaviour. StrategyAuto profiles the Document and picks
-// the heading tier only when its headed sections are dense enough.
+// the first structured tier whose sections are dense enough: heading before
+// heuristic, since real Markdown headings are the stronger signal.
 //
-// The heading tier scans for headings again rather than taking the profile's
-// list: tierSplitters is text+cfg for every tier, and threading one scan
-// through it would couple the chain to the profiler for a cheap line scan.
+// A structured tier scans for its boundaries again rather than taking the
+// profile's list: tierSplitters is text+cfg for every tier, and threading one
+// scan through it would couple the chain to the profiler for a cheap line
+// scan.
 func resolveChain(text string, cfg SplitterConfig) ([]StrategyTier, *DocProfile) {
 	switch cfg.Strategy {
 	case StrategyRecursive, "":

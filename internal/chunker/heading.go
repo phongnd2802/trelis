@@ -5,16 +5,26 @@ import (
 	"unicode/utf8"
 )
 
-// heading is one ATX heading that starts a section.
+// heading is one boundary that starts a section: an ATX heading, or one of
+// the heuristic tier's boundaries.
 type heading struct {
 	// start is the byte offset of the heading line's start, including up to
 	// three spaces of indentation, so a Chunk beginning here keeps them.
 	start int
-	// level is 1 for "#" through 6 for "######".
+	// level is 1 for "#" through 6 for "######", and for the heuristic tier
+	// the depth of the marker (Phần 1 down to Điều 4).
 	level int
 	// text is the heading's text: markers, a closing run of hashes and
 	// surrounding whitespace stripped.
 	text string
+	// keepPath marks a heuristic boundary that carries no heading text, a
+	// page break or separator line: the new section keeps the breadcrumb it
+	// had and the boundary adds nothing to the path.
+	keepPath bool
+	// end is the byte offset just past the heading's last line when its text
+	// spans more than the first line, as a legal marker's title on the next
+	// line does. Zero means the heading occupies its first line alone.
+	end int
 }
 
 // headings returns the ATX headings of text in document order.
@@ -91,8 +101,10 @@ type headingSection struct {
 	// ancestors is the path above this section's own heading. Its first
 	// Chunk starts with that heading line, so it carries only the ancestors.
 	ancestors string
-	// headed is false for the preamble before the first heading.
-	headed bool
+	// bounded is false for the preamble before the first boundary. A
+	// heuristic page break or separator counts: the section starts at a line
+	// the tier chose, not at arbitrary text.
+	bounded bool
 }
 
 // headingAncestor is one heading on the stack a breadcrumb is built from.
@@ -123,7 +135,7 @@ func sectionsFor(text string, hs []heading) []headingSection {
 		return strings.Join(parts, " > ")
 	}
 	var sections []headingSection
-	add := func(start, end, bodyStart int, headed bool, ancestors string) {
+	add := func(start, end, bodyStart int, bounded bool, ancestors string) {
 		if strings.TrimSpace(text[bodyStart:end]) == "" {
 			return
 		}
@@ -132,7 +144,7 @@ func sectionsFor(text string, hs []heading) []headingSection {
 			end:        end,
 			breadcrumb: breadcrumb(),
 			ancestors:  ancestors,
-			headed:     headed,
+			bounded:    bounded,
 		})
 	}
 
@@ -145,17 +157,29 @@ func sectionsFor(text string, hs []heading) []headingSection {
 		add(0, hs[0].start, 0, false, "")
 	}
 	for i, h := range hs {
+		end := len(text)
+		if i+1 < len(hs) {
+			end = hs[i+1].start
+		}
+		if h.keepPath {
+			// A page break or separator starts a new section without a
+			// heading of its own. Its Content holds no heading line, so
+			// every Chunk carries the path it had.
+			add(h.start, end, h.start, true, breadcrumb())
+			continue
+		}
 		for len(stack) > 0 && stack[len(stack)-1].level >= h.level {
 			stack = stack[:len(stack)-1]
 		}
 		ancestors := breadcrumb()
 		stack = append(stack, headingAncestor{level: h.level, text: h.text})
-		end := len(text)
-		if i+1 < len(hs) {
-			end = hs[i+1].start
-		}
 		bodyStart := end
-		if nl := strings.IndexByte(text[h.start:end], '\n'); nl >= 0 {
+		if h.end > h.start && h.end <= end {
+			// A marker whose title is on the line below: the section's body
+			// starts after the title, so a marker with nothing else emits no
+			// Chunk and only feeds the breadcrumb.
+			bodyStart = h.end
+		} else if nl := strings.IndexByte(text[h.start:end], '\n'); nl >= 0 {
 			bodyStart = h.start + nl + 1
 		}
 		add(h.start, end, bodyStart, true, ancestors)
@@ -179,10 +203,20 @@ func sectionsFor(text string, hs []heading) []headingSection {
 // Chunks, whose Content no longer holds the heading, carry the full path.
 // cfg must have its defaults applied.
 func splitHeading(text string, cfg SplitterConfig) []Chunk {
+	return splitSections(text, cfg, headingSections(text))
+}
+
+// splitSections turns each section into Chunks the same way for every
+// structured tier: one Chunk when the section fits its budget, otherwise
+// pieces from the recursive tier's machinery over that section's text alone.
+// Sections are never merged, so a boundary line can be left out of every
+// Chunk when its section has no body; a Chunk holding only a heading would
+// also count towards fragmentation. cfg must have its defaults applied.
+func splitSections(text string, cfg SplitterConfig, sections []headingSection) []Chunk {
 	var out []Chunk
 	idx := runeIndex{text: text}
 	hardMax := protectedLimit(cfg, text)
-	for _, sec := range headingSections(text) {
+	for _, sec := range sections {
 		base := idx.runeOffset(sec.start)
 		content := text[sec.start:sec.end]
 		n := utf8.RuneCountInString(content)

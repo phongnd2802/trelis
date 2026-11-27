@@ -5,8 +5,9 @@ import "strings"
 // Strategy values for SplitterConfig.Strategy.
 const (
 	// StrategyAuto profiles the Document and lets it decide which tiers to
-	// try: dense headings get the heading tier then recursive, anything
-	// else the recursive tier alone.
+	// try: dense Markdown headings get the heading tier then recursive,
+	// otherwise enough heuristic sections get the heuristic tier then
+	// recursive, and anything else the recursive tier alone.
 	StrategyAuto = "auto"
 	// StrategyRecursive runs the recursive tier alone.
 	StrategyRecursive = "recursive"

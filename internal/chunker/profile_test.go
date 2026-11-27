@@ -53,6 +53,27 @@ func TestProfileDocumentCountsOnlyHeadedSectionsWithBody(t *testing.T) {
 	}
 }
 
+func TestProfileDocumentCountsLegalStructure(t *testing.T) {
+	text := loadLegalSample(t)
+	p := ProfileDocument(text)
+
+	if p.LegalArticles != 6 {
+		t.Errorf("LegalArticles = %d, want the 6 Điều lines", p.LegalArticles)
+	}
+	if p.HeuristicSections != 6 {
+		t.Errorf("HeuristicSections = %d, want the 6 article sections (chapter and mục titles are body-less)", p.HeuristicSections)
+	}
+	if p.HeadedSections != 0 {
+		t.Errorf("HeadedSections = %d, want 0 for a document without ATX headings", p.HeadedSections)
+	}
+	if lower := max(tinyChunkRunes, DefaultChunkSize/minAverageSectionFraction); p.AverageHeuristicSectionRunes < lower {
+		t.Errorf("AverageHeuristicSectionRunes = %d, want at least %d", p.AverageHeuristicSectionRunes, lower)
+	}
+	if got := SelectTiers(p, SplitterConfig{ChunkSize: DefaultChunkSize}); !slices.Equal(got, []StrategyTier{TierHeuristic, TierRecursive}) {
+		t.Errorf("chain = %v, want heuristic then recursive", got)
+	}
+}
+
 func TestSelectTiers(t *testing.T) {
 	tests := []struct {
 		name string
@@ -101,6 +122,18 @@ func TestSelectTiers(t *testing.T) {
 			text: strings.Repeat("# Phần\n\n"+prose(1, 2)+"\n\n", 5),
 			size: 100,
 			want: []StrategyTier{TierHeading, TierRecursive},
+		},
+		{
+			name: "a Vietnamese legal document",
+			text: loadLegalSample(t),
+			size: DefaultChunkSize,
+			want: []StrategyTier{TierHeuristic, TierRecursive},
+		},
+		{
+			name: "uppercase section titles",
+			text: uppercaseTitledDocument(),
+			size: 200,
+			want: []StrategyTier{TierHeuristic, TierRecursive},
 		},
 	}
 	for _, tt := range tests {
