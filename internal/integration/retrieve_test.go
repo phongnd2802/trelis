@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -111,6 +112,40 @@ func (tr *trelis) chunkVectors(t *testing.T, documentID string) [][]float32 {
 		t.Fatal(err)
 	}
 	return vectors
+}
+
+// chunkTexts returns a Document's stored Chunks as retrieval sends them to
+// the reranker: ContextHeader, a blank line, then Content.
+func (tr *trelis) chunkTexts(t *testing.T, documentID string) []string {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
+		pgUser, pgPassword, deps.pg.host, deps.pg.port, tr.dbname))
+	if err != nil {
+		t.Fatalf("connect to database %s: %v", tr.dbname, err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	rows, err := conn.Query(ctx,
+		`SELECT context_header, content FROM chunks WHERE document_id = $1 ORDER BY seq`, documentID)
+	if err != nil {
+		t.Fatalf("select chunks of %s: %v", documentID, err)
+	}
+	defer rows.Close()
+	var texts []string
+	for rows.Next() {
+		var header, content string
+		if err := rows.Scan(&header, &content); err != nil {
+			t.Fatal(err)
+		}
+		if header != "" {
+			content = header + "\n\n" + content
+		}
+		texts = append(texts, content)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return texts
 }
 
 // parseVector reads pgvector's text form, [0.1,0.2].
@@ -468,5 +503,116 @@ func TestRetrieveHybridReturnsOnlyChunksOfDocumentsTheCallerCanRead(t *testing.T
 	if first := aliceAnswer.Data.Results[0]; first.DocumentID != secretID {
 		t.Errorf("alice's first fused result is from %s, want the secret Document %s both lists rank first",
 			first.DocumentID, secretID)
+	}
+}
+
+// TestRetrieveRerankFollowsTheRerankScoresAndKeepsRestrictedChunksOut is the
+// acceptance and leakage test for rerank: the dense order puts Alice's shared
+// Document first, the rerank scores invert it, and Bob neither receives nor
+// sends to the rerank provider Alice's Restricted Document.
+func TestRetrieveRerankFollowsTheRerankScoresAndKeepsRestrictedChunksOut(t *testing.T) {
+	tr := start(t)
+	alice := tr.principalKey(t, "alice")
+	bob := tr.principalKey(t, "bob")
+
+	const query = "which note is for bob?"
+	secretID := tr.upload(t, alice, "secret.md", "# Secret\n\nThe launch code is 1234.\n")
+	// A Document Alice shares with Bob through its Access List.
+	sharedID := tr.uploadBytesWithFields(t, alice, "shared.md",
+		[]byte("# Shared\n\nThis note is for bob.\n"), map[string]string{"principals": "bob"})
+	bobID := tr.upload(t, bob, "bob.md", "# Bob\n\nBob's own note.\n")
+
+	for _, doc := range []struct{ id, key, name string }{
+		{secretID, alice, "Alice's secret"},
+		{sharedID, alice, "Alice's shared"},
+		{bobID, bob, "Bob's own"},
+	} {
+		if got := tr.waitForIngest(t, doc.key, doc.id); got.ParseStatus != "completed" {
+			t.Fatalf("%s Document parse_status = %q (%q), want completed", doc.name, got.ParseStatus, got.ParseError)
+		}
+	}
+
+	sharedTexts := tr.chunkTexts(t, sharedID)
+	bobTexts := tr.chunkTexts(t, bobID)
+	if len(sharedTexts) != 1 || len(bobTexts) != 1 {
+		t.Fatalf("shared/bob Chunks = %d/%d, want one each so the rerank scores pin one text per Document",
+			len(sharedTexts), len(bobTexts))
+	}
+
+	// The dense order puts the shared Document first for Bob: its Chunk's
+	// vector is the query's. The rerank scores invert that order.
+	vectors := tr.chunkVectors(t, sharedID)
+	if len(vectors) != 1 {
+		t.Fatalf("shared Document has %d embedded Chunks, want one", len(vectors))
+	}
+	tr.provider.EmbedAs(query, vectors[0])
+	tr.provider.ScoreAs(query, sharedTexts[0], 0.1)
+	tr.provider.ScoreAs(query, bobTexts[0], 0.9)
+
+	answer := tr.retrieveConfig(t, bob, query, 10, map[string]any{
+		"techniques": []string{"dense", "rerank"},
+	})
+	if len(answer.Data.Results) != 2 {
+		t.Fatalf("bob's reranked results = %+v, want his 2 readable Documents", answer.Data.Results)
+	}
+	first, second := answer.Data.Results[0], answer.Data.Results[1]
+	if first.DocumentID != bobID || second.DocumentID != sharedID {
+		t.Fatalf("bob's reranked order = %s, %s; want %s then %s by rerank score",
+			first.DocumentID, second.DocumentID, bobID, sharedID)
+	}
+	// The first stage really ranked the other way round, so the rerank stage
+	// is what moved the Documents.
+	if first.Scores["dense"] >= second.Scores["dense"] {
+		t.Errorf("dense scores = %v/%v, want the shared Document ahead before rerank",
+			first.Scores["dense"], second.Scores["dense"])
+	}
+	if first.Score != 0.9 || first.Scores["rerank"] != 0.9 || first.Ranks["rerank"] != 1 {
+		t.Errorf("first result = %+v, want rerank score 0.9 and rank 1", first)
+	}
+	if second.Score != 0.1 || second.Scores["rerank"] != 0.1 || second.Ranks["rerank"] != 2 {
+		t.Errorf("second result = %+v, want rerank score 0.1 and rank 2", second)
+	}
+	for _, result := range answer.Data.Results {
+		if result.DocumentID == secretID {
+			t.Errorf("bob received Chunk %s of alice's Restricted Document", result.ChunkID)
+		}
+		if _, ok := result.Scores["dense"]; !ok {
+			t.Errorf("result %s scores = %v, want the first stage's dense score kept", result.ChunkID, result.Scores)
+		}
+	}
+
+	// The rerank step comes last, naming the model and the pool it scored.
+	trace := answer.Data.Trace
+	if len(trace) != 3 {
+		t.Fatalf("reranked trace = %+v, want the embed, search and rerank steps", trace)
+	}
+	if step := trace[2]; step.Step != "rerank" || step.Technique != "rerank" || step.Model != rerankModel ||
+		step.Candidates != 2 || step.DurationMS < 0 {
+		t.Errorf("trace[2] = %+v, want the rerank step naming %q and 2 candidates", step, rerankModel)
+	}
+
+	// The rerank provider saw Bob's readable Chunks only, in pool order, and
+	// never the Restricted Document's text.
+	requests := tr.provider.Requests(modeltest.Rerank)
+	if len(requests) != 1 {
+		t.Fatalf("/v1/rerank received %d requests, want one", len(requests))
+	}
+	var rerankBody struct {
+		Query     string   `json:"query"`
+		Documents []string `json:"documents"`
+	}
+	if err := json.Unmarshal(requests[0].Body, &rerankBody); err != nil {
+		t.Fatalf("decode rerank request: %v", err)
+	}
+	if rerankBody.Query != query {
+		t.Errorf("rerank query = %q, want %q", rerankBody.Query, query)
+	}
+	if want := []string{sharedTexts[0], bobTexts[0]}; !slices.Equal(rerankBody.Documents, want) {
+		t.Errorf("reranked texts = %q, want the readable pool %q", rerankBody.Documents, want)
+	}
+	for _, text := range rerankBody.Documents {
+		if strings.Contains(text, "1234") {
+			t.Errorf("the rerank provider received Alice's Restricted Chunk text %q", text)
+		}
 	}
 }

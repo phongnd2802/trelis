@@ -390,7 +390,7 @@ const docTemplate = `{
                         "bearerAuth": []
                     }
                 ],
-                "description": "Runs every Retrieval Technique named in retrieval_config (dense and/or bm25) over the Documents the caller can read. One technique answers in its own order with its own score; several run concurrently over max(top_k, 50) candidates each and are fused with Reciprocal Rank Fusion, score = the sum of 1/(rrf_k + rank) over the lists that carry the Chunk, then cut to top_k with equal fused scores ordered by chunk_id. rrf_k defaults to 60 and must be between 1 and 1000; it has no effect with one technique. Every result carries the score and 1-based rank of each technique whose list carried it. A bm25 request needs no embedding model. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values, an unknown or duplicate technique and an out-of-range rrf_k are 400; a body over 64 KiB is 413; without models.embedding, a dense request (alone or alongside bm25) is 503.",
+                "description": "Runs every candidate Retrieval Technique named in retrieval_config (dense and/or bm25) over the Documents the caller can read. One technique answers in its own order with its own score; several run concurrently over max(top_k, 50) candidates each and are fused with Reciprocal Rank Fusion, score = the sum of 1/(rrf_k + rank) over the lists that carry the Chunk, then cut to top_k with equal fused scores ordered by chunk_id. rrf_k defaults to 60 and must be between 1 and 1000; it has no effect with one technique. Naming rerank adds a second stage: the candidate pool (the single list or the fused list, cut to rerank_candidates) is scored once by the rerank model, ordered by that score with ties by chunk_id, then cut to top_k; rerank cannot run alone. rerank_candidates defaults to 50, must be between 1 and 100 and at least top_k, and has no effect without rerank. Every result carries the score and 1-based rank of each technique whose list carried it, plus the rerank score and rank when it ran. A bm25 request needs no embedding model. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values, an unknown or duplicate technique, rerank on its own and an out-of-range rrf_k or rerank_candidates are 400; a body over 64 KiB is 413; without models.embedding, a dense request is 503, and without models.rerank a request naming rerank is 503.",
                 "consumes": [
                     "application/json"
                 ],
@@ -403,7 +403,7 @@ const docTemplate = `{
                 "summary": "Retrieve Chunks for a query",
                 "parameters": [
                     {
-                        "description": "The query, how many Chunks to return, which Retrieval Techniques to run and the RRF constant",
+                        "description": "The query, how many Chunks to return, which Retrieval Techniques to run, the RRF constant and the rerank candidate pool",
                         "name": "request",
                         "in": "body",
                         "required": true,
@@ -432,7 +432,7 @@ const docTemplate = `{
                         }
                     },
                     "400": {
-                        "description": "Body that is not one JSON object, an unknown field or wrong value type, a blank or too-long query, an out-of-range top_k or an invalid retrieval_config (an unknown or duplicate technique, or an rrf_k outside 1..1000)",
+                        "description": "Body that is not one JSON object, an unknown field or wrong value type, a blank or too-long query, an out-of-range top_k or an invalid retrieval_config (an unknown or duplicate technique, rerank on its own, an rrf_k outside 1..1000, or a rerank_candidates outside 1..100 or below top_k)",
                         "schema": {
                             "$ref": "#/definitions/handler.ErrorResponse"
                         }
@@ -456,7 +456,7 @@ const docTemplate = `{
                         }
                     },
                     "503": {
-                        "description": "models.embedding is not configured, so a request naming dense is unavailable (bm25 alone still works)",
+                        "description": "models.embedding is not configured so dense cannot run, or models.rerank is not configured so rerank cannot run (bm25 alone still works)",
                         "schema": {
                             "$ref": "#/definitions/handler.ErrorResponse"
                         }
@@ -710,12 +710,16 @@ const docTemplate = `{
         "types.RetrievalConfig": {
             "type": "object",
             "properties": {
+                "rerank_candidates": {
+                    "description": "RerankCandidates is how many Chunks the first stage hands to the\nreranker; nil means the default. It is accepted and ignored when the\nlist does not name the rerank technique.",
+                    "type": "integer"
+                },
                 "rrf_k": {
                     "description": "RRFK is the Reciprocal Rank Fusion constant k; nil means the default.\nIt only affects a request that runs more than one technique, so it is\naccepted and ignored for a single one.",
                     "type": "integer"
                 },
                 "techniques": {
-                    "description": "Techniques is the set of Retrieval Techniques to run, without\nduplicates. More than one makes the request a fusion: each runs over\nthe readable Documents and their lists are combined with Reciprocal\nRank Fusion.",
+                    "description": "Techniques is the set of Retrieval Techniques to run, without\nduplicates. More than one candidate technique makes the request a\nfusion: each runs over the readable Documents and their lists are\ncombined with Reciprocal Rank Fusion. Rerank reorders whatever the\ncandidate techniques found.",
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/types.RetrievalTechnique"
@@ -766,11 +770,13 @@ const docTemplate = `{
             "enum": [
                 "dense",
                 "bm25",
+                "rerank",
                 "rrf"
             ],
             "x-enum-varnames": [
                 "RetrievalTechniqueDense",
                 "RetrievalTechniqueBM25",
+                "RetrievalTechniqueRerank",
                 "RetrievalTechniqueRRF"
             ]
         },
@@ -814,7 +820,7 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "candidates": {
-                    "description": "Candidates is how many Chunks the step returned: the search step's own\nmatches, or the distinct Chunks a fuse step combined. It is a pointer so\na step with no candidate count leaves the field out.",
+                    "description": "Candidates is how many Chunks the step returned: the search step's own\nmatches, the distinct Chunks a fuse step combined, or the pool size sent\nto the reranker. It is a pointer so a step with no candidate count\nleaves the field out.",
                     "type": "integer"
                 },
                 "duration_ms": {
@@ -822,7 +828,7 @@ const docTemplate = `{
                     "type": "integer"
                 },
                 "model": {
-                    "description": "Model is the embedding model, on the step that called one.",
+                    "description": "Model is the embedding or rerank model, on the step that called one.",
                     "type": "string"
                 },
                 "step": {

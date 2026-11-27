@@ -2,6 +2,7 @@ package types
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -21,6 +22,10 @@ const (
 	// text at Vietnamese syllable level, plus a diacritics-free copy so a
 	// query typed without diacritics still matches.
 	RetrievalTechniqueBM25 RetrievalTechnique = "bm25"
+	// RetrievalTechniqueRerank reorders the Chunks another technique found
+	// with the rerank model's relevance score. It is a second stage, not a
+	// candidate source, so a request must name at least one other technique.
+	RetrievalTechniqueRerank RetrievalTechnique = "rerank"
 )
 
 // RetrievalTechniqueRRF labels the step that fuses several techniques' lists
@@ -47,6 +52,14 @@ const RetrievalRRFKMax = 1000
 // every list places low can still reach the fused top_k that way.
 const RetrievalFusionCandidates = 50
 
+// RetrievalRerankCandidatesDefault is how many candidates the first stage
+// hands to the reranker when a request leaves rerank_candidates out.
+const RetrievalRerankCandidatesDefault = 50
+
+// RetrievalRerankCandidatesMax is the largest candidate pool a request may
+// ask the reranker to score.
+const RetrievalRerankCandidatesMax = 100
+
 // RetrievalQueryMaxRunes is the longest query a request may carry, in runes.
 // It keeps an arbitrary string out of a paid embedding call.
 const RetrievalQueryMaxRunes = 2000
@@ -54,7 +67,7 @@ const RetrievalQueryMaxRunes = 2000
 // KnownRetrievalTechniques returns the Retrieval Techniques this build
 // implements, in the order an error message names them.
 func KnownRetrievalTechniques() []RetrievalTechnique {
-	return []RetrievalTechnique{RetrievalTechniqueDense, RetrievalTechniqueBM25}
+	return []RetrievalTechnique{RetrievalTechniqueDense, RetrievalTechniqueBM25, RetrievalTechniqueRerank}
 }
 
 // Known reports whether this build implements the technique. A technique a
@@ -78,34 +91,75 @@ func knownTechniqueList() string {
 	return strings.Join(names, ", ")
 }
 
+// knownCandidateTechniqueList names the techniques that find candidates, all
+// but rerank, as the rerank-alone error lists them.
+func knownCandidateTechniqueList() string {
+	names := make([]string, 0, len(KnownRetrievalTechniques()))
+	for _, t := range KnownRetrievalTechniques() {
+		if t == RetrievalTechniqueRerank {
+			continue
+		}
+		names = append(names, fmt.Sprintf("%q", string(t)))
+	}
+	return strings.Join(names, ", ")
+}
+
 // RetrievalConfig is a named combination of Retrieval Techniques switched on
 // together (GLOSSARY.md).
 type RetrievalConfig struct {
 	// Techniques is the set of Retrieval Techniques to run, without
-	// duplicates. More than one makes the request a fusion: each runs over
-	// the readable Documents and their lists are combined with Reciprocal
-	// Rank Fusion.
+	// duplicates. More than one candidate technique makes the request a
+	// fusion: each runs over the readable Documents and their lists are
+	// combined with Reciprocal Rank Fusion. Rerank reorders whatever the
+	// candidate techniques found.
 	Techniques []RetrievalTechnique `json:"techniques"`
 	// RRFK is the Reciprocal Rank Fusion constant k; nil means the default.
 	// It only affects a request that runs more than one technique, so it is
 	// accepted and ignored for a single one.
 	RRFK *int `json:"rrf_k,omitempty"`
+	// RerankCandidates is how many Chunks the first stage hands to the
+	// reranker; nil means the default. It is accepted and ignored when the
+	// list does not name the rerank technique.
+	RerankCandidates *int `json:"rerank_candidates,omitempty"`
+}
+
+// CandidateTechniques returns the techniques that find candidates: every
+// requested technique except rerank, which only reorders them. Validation
+// rejects a config that names rerank alone, so a valid config's result is
+// never empty.
+func (c *RetrievalConfig) CandidateTechniques() []RetrievalTechnique {
+	out := make([]RetrievalTechnique, 0, len(c.Techniques))
+	for _, technique := range c.Techniques {
+		if technique != RetrievalTechniqueRerank {
+			out = append(out, technique)
+		}
+	}
+	return out
+}
+
+// Reranks reports whether the config names the rerank technique.
+func (c *RetrievalConfig) Reranks() bool {
+	return slices.Contains(c.Techniques, RetrievalTechniqueRerank)
 }
 
 // DefaultRetrievalConfig returns the config a request that leaves it out
 // gets: dense alone.
 func DefaultRetrievalConfig() *RetrievalConfig {
 	rrfK := RetrievalRRFKDefault
+	candidates := RetrievalRerankCandidatesDefault
 	return &RetrievalConfig{
-		Techniques: []RetrievalTechnique{RetrievalTechniqueDense},
-		RRFK:       &rrfK,
+		Techniques:       []RetrievalTechnique{RetrievalTechniqueDense},
+		RRFK:             &rrfK,
+		RerankCandidates: &candidates,
 	}
 }
 
 // Validate rejects an empty list, a technique this build does not implement,
-// a technique listed twice and an rrf_k outside 1..RetrievalRRFKMax. It fills
-// an omitted rrf_k with RetrievalRRFKDefault. The messages are fit for the
-// client.
+// a technique listed twice, rerank on its own, an rrf_k outside
+// 1..RetrievalRRFKMax and a rerank_candidates outside
+// 1..RetrievalRerankCandidatesMax. It fills an omitted rrf_k with
+// RetrievalRRFKDefault and an omitted rerank_candidates with
+// RetrievalRerankCandidatesDefault. The messages are fit for the client.
 func (c *RetrievalConfig) Validate() error {
 	if c == nil || len(c.Techniques) == 0 {
 		return fmt.Errorf("retrieval_config.techniques must name at least one technique (known techniques: %s)",
@@ -122,12 +176,24 @@ func (c *RetrievalConfig) Validate() error {
 		}
 		seen[technique] = struct{}{}
 	}
+	if c.Reranks() && len(c.CandidateTechniques()) == 0 {
+		return fmt.Errorf("retrieval technique %q reorders the Chunks another technique finds, so techniques must name at least one candidate technique as well (candidate techniques: %s)",
+			RetrievalTechniqueRerank, knownCandidateTechniqueList())
+	}
 	if c.RRFK == nil {
 		rrfK := RetrievalRRFKDefault
 		c.RRFK = &rrfK
 	}
 	if *c.RRFK < 1 || *c.RRFK > RetrievalRRFKMax {
 		return fmt.Errorf("retrieval_config.rrf_k must be between 1 and %d", RetrievalRRFKMax)
+	}
+	if c.RerankCandidates == nil {
+		candidates := RetrievalRerankCandidatesDefault
+		c.RerankCandidates = &candidates
+	}
+	if *c.RerankCandidates < 1 || *c.RerankCandidates > RetrievalRerankCandidatesMax {
+		return fmt.Errorf("retrieval_config.rerank_candidates must be between 1 and %d",
+			RetrievalRerankCandidatesMax)
 	}
 	return nil
 }
@@ -147,7 +213,9 @@ type RetrievalRequest struct {
 
 // Validate checks the request and fills its defaults: the query is trimmed,
 // an omitted top_k becomes RetrievalTopKDefault, and an omitted
-// retrieval_config becomes dense alone. The error messages are fit for the
+// retrieval_config becomes dense alone. A rerank_candidates smaller than
+// top_k is rejected, since that pool could never fill top_k; it is ignored
+// when the config does not name rerank. The error messages are fit for the
 // client.
 func (r *RetrievalRequest) Validate() error {
 	r.Query = strings.TrimSpace(r.Query)
@@ -167,7 +235,14 @@ func (r *RetrievalRequest) Validate() error {
 	if r.RetrievalConfig == nil {
 		r.RetrievalConfig = DefaultRetrievalConfig()
 	}
-	return r.RetrievalConfig.Validate()
+	if err := r.RetrievalConfig.Validate(); err != nil {
+		return err
+	}
+	if r.RetrievalConfig.Reranks() && *r.RetrievalConfig.RerankCandidates < *r.TopK {
+		return fmt.Errorf("retrieval_config.rerank_candidates must be at least top_k (%d), got %d",
+			*r.TopK, *r.RetrievalConfig.RerankCandidates)
+	}
+	return nil
 }
 
 // ChunkMatch is one Chunk a Retrieval Technique found, with the score that
@@ -200,6 +275,8 @@ const (
 	// TraceStepFuse combines the techniques' ranked lists with Reciprocal
 	// Rank Fusion.
 	TraceStepFuse = "fuse"
+	// TraceStepRerank reorders the candidate pool with the rerank model.
+	TraceStepRerank = "rerank"
 )
 
 // TraceStep is one step of a retrieval run, timed so a caller can see where
@@ -212,11 +289,12 @@ type TraceStep struct {
 	Technique RetrievalTechnique `json:"technique,omitempty"`
 	// DurationMS is how long the step took, in milliseconds.
 	DurationMS int64 `json:"duration_ms"`
-	// Model is the embedding model, on the step that called one.
+	// Model is the embedding or rerank model, on the step that called one.
 	Model string `json:"model,omitempty"`
 	// Candidates is how many Chunks the step returned: the search step's own
-	// matches, or the distinct Chunks a fuse step combined. It is a pointer so
-	// a step with no candidate count leaves the field out.
+	// matches, the distinct Chunks a fuse step combined, or the pool size sent
+	// to the reranker. It is a pointer so a step with no candidate count
+	// leaves the field out.
 	Candidates *int `json:"candidates,omitempty"`
 }
 

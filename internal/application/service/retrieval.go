@@ -32,19 +32,25 @@ type retrievalService struct {
 	// dense retrieval unavailable rather than silently returning nothing. BM25
 	// needs no embedding model.
 	embedder interfaces.Embedder
-	// runners maps every Retrieval Technique this build implements to the
-	// function that runs it. It is built once, so no request has to map names
-	// to implementations again.
+	// reranker is nil when models.rerank is not configured, which makes a
+	// request naming rerank unavailable rather than silently skipping it.
+	reranker interfaces.Reranker
+	// runners maps every candidate Retrieval Technique this build implements
+	// to the function that runs it. It is built once, so no request has to map
+	// names to implementations again. Rerank has no runner: it reorders the
+	// candidates the others found.
 	runners map[types.RetrievalTechnique]techniqueRunner
 }
 
 // NewRetrievalService returns the retrieval use case. embedder may be nil
 // when no embedding model is configured; dense retrieval then answers a
-// service-unavailable error, while BM25 still runs.
+// service-unavailable error, while BM25 still runs. reranker may be nil when
+// no rerank model is configured; a request naming rerank then answers a
+// service-unavailable error.
 func NewRetrievalService(documents interfaces.DocumentRepository, chunks interfaces.ChunkSearcher,
-	embedder interfaces.Embedder,
+	embedder interfaces.Embedder, reranker interfaces.Reranker,
 ) interfaces.RetrievalService {
-	s := &retrievalService{documents: documents, chunks: chunks, embedder: embedder}
+	s := &retrievalService{documents: documents, chunks: chunks, embedder: embedder, reranker: reranker}
 	s.runners = map[types.RetrievalTechnique]techniqueRunner{
 		types.RetrievalTechniqueDense: s.runDense,
 		types.RetrievalTechniqueBM25:  s.runBM25,
@@ -53,9 +59,11 @@ func NewRetrievalService(documents interfaces.DocumentRepository, chunks interfa
 }
 
 // Retrieve validates req, resolves the caller's readable Documents and runs
-// every Retrieval Technique req names over them. One technique answers with
-// its own score and rank; several run concurrently and their ranks are fused
-// with Reciprocal Rank Fusion, then cut to top_k. Reads only, so no
+// every candidate Retrieval Technique req names over them. One technique
+// answers with its own score and rank; several run concurrently and their
+// ranks are fused with Reciprocal Rank Fusion. When the config also names
+// rerank, the candidate pool (fused when there are several) is reordered by
+// the rerank model before the answer is cut to top_k. Reads only, so no
 // transaction is needed: the readable set is resolved on every request, never
 // cached. A Principal who can read nothing still gets the trace of the steps
 // that ran, with empty results, so the answer has the same shape as one that
@@ -73,10 +81,16 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 		return nil, apperrors.NewServiceUnavailableError(
 			"dense retrieval needs models.embedding to be configured")
 	}
+	candidateTechniques := req.RetrievalConfig.CandidateTechniques()
+	rerankOn := req.RetrievalConfig.Reranks()
+	if rerankOn && s.reranker == nil {
+		return nil, apperrors.NewServiceUnavailableError(
+			"rerank needs models.rerank to be configured")
+	}
 	// Non-nil slices keep an empty answer as "results": [] rather than null.
 	result := &types.RetrievalResult{
 		Results: []types.RetrievedChunk{},
-		Trace:   make([]types.TraceStep, 0, len(techniques)*2+1),
+		Trace:   make([]types.TraceStep, 0, len(candidateTechniques)*2+2),
 	}
 
 	documentIDs, err := s.documents.ListReadableDocumentIDs(ctx, principal.ID)
@@ -85,12 +99,18 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 	}
 	// One technique fetches exactly top_k, as it always has. Fusion needs a
 	// deeper pool per list so a Chunk that every list places low can still
-	// reach the fused top_k.
+	// reach the fused top_k. Rerank needs a pool of its own size to score
+	// before the cut to top_k.
+	poolSize := *req.TopK
 	depth := *req.TopK
-	if len(techniques) > 1 {
+	if len(candidateTechniques) > 1 {
 		depth = max(depth, types.RetrievalFusionCandidates)
 	}
-	runs, err := s.runTechniques(ctx, techniques, documentIDs, req.Query, depth)
+	if rerankOn {
+		poolSize = *req.RetrievalConfig.RerankCandidates
+		depth = max(depth, poolSize)
+	}
+	runs, err := s.runTechniques(ctx, candidateTechniques, documentIDs, req.Query, depth)
 	if err != nil {
 		return nil, err
 	}
@@ -102,20 +122,35 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 		result.Trace = append(result.Trace, run.steps...)
 		lists[run.technique] = run.matches
 	}
+
+	var pool []fusedChunk
 	if len(runs) == 1 {
-		result.Results = retrievedChunks(singleTechniqueChunks(runs[0].technique, runs[0].matches))
+		pool = singleTechniqueChunks(runs[0].technique, runs[0].matches)
+		if rerankOn && len(pool) > poolSize {
+			pool = pool[:poolSize]
+		}
+	} else {
+		start := time.Now()
+		var distinct int
+		pool, distinct = fuseRRF(lists, *req.RetrievalConfig.RRFK, poolSize)
+		result.Trace = append(result.Trace, types.TraceStep{
+			Step:       types.TraceStepFuse,
+			Technique:  types.RetrievalTechniqueRRF,
+			DurationMS: time.Since(start).Milliseconds(),
+			Candidates: &distinct,
+		})
+	}
+	if !rerankOn {
+		result.Results = retrievedChunks(pool)
 		return result, nil
 	}
 
-	start := time.Now()
-	fused, distinct := fuseRRF(lists, *req.RetrievalConfig.RRFK, *req.TopK)
-	result.Trace = append(result.Trace, types.TraceStep{
-		Step:       types.TraceStepFuse,
-		Technique:  types.RetrievalTechniqueRRF,
-		DurationMS: time.Since(start).Milliseconds(),
-		Candidates: &distinct,
-	})
-	result.Results = retrievedChunks(fused)
+	reranked, step, err := s.rerank(ctx, req.Query, pool, *req.TopK)
+	if err != nil {
+		return nil, err
+	}
+	result.Trace = append(result.Trace, step)
+	result.Results = retrievedChunks(reranked)
 	return result, nil
 }
 
@@ -261,6 +296,57 @@ func retrievedChunks(chunks []fusedChunk) []types.RetrievedChunk {
 		})
 	}
 	return out
+}
+
+// rerank orders the candidate pool by the rerank model's score, adds that
+// score and rank beside the first stage's, cuts the pool to topK and returns
+// the step that recorded the call. Ties order by Chunk ID, the same way the
+// other stages break them. An empty pool makes no model call but still records
+// the step, so the answer keeps its shape.
+func (s *retrievalService) rerank(ctx context.Context, query string, pool []fusedChunk,
+	topK int,
+) ([]fusedChunk, types.TraceStep, error) {
+	poolSize := len(pool)
+	step := types.TraceStep{
+		Step:       types.TraceStepRerank,
+		Technique:  types.RetrievalTechniqueRerank,
+		Candidates: &poolSize,
+	}
+	if poolSize == 0 {
+		return pool, step, nil
+	}
+	texts := make([]string, poolSize)
+	for i, entry := range pool {
+		texts[i] = chunkText(entry.chunk)
+	}
+	model := s.reranker.GetModelName()
+	start := time.Now()
+	scores, err := s.reranker.Rerank(ctx, query, texts)
+	step.DurationMS = time.Since(start).Milliseconds()
+	step.Model = model
+	if err != nil {
+		return nil, types.TraceStep{}, fmt.Errorf("rerank candidates: %w", err)
+	}
+	if len(scores) != poolSize {
+		return nil, types.TraceStep{}, fmt.Errorf("rerank model returned %d scores for %d candidates", len(scores), poolSize)
+	}
+	for i := range pool {
+		pool[i].score = scores[i]
+		pool[i].scores[types.RetrievalTechniqueRerank] = scores[i]
+	}
+	slices.SortFunc(pool, func(a, b fusedChunk) int {
+		if c := cmp.Compare(b.score, a.score); c != 0 {
+			return c
+		}
+		return bytes.Compare(a.chunk.ID[:], b.chunk.ID[:])
+	})
+	if len(pool) > topK {
+		pool = pool[:topK]
+	}
+	for i := range pool {
+		pool[i].ranks[types.RetrievalTechniqueRerank] = i + 1
+	}
+	return pool, step, nil
 }
 
 // fuseRRF combines technique lists with Reciprocal Rank Fusion: a Chunk's
