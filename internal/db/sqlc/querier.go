@@ -57,6 +57,12 @@ type Querier interface {
 	// #143: the generic plan re-parsed the repeated query-vector ::text::vector
 	// cast for every Chunk; query_vec casts it once. The readable-ID filter stays
 	// in the scan so the Access List limits the work.
+	//
+	// #139: the distance is guarded by CASE because a plan may evaluate it before
+	// the model filter, and a Chunk of another model may have another dimension.
+	// The model filter stays in the scan too, so it narrows the rows before any
+	// scoring. A NULL score (another model or no embedding) or a NaN score (a
+	// zero-norm vector) can never be a match; NaN would also break JSON encoding.
 	SearchDenseChunks(ctx context.Context, arg SearchDenseChunksParams) ([]SearchDenseChunksRow, error)
 	// The vector goes in as its text form and is cast here, which is also what
 	// keeps sqlc from having to map the vector type. execrows lets the caller

@@ -45,6 +45,21 @@ func documentGranted(t *testing.T, s db.Store, ownerID uuid.UUID, grants types.A
 	return doc
 }
 
+// singleConnPool returns a migrated test database on a one-connection pool, so
+// a prepared statement and the pg_prepared_statements lookup share a session.
+func singleConnPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	pool := dbtest.Migrated(t)
+	cfg := pool.Config()
+	cfg.MaxConns = 1
+	single, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("single-connection pool: %v", err)
+	}
+	t.Cleanup(single.Close)
+	return single
+}
+
 func TestReplaceChunksLeavesTheSameSetOnEveryRun(t *testing.T) {
 	s, ids := seeded(t)
 	ctx := context.Background()
@@ -296,25 +311,10 @@ func TestSearchDenseSkipsNaNScoresFromZeroVectors(t *testing.T) {
 	}
 }
 
-// TestSearchDenseCastsTheQueryVectorOnceUnderAGenericPlan pins the #143
-// mechanism: a generic plan for the old query cast the text query vector once
-// for every Chunk it scanned. The control asserts the old shape still has
-// that per-Chunk cast; the repository query must cast the vector only once.
-func TestSearchDenseCastsTheQueryVectorOnceUnderAGenericPlan(t *testing.T) {
-	ctx := context.Background()
-	pool := dbtest.Migrated(t)
-
-	// One connection keeps the SearchDense prepared statement and the
-	// pg_prepared_statements lookup on the same session.
-	cfg := pool.Config()
-	cfg.MaxConns = 1
-	single, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		t.Fatalf("single-connection pool: %v", err)
-	}
-	t.Cleanup(single.Close)
-
-	const oldQuery = `SELECT id, document_id, seq, content, context_header,
+// preFixSearchQuery is the pre-#143 dense search: it parses the text query
+// vector once for every Chunk. The #143 test explains it as a control; the
+// #139 test runs it to force the bad qual order.
+const preFixSearchQuery = `SELECT id, document_id, seq, content, context_header,
        (1 - (embedding <=> $1::text::vector))::float8 AS score
 FROM chunks
 WHERE document_id = ANY($2::uuid[])
@@ -323,7 +323,119 @@ WHERE document_id = ANY($2::uuid[])
   AND (embedding <=> $1::text::vector) <> 'NaN'::float8
 ORDER BY embedding <=> $1::text::vector, id
 LIMIT $4`
-	oldPlan := explainGeneric(t, ctx, single, oldQuery)
+
+// TestSearchDenseSkipsChunksOfAnotherModelAtAnotherDimension pins #139: a
+// Chunk embedded by another model, at another dimension, must not make the
+// search error whichever qual the planner evaluates first. The distance is
+// guarded by a CASE, so it is only computed for Chunks of the searched model.
+func TestSearchDenseSkipsChunksOfAnotherModelAtAnotherDimension(t *testing.T) {
+	ctx := context.Background()
+	single := singleConnPool(t)
+
+	s := db.NewStore(single)
+	owner, err := s.Querier(ctx).CreatePrincipal(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := document(t, s, owner.ID)
+	chunks := NewChunkRepository(s)
+	searcher := NewChunkSearcher(s)
+
+	seed := []struct {
+		content string
+		vector  []float32
+		model   string
+	}{
+		{"first", []float32{1, 0, 0}, "test-embedding"},
+		{"another model", []float32{1, 0, 0, 0}, "other-embedding"},
+		{"second", []float32{0, 1, 0}, "test-embedding"},
+	}
+	input := make([]*types.Chunk, len(seed))
+	offset := 0
+	for i, row := range seed {
+		input[i] = &types.Chunk{
+			Seq:         i,
+			Content:     row.content,
+			StartOffset: offset,
+			EndOffset:   offset + len(row.content),
+		}
+		offset += len(row.content)
+	}
+	if err := s.ExecTx(ctx, func(ctx context.Context) error {
+		return chunks.ReplaceChunks(ctx, doc.ID, input)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := chunks.ListUnembeddedChunks(ctx, doc.ID, 0, len(seed))
+	if err != nil || len(stored) != len(seed) {
+		t.Fatalf("ListUnembeddedChunks = %+v, %v; want %d Chunks", stored, err, len(seed))
+	}
+	for i, c := range stored {
+		if err := chunks.SetChunkEmbedding(ctx, c.ID, seed[i].vector, seed[i].model); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Make the whole distance comparison cheaper than the model comparison,
+	// so the planner evaluates it first. The control below then proves the
+	// order with an unguarded query; the repository query must stay safe.
+	for _, stmt := range []string{
+		`ALTER FUNCTION public.cosine_distance(vector, vector) COST 0.0001`,
+		`ALTER FUNCTION pg_catalog.float8ne(float8, float8) COST 0.0001`,
+	} {
+		if _, err := single.Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+
+	// The pre-#143 shape keeps the distance in the scan filter next to the
+	// model check. Under the forced order it computes the 3-dim query
+	// distance on the 4-dim Chunk and errors.
+	rows, err := single.Query(ctx, preFixSearchQuery, "[1,0,0]", []uuid.UUID{doc.ID}, "test-embedding", 10)
+	if err == nil {
+		for rows.Next() {
+		}
+		err = rows.Err()
+		rows.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "different vector dimensions") {
+		t.Fatalf("the unguarded control query = %v, want a dimension error; the forced qual order no longer holds", err)
+	}
+
+	got, err := searcher.SearchDense(ctx, []uuid.UUID{doc.ID}, []float32{1, 0, 0}, "test-embedding", 10)
+	if err != nil {
+		t.Fatalf("SearchDense: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("SearchDense returned %d matches, want only the 2 Chunks of the searched model", len(got))
+	}
+	if got[0].Chunk.ID != stored[0].ID || got[1].Chunk.ID != stored[2].ID {
+		t.Errorf("SearchDense returned seq %d then %d, want seq 0 then seq 2",
+			got[0].Chunk.Seq, got[1].Chunk.Seq)
+	}
+	if math.Abs(got[0].Score-1) > 1e-5 || math.Abs(got[1].Score) > 1e-5 {
+		t.Errorf("scores = %v, %v; want 1 then 0", got[0].Score, got[1].Score)
+	}
+
+	// #143's materialized query_vec makes the distance a join filter, after
+	// the scan's model filter, so the old query happens to pass above. The
+	// plan must still guard every distance by the model: another plan shape
+	// may evaluate it in the scan filter, as the control just did.
+	plan := explainGeneric(t, ctx, single, preparedStatementText(t, ctx, single, "SearchDenseChunks"))
+	if expr := unguardedDistance(plan); expr != "" {
+		t.Errorf("SearchDenseChunks computes a distance without checking the Chunk's model first: %s; #139", expr)
+	}
+}
+
+// TestSearchDenseCastsTheQueryVectorOnceUnderAGenericPlan pins the #143
+// mechanism: a generic plan for the old query cast the text query vector once
+// for every Chunk it scanned. The control asserts the old shape still has
+// that per-Chunk cast; the repository query must cast the vector only once.
+func TestSearchDenseCastsTheQueryVectorOnceUnderAGenericPlan(t *testing.T) {
+	ctx := context.Background()
+	single := singleConnPool(t)
+
+	oldPlan := explainGeneric(t, ctx, single, preFixSearchQuery)
 	if !hasPerChunkCast(oldPlan) {
 		t.Fatalf("the pre-#143 query no longer casts its query vector per Chunk over chunks (%s); the old plan shape changed (for example after a Postgres upgrade), so re-check that this test still proves #143", planString(oldPlan))
 	}
@@ -350,6 +462,10 @@ type planNode struct {
 }
 
 var vectorCast = regexp.MustCompile(`\(\$\d+\)::vector`)
+
+// guardedDistance matches a cosine distance in the THEN branch of a CASE that
+// checks the Chunk's model, as EXPLAIN prints it.
+var guardedDistance = regexp.MustCompile(`CASE WHEN \(chunks\.embedding_model = [^)]*\) THEN \(chunks\.embedding <=> `)
 
 // explainGeneric plans query as a generic plan, without arguments or
 // execution. Postgres 16+ supports GENERIC_PLAN.
@@ -412,6 +528,25 @@ func hasPerChunkCast(node planNode) bool {
 		}
 	}
 	return false
+}
+
+// unguardedDistance returns the first plan expression with a cosine distance
+// outside the THEN branch of a CASE that checks the Chunk's model, or "" when
+// every distance is guarded. That guard is what keeps a plan that evaluates
+// the distance before the model filter safe (#139).
+func unguardedDistance(node planNode) string {
+	for _, expr := range node.expressions() {
+		if distances := strings.Count(expr, "<=>"); distances > 0 &&
+			len(guardedDistance.FindAllString(expr, -1)) != distances {
+			return expr
+		}
+	}
+	for _, child := range node.Plans {
+		if expr := unguardedDistance(child); expr != "" {
+			return expr
+		}
+	}
+	return ""
 }
 
 // overChunks reports whether node or a descendant scans chunks.
