@@ -78,7 +78,7 @@ func (f *fixedEmbedder) GetModelName() string { return f.model }
 func newRetrieveRouter(retrieval interfaces.RetrievalService) http.Handler {
 	me := handler.NewPrincipalHandler(service.NewPrincipalService(nil, nil, nil))
 	return New(Readiness{}, keyring{"trelis_alice": alice}, me, nil,
-		handler.NewRetrievalHandler(retrieval), false)
+		handler.NewRetrievalHandler(retrieval), nil, nil, false)
 }
 
 // postJSON sends body as the named bearer token (none when empty).
@@ -449,7 +449,7 @@ func TestAnotherPrincipalNeverReceivesAChunkAtTheRouterSeam(t *testing.T) {
 	)
 	me := handler.NewPrincipalHandler(service.NewPrincipalService(nil, nil, nil))
 	h := New(Readiness{}, keyring{"trelis_alice": alice, "trelis_bob": bob}, me, nil,
-		handler.NewRetrievalHandler(svc), false)
+		handler.NewRetrievalHandler(svc), nil, nil, false)
 
 	bobRec := postJSON(t, h, "/retrieve", `{"query":"who won?"}`, "Bearer trelis_bob")
 	if bobRec.Code != http.StatusOK {

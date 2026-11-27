@@ -56,7 +56,7 @@ func TestSwaggerIsHiddenBehindTheKeyWhenDisabled(t *testing.T) {
 // undocumented route and a stale spec entry both fail.
 func TestTheSpecDocumentsEveryRoute(t *testing.T) {
 	// nil handlers are fine: New takes their method values, it never calls them.
-	routes := New(Readiness{}, keyring{}, nil, nil, nil, false)
+	routes := New(Readiness{}, keyring{}, nil, nil, nil, nil, nil, false)
 	var served []string
 	err := chi.Walk(routes.(chi.Routes), func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
 		if strings.HasPrefix(route, "/swagger/") {

@@ -26,6 +26,11 @@ type Querier interface {
 	GetGroupByName(ctx context.Context, name string) (GetGroupByNameRow, error)
 	GetPrincipalByKeyHash(ctx context.Context, keyHash []byte) (GetPrincipalByKeyHashRow, error)
 	GetPrincipalByName(ctx context.Context, name string) (GetPrincipalByNameRow, error)
+	// One Chunk by ID, only when the caller can read its Document. A Chunk of a
+	// Document the caller cannot read, and one that does not exist, answer the
+	// same no-row result, so the caller cannot tell them apart (ADR-0004). The
+	// embedding is left out: no read path serves it.
+	GetReadableChunk(ctx context.Context, arg GetReadableChunkParams) (GetReadableChunkRow, error)
 	// No row when the Document does not exist or the Principal cannot read it,
 	// so callers cannot tell the two apart.
 	GetReadableDocument(ctx context.Context, arg GetReadableDocumentParams) (Document, error)

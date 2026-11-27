@@ -52,7 +52,7 @@ func newRouter(authn interfaces.AuthService) http.Handler {
 // newRouterWith is the router on authn, with Swagger mounted when swagger is true.
 func newRouterWith(authn interfaces.AuthService, swagger bool) http.Handler {
 	me := handler.NewPrincipalHandler(service.NewPrincipalService(nil, nil, nil))
-	return New(Readiness{}, authn, me, nil, nil, swagger)
+	return New(Readiness{}, authn, me, nil, nil, nil, nil, swagger)
 }
 
 func get(t *testing.T, h http.Handler, path, authorization string) *httptest.ResponseRecorder {

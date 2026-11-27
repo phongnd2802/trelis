@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -13,6 +14,10 @@ import (
 	"github.com/phongnd2802/trelis/internal/types"
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
+
+// ErrChunkNotFound means no Chunk matched, or the Principal asking cannot
+// read its Document.
+var ErrChunkNotFound = errors.New("chunk not found")
 
 type chunkRepository struct {
 	store db.Store
@@ -27,6 +32,34 @@ func NewChunkRepository(store db.Store) interfaces.ChunkRepository {
 // and BM25 searches the retrieval service runs.
 func NewChunkSearcher(store db.Store) interfaces.ChunkSearcher {
 	return &chunkRepository{store: store}
+}
+
+// NewChunkReader returns the Chunk repository's read-by-ID side.
+func NewChunkReader(store db.Store) interfaces.ChunkReader {
+	return &chunkRepository{store: store}
+}
+
+// GetReadableChunk returns the Chunk when principalID can read its Document.
+// The readable check is part of the query, so a Chunk of a Restricted
+// Document and an unknown ID are the same ErrChunkNotFound (ADR-0004).
+func (r *chunkRepository) GetReadableChunk(ctx context.Context, principalID, id uuid.UUID) (*types.Chunk, error) {
+	row, err := r.store.Querier(ctx).GetReadableChunk(ctx, sqlc.GetReadableChunkParams{ID: id, PrincipalID: principalID})
+	if errors.Is(err, db.ErrNotFound) {
+		return nil, ErrChunkNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("chunk %s: %w", id, err)
+	}
+	return &types.Chunk{
+		ID:            row.ID,
+		DocumentID:    row.DocumentID,
+		Seq:           int(row.Seq),
+		Content:       row.Content,
+		ContextHeader: row.ContextHeader,
+		StartOffset:   int(row.StartOffset),
+		EndOffset:     int(row.EndOffset),
+		CreatedAt:     row.CreatedAt,
+	}, nil
 }
 
 // ReplaceChunks deletes a Document's Chunks and inserts chunks in order. It
