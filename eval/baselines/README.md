@@ -52,3 +52,47 @@ How it was produced (2026-11-27, Trelis `6beccaa`, harness 0.1.0):
   Postgres generic plan that re-parsed the query vector once per Chunk;
   #143 has the plan and timing numbers. Compare runs only at the same
   concurrency and provider.
+
+## `bm25-strat500-seed1.jsonl` and `bm25+dense-strat500-seed1.jsonl`
+
+The BM25 row (#33) and the hybrid row, BM25 and dense fused with Reciprocal
+Rank Fusion at `rrf_k` 60 (#34). Both come from one command that also re-ran
+dense, so the three rows below share one Trelis, one corpus and one Golden
+Set.
+
+| Config | Recall@5 | Recall@10 | MRR | nDCG@10 | Latency p50 / p95 |
+|---|---|---|---|---|---|
+| `bm25` | 0.621 | 0.744 | 0.780 | 0.659 | 21 ms / 29 ms |
+| `dense` (same command, not kept) | 0.629 | 0.781 | 0.796 | 0.679 | 2.1 s / 6.1 s |
+| `bm25+dense` | 0.666 | 0.811 | 0.828 | 0.714 | 244 ms / 259 ms |
+
+n = 441 scored for each, with the 59 `null_query` questions skipped and 0
+errors. These are point estimates; confidence intervals come with #40.
+
+The re-run dense row matches `dense-strat500-seed1.jsonl` to within 0.002 on
+every metric, which is why that file stays the dense reference.
+
+How they were produced (2026-11-27, Trelis `d4b4c0b`, harness 0.1.0):
+
+- **Corpus, Golden Set and embedding:** the same as the dense baseline above,
+  on the same Trelis instance and the same 16,920 Chunks. BM25 indexes them
+  with pg_search 0.27.1 (ADR-0009).
+- **Command:**
+
+  ```sh
+  uv run --project eval trelis-eval retrieval run \
+    --golden eval/data/multihop-rag/strat500-golden.jsonl \
+    --manifest eval/data/multihop-rag/strat500-manifest.jsonl \
+    --config bm25 --config dense --config bm25+dense --concurrency 4
+  ```
+
+- **Model calls:** the embedding role went through `trelis-eval proxy --mode
+  record` (#41). The `dense` config ran first and recorded each query's
+  embedding at the provider. `bm25+dense` then replayed them, so its
+  `dense/embed_query` step is about 2 ms.
+- **Latency:** with the cost of one embedding call removed, the hybrid row's
+  latency is mostly the dense search (p50 230 ms) plus BM25 (p50 13 ms); the
+  two run concurrently. The re-run dense row's latency is the hosted
+  embedding call (p50 1.9 s); its search step is p50 209 ms, against 21 s in
+  the dense baseline before #143. Compare latency only between runs that
+  made, or replayed, the same model calls.
