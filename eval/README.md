@@ -159,6 +159,10 @@ slow hosted provider sets the pace. `--request-timeout` (default 120 s) keeps a
 slow answer from becoming a question error, and `--concurrency N` (default 1,
 at most 32) keeps N questions in flight to cut the wall-clock time. The header
 records the concurrency because latency is measured under it.
+`--max-consecutive-errors N` (default 10; 0 disables) aborts a config once N
+questions in a row answer as errors, so a provider refusing every call stops
+the run instead of filling a results file. A skipped question neither resets
+nor advances the streak; a scored one resets it.
 
 Under each summary line, `steps:` gives the p50/p95 of every `/retrieve` trace
 step (for example `dense/embed_query` and `dense/search`), so a slow run shows
@@ -175,10 +179,11 @@ run id must be one that has not run yet.
 `recall@5`, `recall@10`, `mrr` and `ndcg@10` are Document-level, and the JSONL
 schema is documented in [docs/metrics.md](docs/metrics.md). `eval/runs/` is
 gitignored. The command exits 1 when a config aborted or scored no questions. A
-400 or 503 aborts that config at once (no file is written) and the command
-continues with the next one; any other request error is recorded on the
-question and excluded from the means, not scored as zero. Errors alone do not
-change the exit code.
+400 or 503 aborts that config at once (no file is written), as does reaching
+`--max-consecutive-errors` question errors in a row, and the command continues
+with the next one; any other request error, including a 502 from a model
+provider that rejected the call, is recorded on the question and excluded from
+the means, not scored as zero. Errors alone do not change the exit code.
 
 ## Build the Ablation Matrix report
 

@@ -12,6 +12,7 @@ package chat
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/phongnd2802/trelis/internal/config"
@@ -19,6 +20,7 @@ import (
 	"github.com/phongnd2802/trelis/internal/models/api"
 	"github.com/phongnd2802/trelis/internal/models/api/openaicompletions"
 	"github.com/phongnd2802/trelis/internal/models/api/openairesponses"
+	"github.com/phongnd2802/trelis/internal/models/providererror"
 	"github.com/phongnd2802/trelis/internal/types"
 )
 
@@ -74,13 +76,18 @@ func NewChat(roleKey string, role config.ChatRole) (Chat, error) {
 	default:
 		return nil, fmt.Errorf("unsupported chat api %q for model %s", role.Protocol, role.Model)
 	}
-	return &loggingChat{roleKey: roleKey, protocol: role.Protocol, inner: inner}, nil
+	return &loggingChat{roleKey: roleKey, role: strings.TrimPrefix(roleKey, "models."),
+		protocol: role.Protocol, inner: inner}, nil
 }
 
 // loggingChat is a role's client with the one model-call line around each
 // logical call. A chat send is not retried by the clients, so attempts is 1.
 type loggingChat struct {
-	roleKey  string
+	// roleKey is the role's config key, as the model-call line names it.
+	roleKey string
+	// role names the role in a client-facing error: the key without its
+	// "models." prefix, so "models.chat" reads as "chat".
+	role     string
 	protocol api.API
 	inner    Chat
 }
@@ -111,7 +118,10 @@ func (c *loggingChat) Chat(ctx context.Context, messages []Message, opts *ChatOp
 		call.OutputTokens = resp.Usage.CompletionTokens
 	}
 	logger.LogModelCall(ctx, call)
-	return resp, err
+	if err != nil {
+		return nil, providererror.Wrap(c.role, err)
+	}
+	return resp, nil
 }
 
 func (c *loggingChat) ChatStream(ctx context.Context, messages []Message, opts *ChatOptions) (<-chan types.StreamResponse, error) {
@@ -119,7 +129,7 @@ func (c *loggingChat) ChatStream(ctx context.Context, messages []Message, opts *
 	inner, err := c.inner.ChatStream(ctx, messages, opts)
 	if err != nil {
 		logger.LogModelCall(ctx, c.call(start, true, api.HTTPStatusCode(err)))
-		return nil, err
+		return nil, providererror.Wrap(c.role, err)
 	}
 
 	out := make(chan types.StreamResponse)

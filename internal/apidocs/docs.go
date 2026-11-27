@@ -22,7 +22,7 @@ const docTemplate = `{
                         "bearerAuth": []
                     }
                 ],
-                "description": "Retrieves the Documents the caller can read, then asks models.chat for one answer that cites the retrieved Chunks. Sources are numbered [1]..[n] in retrieval order; each claim is cited with its source numbers in square brackets, the answer text keeps the valid markers, and citations lists each cited source once in order of first appearance. A marker outside 1..n is removed from the text and never cited; a marker inside Markdown code or a Markdown link is left untouched and never cited. When retrieval finds nothing the answer is a fixed sentence in the question's language and no chat call is made. debug adds the retrieved Chunks (exactly as POST /retrieve answers them), the trace with a final generate step, and the chat call's token usage. Malformed JSON, unknown fields, invalid values and the retrieval rules are 400; a body over 64 KiB is 413; without models.chat the route answers 503 before any retrieval, and retrieval's own 503 (models.embedding for dense, models.rerank for rerank) passes through; a chat failure is a generic 500.",
+                "description": "Retrieves the Documents the caller can read, then asks models.chat for one answer that cites the retrieved Chunks. Sources are numbered [1]..[n] in retrieval order; each claim is cited with its source numbers in square brackets, the answer text keeps the valid markers, and citations lists each cited source once in order of first appearance. A marker outside 1..n is removed from the text and never cited; a marker inside Markdown code or a Markdown link is left untouched and never cited. When retrieval finds nothing the answer is a fixed sentence in the question's language and no chat call is made. debug adds the retrieved Chunks (exactly as POST /retrieve answers them), the trace with a final generate step, and the chat call's token usage. Malformed JSON, unknown fields, invalid values and the retrieval rules are 400; a body over 64 KiB is 413; without models.chat the route answers 503 before any retrieval, and retrieval's own 503 (models.embedding for dense, models.rerank for rerank) passes through; a model provider's rejection of a retrieval or chat call (its credentials, credit, permission or rate limit) is 502 and names the model role in its message, and any other model failure is a generic 500.",
                 "consumes": [
                     "application/json"
                 ],
@@ -83,6 +83,12 @@ const docTemplate = `{
                     },
                     "500": {
                         "description": "Internal server error; a failed API key check answers the router's error body instead",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "502": {
+                        "description": "A model provider rejected the call because of its credentials, credit, permission or rate limit (an embedding, rerank or chat status 401, 402, 403 or 429); the message names the model role, never the provider's body",
                         "schema": {
                             "$ref": "#/definitions/handler.ErrorResponse"
                         }
@@ -542,7 +548,7 @@ const docTemplate = `{
                         "bearerAuth": []
                     }
                 ],
-                "description": "Runs every candidate Retrieval Technique named in retrieval_config (dense and/or bm25) over the Documents the caller can read. One technique answers in its own order with its own score; several run concurrently over max(top_k, 50) candidates each and are fused with Reciprocal Rank Fusion, score = the sum of 1/(rrf_k + rank) over the lists that carry the Chunk, then cut to top_k with equal fused scores ordered by chunk_id. rrf_k defaults to 60 and must be between 1 and 1000; it has no effect with one technique. Naming rerank adds a second stage: the candidate pool (the single list or the fused list, cut to rerank_candidates) is scored once by the rerank model, ordered by that score with ties by chunk_id, then cut to top_k; rerank cannot run alone. rerank_candidates defaults to 50, must be between 1 and 100 and at least top_k, and has no effect without rerank. Every result carries the score and 1-based rank of each technique whose list carried it, plus the rerank score and rank when it ran. A bm25 request needs no embedding model. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values, an unknown or duplicate technique, rerank on its own and an out-of-range rrf_k or rerank_candidates are 400; a body over 64 KiB is 413; without models.embedding, a dense request is 503, and without models.rerank a request naming rerank is 503.",
+                "description": "Runs every candidate Retrieval Technique named in retrieval_config (dense and/or bm25) over the Documents the caller can read. One technique answers in its own order with its own score; several run concurrently over max(top_k, 50) candidates each and are fused with Reciprocal Rank Fusion, score = the sum of 1/(rrf_k + rank) over the lists that carry the Chunk, then cut to top_k with equal fused scores ordered by chunk_id. rrf_k defaults to 60 and must be between 1 and 1000; it has no effect with one technique. Naming rerank adds a second stage: the candidate pool (the single list or the fused list, cut to rerank_candidates) is scored once by the rerank model, ordered by that score with ties by chunk_id, then cut to top_k; rerank cannot run alone. rerank_candidates defaults to 50, must be between 1 and 100 and at least top_k, and has no effect without rerank. Every result carries the score and 1-based rank of each technique whose list carried it, plus the rerank score and rank when it ran. A bm25 request needs no embedding model. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values, an unknown or duplicate technique, rerank on its own and an out-of-range rrf_k or rerank_candidates are 400; a body over 64 KiB is 413; without models.embedding, a dense request is 503, and without models.rerank a request naming rerank is 503. A model provider's rejection of the call (its credentials, credit, permission or rate limit) is 502 and names the model role in its message; any other model failure is a generic 500.",
                 "consumes": [
                     "application/json"
                 ],
@@ -607,6 +613,12 @@ const docTemplate = `{
                             "$ref": "#/definitions/handler.ErrorResponse"
                         }
                     },
+                    "502": {
+                        "description": "A model provider rejected the call because of its credentials, credit, permission or rate limit (an embedding or rerank status 401, 402, 403 or 429); the message names the model role, never the provider's body",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
                     "503": {
                         "description": "models.embedding is not configured so dense cannot run, or models.rerank is not configured so rerank cannot run (bm25 alone still works)",
                         "schema": {
@@ -632,7 +644,8 @@ const docTemplate = `{
                 1008,
                 1009,
                 1010,
-                1011
+                1011,
+                1012
             ],
             "x-enum-varnames": [
                 "ErrBadRequest",
@@ -646,7 +659,8 @@ const docTemplate = `{
                 "ErrServiceUnavailable",
                 "ErrTimeout",
                 "ErrValidation",
-                "ErrRequestEntityTooLarge"
+                "ErrRequestEntityTooLarge",
+                "ErrModelProvider"
             ]
         },
         "handler.DataResponse": {

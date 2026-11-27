@@ -156,8 +156,24 @@ so the run is not valid. No results file is written, the command prints
 `config <name>: aborted: <message>`, continues with the next config and exits
 1 at the end.
 
+**10 question errors in a row** also stop that config's Ablation Run, because
+the requests are failing rather than the questions: the provider is refusing
+the calls, or the service is down. `--max-consecutive-errors N` sets the limit
+(default 10; 0 disables the rule). A skipped question neither resets nor
+advances the streak; a scored question resets it. With `--concurrency` above 1
+the streak follows the order results arrive, not Golden Set order, and no
+further question is sent once it aborts. The abort is the 400/503 abort in
+every other respect: no results file, continue with the next config, exit 1 at
+the end. The command prints
+`config <name>: aborted: <N> consecutive question errors; last: <message>`.
+
 Every other request failure (a 5xx other than 503, or an `httpx.HTTPError`) is
-recorded on that question as `error` with the message. The run continues, the
+recorded on that question as `error` with the message. A **502** is one of
+these: Trelis answers it when a model provider rejects the call
+(`ErrModelProvider`, a provider status 401, 402, 403 or 429), and the message
+names the model role rather than the provider's body. One such error is a
+question error like any other; repeated, it trips the consecutive rule above
+and aborts that config's Ablation Run. The run continues otherwise, the
 question is excluded from the means, and it is counted in the summary. This is
 the "grader errors are excluded and counted" rule: a broken question never
 silently becomes a zero.

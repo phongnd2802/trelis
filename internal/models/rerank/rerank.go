@@ -20,6 +20,7 @@ import (
 	"github.com/phongnd2802/trelis/internal/config"
 	"github.com/phongnd2802/trelis/internal/logger"
 	"github.com/phongnd2802/trelis/internal/models/api"
+	"github.com/phongnd2802/trelis/internal/models/providererror"
 )
 
 // defaultPath is where a Jina/Cohere-compatible provider takes rerank
@@ -115,7 +116,7 @@ func (c *client) Rerank(ctx context.Context, query string, documents []string) (
 	}
 	logger.LogModelCall(ctx, call)
 	if err != nil {
-		return nil, err
+		return nil, providererror.Wrap("rerank", err)
 	}
 	return scores, nil
 }

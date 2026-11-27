@@ -672,6 +672,74 @@ def test_retrieval_run_aborts_one_config_and_continues_with_the_next(tmp_path, m
     assert len(requests) == 3
 
 
+def test_retrieval_run_aborts_a_config_after_repeated_question_errors(
+    tmp_path, monkeypatch, capsys
+):
+    requests = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        return httpx.Response(
+            502,
+            json={
+                "success": False,
+                "error": {
+                    "code": 1012,
+                    "message": "the rerank model provider rejected the call (HTTP 402)",
+                    "details": None,
+                },
+            },
+        )
+
+    code, out_dir = run_retrieval(
+        tmp_path,
+        monkeypatch,
+        httpx.MockTransport(handler),
+        "--max-consecutive-errors",
+        "2",
+    )
+
+    assert code == 1
+    assert not (out_dir / "20260101T000000Z" / "dense.jsonl").exists()
+    output = capsys.readouterr().out
+    assert "config dense: aborted: 2 consecutive question errors; last: HTTP 502" in output
+    assert len(requests) == 2
+
+
+def test_retrieval_run_zero_max_consecutive_errors_keeps_the_question_errors(
+    tmp_path, monkeypatch, capsys
+):
+    def handler(request):
+        return httpx.Response(
+            502,
+            json={
+                "success": False,
+                "error": {
+                    "code": 1012,
+                    "message": "the rerank model provider rejected the call (HTTP 402)",
+                    "details": None,
+                },
+            },
+        )
+
+    code, out_dir = run_retrieval(
+        tmp_path,
+        monkeypatch,
+        httpx.MockTransport(handler),
+        "--max-consecutive-errors",
+        "0",
+    )
+
+    assert code == 1
+    path = out_dir / "20260101T000000Z" / "dense.jsonl"
+    assert path.exists()
+    summary = json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
+    assert summary["counts"]["error"] == 2
+    output = capsys.readouterr().out
+    assert "aborted" not in output
+
+
 def test_retrieval_run_passes_request_timeout_and_concurrency(tmp_path, monkeypatch):
     import trelis_eval.cli as cli
 

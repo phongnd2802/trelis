@@ -19,6 +19,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/phongnd2802/trelis/internal/config"
+	apperrors "github.com/phongnd2802/trelis/internal/errors"
 	"github.com/phongnd2802/trelis/internal/models/api"
 	"github.com/phongnd2802/trelis/internal/models/modeltest"
 )
@@ -168,6 +169,39 @@ func TestRerankGivesUpAfterTheLastAttempt(t *testing.T) {
 	if n := p.CallCount(modeltest.Rerank); n != attempts {
 		t.Errorf("provider saw %d requests, want %d attempts", n, attempts)
 	}
+}
+
+func TestRerankA429Is502OnlyAfterTheRetriesAreUsedUp(t *testing.T) {
+	t.Run("every attempt is refused", func(t *testing.T) {
+		p := modeltest.NewFakeProvider(t)
+		p.FailNext(modeltest.Rerank, http.StatusTooManyRequests, attempts)
+		r := reranker(t, p)
+
+		_, err := r.Rerank(context.Background(), "q", []string{"a"})
+		appErr, ok := apperrors.IsAppError(err)
+		if !ok || appErr.Code != apperrors.ErrModelProvider || appErr.HTTPCode != http.StatusBadGateway {
+			t.Fatalf("Rerank err = %v, want the 502 ErrModelProvider after the retries", err)
+		}
+		if want := "the rerank model provider rejected the call (HTTP 429)"; appErr.Message != want {
+			t.Errorf("message = %q, want %q", appErr.Message, want)
+		}
+		if n := p.CallCount(modeltest.Rerank); n != attempts {
+			t.Errorf("provider saw %d requests, want %d attempts before the 502", n, attempts)
+		}
+	})
+
+	t.Run("an attempt gets through", func(t *testing.T) {
+		p := modeltest.NewFakeProvider(t)
+		p.FailNext(modeltest.Rerank, http.StatusTooManyRequests, attempts-1)
+		r := reranker(t, p)
+
+		if _, err := r.Rerank(context.Background(), "q", []string{"a"}); err != nil {
+			t.Fatalf("Rerank: %v after a retry got through", err)
+		}
+		if n := p.CallCount(modeltest.Rerank); n != attempts {
+			t.Errorf("provider saw %d requests, want %d attempts", n, attempts)
+		}
+	})
 }
 
 func TestRerankSurfacesAClientErrorWithoutRetrying(t *testing.T) {
