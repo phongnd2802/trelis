@@ -10,7 +10,8 @@ versioned files, not server state.
 The harness fetches the MultiHop-RAG Benchmark Corpus, ingests a subset as
 Documents, waits for ingest to finish, reads and writes Golden Sets, and
 scores Ablation Runs under Retrieval Configs with Recall@5, Recall@10, MRR and
-nDCG@10. The record/replay proxy comes in a later ticket.
+nDCG@10. It also runs an OpenAI-compatible record/replay proxy so paid model
+calls are recorded once and replayed for free.
 
 Terms are the ones in [GLOSSARY.md](../GLOSSARY.md): Corpus, Benchmark
 Corpus, Document, Principal, Access List, Golden Set, Slice.
@@ -168,6 +169,27 @@ gitignored. The command exits 1 when a config aborted or scored no questions. A
 continues with the next one; any other request error is recorded on the
 question and excluded from the means, not scored as zero. Errors alone do not
 change the exit code.
+
+## Record and replay model calls
+
+Trelis calls its providers inside the Go service, so a retrieval run pays for
+an embedding on every question. Start the proxy and point the embedding role
+at it to pay once:
+
+```sh
+uv run --project eval trelis-eval proxy --mode record \
+  --upstream embedding=https://openrouter.ai/api/v1 \
+  --fixtures eval/fixtures/models
+```
+
+The command prints the `TRELIS_MODELS_EMBEDDING_BASE_URL` line to start Trelis
+with. Run the same Ablation Run again with `--mode replay` (no upstream and no
+provider key) and every recorded answer is served from
+`eval/fixtures/models` byte for byte, including its original `usage`. A
+missing fixture fails with a `404` and names the request, so a prompt or
+Chunk change cannot silently score a stale answer. [docs/record-replay.md](docs/record-replay.md)
+covers the routing, the key, the fixture schema, the modes, the miss workflow
+and a worked dense-baseline example.
 
 ## Tests
 
