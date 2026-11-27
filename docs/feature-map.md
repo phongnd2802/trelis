@@ -89,6 +89,7 @@ the admin CLI. Setup and the fetch → ingest walkthrough are in `eval/README.md
 | Retrieval Ablation Runs: score a Golden Set under one or more Retrieval Configs with Recall@5, Recall@10, MRR and nDCG@10, one versioned JSONL file per run | done | `eval/src/trelis_eval/ablation_run.py`, `eval/src/trelis_eval/metrics.py`, `eval/src/trelis_eval/client.py`, `eval/src/trelis_eval/cli.py`, `eval/docs/metrics.md` | `trelis-eval retrieval run` | `eval/tests/test_ablation_run.py`, `eval/tests/test_metrics.py`, `eval/tests/test_client.py`, `eval/tests/test_cli.py`, `eval/tests/test_multihop.py` | ADR-0001, #39 |
 | Record/replay model proxy: an OpenAI-compatible proxy routed per role by path prefix that records paid chat, responses, embedding and rerank calls once and replays them byte-identically, preserving `usage` | done | `eval/src/trelis_eval/model_proxy.py`, `eval/src/trelis_eval/cli.py`, `eval/docs/record-replay.md`, `scripts/eval-stack.sh` | `trelis-eval proxy --mode {record,replay,passthrough} --upstream ROLE=URL`; `scripts/eval-stack.sh up record|replay` runs Trelis behind it for an Ablation Run | `eval/tests/test_model_proxy.py`, `eval/tests/test_cli.py` | ADR-0001, #41 |
 | Baseline Ablation Runs kept as reference rows on the stratified 500 (Recall@10 / MRR: dense 0.779 / 0.797, bm25 0.744 / 0.780, bm25+dense 0.811 / 0.828) | done | `eval/baselines/dense-strat500-seed1.jsonl`, `eval/baselines/bm25-strat500-seed1.jsonl`, `eval/baselines/bm25+dense-strat500-seed1.jsonl`, `eval/baselines/README.md` | — | — | #141, #33, #34 |
+| Ablation Matrix report: a seeded percentile-bootstrap 95% confidence interval for every metric and latency percentile of each Ablation Run, rendered as static Markdown and HTML from results files alone | done | `eval/src/trelis_eval/report.py`, `eval/src/trelis_eval/cli.py`, `eval/docs/metrics.md` | `trelis-eval report` | `eval/tests/test_report.py`, `eval/tests/test_cli.py` | ADR-0001, #40 |
 
 ## Platform
 
@@ -111,5 +112,5 @@ One line per roadmap milestone (#1); the issues hold the detail.
 - **GraphRAG**: Extractions, cross-document Entity Resolution, Neo4j projection, graph read API: Week 4 (#5), ADR-0003, #56, #60, #61.
 - **Agent Answer, tools, MCP server**: Week 5 (#6), #66, #67, #69, #70.
 - **Wiki** (Summary, Entity and Index Pages), **MCP client** with Tool Approval: Week 6 (#7), #62–#65, #71–#73.
-- **Eval harness** (external Python, Golden Set, Ablation Matrix): the skeleton is in [Eval harness](#eval-harness) (#38), Retrieval Ablation Runs are done (#39) and the record/replay proxy is done (#41); #81, #88.
+- **Eval harness** (external Python, Golden Set, Ablation Matrix): the skeleton is in [Eval harness](#eval-harness) (#38), Retrieval Ablation Runs are done (#39), the record/replay proxy is done (#41) and the Ablation Matrix report is done (#40); #81, #88.
 - **Frontend, demo**: Week 8 (#9), #83, #84, #86, #87, #89.

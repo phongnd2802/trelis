@@ -779,3 +779,124 @@ def test_retrieval_run_prints_per_step_latencies(tmp_path, monkeypatch, capsys):
     assert (
         "steps: dense/embed_query p50=4ms p95=4ms, dense/search p50=19000ms p95=19000ms" in output
     )
+
+
+def write_varied_results_file(tmp_path, monkeypatch):
+    """Write one results file whose questions rank the evidence differently."""
+    monkeypatch.setenv("TRELIS_API_KEY", "test-key")
+    monkeypatch.setenv("TRELIS_BASE_URL", "http://trelis.test")
+    questions = [
+        retrieval_question(f"mhr-{index:04d}", ["https://example.com/a"]) for index in range(8)
+    ]
+    golden_path, manifest_path = write_retrieval_inputs(
+        tmp_path,
+        questions,
+        [completed_record("https://example.com/a", "doc-a")],
+    )
+    # Evidence at ranks 1 to 8 behind unmapped Chunks, so MRR and nDCG@10 vary
+    # between questions and their intervals depend on the seed.
+    server = RetrievalServer(
+        {
+            f"Question mhr-{index:04d}?": [
+                *(retrieval_chunk(f"doc-x{rank}", f"c{index}-{rank}") for rank in range(index)),
+                retrieval_chunk("doc-a", f"c{index}-a"),
+            ]
+            for index in range(8)
+        }
+    )
+    out_dir = tmp_path / "runs"
+    code = main(
+        [
+            "retrieval",
+            "run",
+            "--golden",
+            str(golden_path),
+            "--manifest",
+            str(manifest_path),
+            "--out-dir",
+            str(out_dir),
+            "--run-id",
+            "20260101T000000Z",
+        ],
+        transport=httpx.MockTransport(server),
+    )
+    assert code == 0
+    return out_dir / "20260101T000000Z" / "dense.jsonl"
+
+
+def test_report_writes_byte_identical_output_on_a_rebuild(tmp_path, monkeypatch, capsys):
+    results = write_varied_results_file(tmp_path, monkeypatch)
+    monkeypatch.delenv("TRELIS_API_KEY")
+    first = tmp_path / "report-1"
+    second = tmp_path / "report-2"
+
+    assert main(["report", str(results), "--resamples", "100", "--out-dir", str(first)]) == 0
+    assert main(["report", str(results), "--resamples", "100", "--out-dir", str(second)]) == 0
+
+    for name in ("ablation-matrix.md", "ablation-matrix.html"):
+        assert (first / name).read_bytes() == (second / name).read_bytes()
+    output = capsys.readouterr().out
+    assert str(first / "ablation-matrix.md") in output
+    assert str(first / "ablation-matrix.html") in output
+
+
+def test_report_accepts_a_directory_of_results_files(tmp_path, monkeypatch):
+    results = write_varied_results_file(tmp_path, monkeypatch)
+    out_dir = tmp_path / "report"
+
+    code = main(["report", str(results.parent), "--resamples", "50", "--out-dir", str(out_dir)])
+
+    assert code == 0
+    markdown = (out_dir / "ablation-matrix.md").read_text(encoding="utf-8")
+    assert "| dense |" in markdown
+    assert (out_dir / "ablation-matrix.html").exists()
+
+
+def test_report_rejects_a_directory_without_results_files(tmp_path, capsys):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    code = main(["report", str(empty), "--out-dir", str(tmp_path / "report")])
+
+    assert code == 1
+    assert "no *.jsonl" in capsys.readouterr().err
+
+
+def test_report_a_different_seed_moves_the_intervals(tmp_path, monkeypatch):
+    results = write_varied_results_file(tmp_path, monkeypatch)
+    first = tmp_path / "seed-1"
+    second = tmp_path / "seed-2"
+
+    assert (
+        main(["report", str(results), "--seed", "1", "--resamples", "500", "--out-dir", str(first)])
+        == 0
+    )
+    assert (
+        main(
+            ["report", str(results), "--seed", "2", "--resamples", "500", "--out-dir", str(second)]
+        )
+        == 0
+    )
+
+    def matrix_rows(out_dir):
+        lines = (out_dir / "ablation-matrix.md").read_text(encoding="utf-8").splitlines()
+        return [line for line in lines if line.startswith("| dense |")]
+
+    assert matrix_rows(first) != matrix_rows(second)
+
+
+def test_report_exits_one_on_results_from_different_golden_sets(tmp_path, monkeypatch, capsys):
+    results = write_varied_results_file(tmp_path, monkeypatch)
+    lines = results.read_text(encoding="utf-8").splitlines()
+    header = json.loads(lines[0])
+    header["config"] = {"name": "bm25", "techniques": ["bm25"]}
+    header["golden_set"]["sha256"] = "0" * 64
+    other = tmp_path / "other" / "bm25.jsonl"
+    other.parent.mkdir(parents=True)
+    other.write_text("\n".join([json.dumps(header), *lines[1:]]) + "\n", encoding="utf-8")
+
+    code = main(["report", str(results), str(other), "--out-dir", str(tmp_path / "report")])
+
+    assert code == 1
+    assert "Golden Set" in capsys.readouterr().err
+    assert not (tmp_path / "report").exists()

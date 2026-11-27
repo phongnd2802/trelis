@@ -174,6 +174,23 @@ continues with the next one; any other request error is recorded on the
 question and excluded from the means, not scored as zero. Errors alone do not
 change the exit code.
 
+## Build the Ablation Matrix report
+
+Turn results files into the Ablation Matrix, with a 95% confidence interval on
+every metric and latency percentile:
+
+```sh
+uv run --project eval trelis-eval report eval/baselines
+```
+
+`report` accepts results files or a directory of `*.jsonl` (sorted by name),
+writes `eval/reports/ablation-matrix.md` and `ablation-matrix.html`, and prints
+both paths. `--seed` (default 1) and `--resamples` (default 10,000) control the
+bootstrap; `--out-dir` chooses another directory. It needs no running Trelis.
+`eval/reports/` is meant to be published, not gitignored. The interval,
+comparability and determinism rules are in
+[docs/metrics.md](docs/metrics.md#confidence-intervals).
+
 ## Record and replay model calls
 
 Trelis calls its providers inside the Go service, so a retrieval run pays for

@@ -23,6 +23,7 @@ from .ablation_run import (
     QuestionStatus,
     default_run_id,
     file_sha256,
+    load_ablation_run,
     load_manifest,
     parse_retrieval_config,
     run_ablation,
@@ -51,6 +52,7 @@ from .multihop import (
     stratified_sample,
     to_golden_set,
 )
+from .report import build_matrix, render_html, render_markdown
 
 DEFAULT_DATA_DIR = Path("eval/data/multihop-rag")
 DEFAULT_BASE_URL = "http://localhost:8080"
@@ -204,6 +206,39 @@ def _build_parser() -> argparse.ArgumentParser:
         "--base-url", default=None, help="Trelis base URL (default: $TRELIS_BASE_URL)"
     )
     run_command.set_defaults(handler=_run_retrieval)
+
+    report_command = commands.add_parser(
+        "report",
+        help="build the Ablation Matrix report from Ablation Run results files",
+        epilog=(
+            "Reads results files only: no HTTP request and no API key. The same "
+            "files and seed write byte-identical ablation-matrix.md and "
+            "ablation-matrix.html."
+        ),
+    )
+    report_command.add_argument(
+        "results",
+        type=Path,
+        nargs="+",
+        metavar="RESULTS",
+        help="results JSONL files, or directories of *.jsonl (sorted by name)",
+    )
+    report_command.add_argument(
+        "--seed", type=_non_negative_int, default=1, help="bootstrap RNG seed (default: 1)"
+    )
+    report_command.add_argument(
+        "--resamples",
+        type=_positive_int,
+        default=10000,
+        help="bootstrap resamples per metric and latency percentile (default: 10000)",
+    )
+    report_command.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("eval/reports"),
+        help="directory for ablation-matrix.md and ablation-matrix.html",
+    )
+    report_command.set_defaults(handler=_run_report)
 
     proxy = commands.add_parser(
         "proxy",
@@ -374,6 +409,39 @@ def _run_retrieval(args: argparse.Namespace, transport: httpx.BaseTransport | No
             if run.summary.scored == 0:
                 exit_code = 1
     return exit_code
+
+
+def _run_report(args: argparse.Namespace, transport: httpx.BaseTransport | None) -> int:
+    """Build the Ablation Matrix report from results files alone."""
+    del transport
+    paths = _results_files(args.results)
+    matrix = build_matrix(
+        [load_ablation_run(path) for path in paths],
+        seed=args.seed,
+        resamples=args.resamples,
+    )
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    markdown_path = args.out_dir / "ablation-matrix.md"
+    html_path = args.out_dir / "ablation-matrix.html"
+    markdown_path.write_text(render_markdown(matrix), encoding="utf-8", newline="\n")
+    html_path.write_text(render_html(matrix), encoding="utf-8", newline="\n")
+    print(markdown_path)
+    print(html_path)
+    return 0
+
+
+def _results_files(arguments: Sequence[Path]) -> list[Path]:
+    """Expand any directory into its *.jsonl files, sorted by name."""
+    paths: list[Path] = []
+    for argument in arguments:
+        if not argument.is_dir():
+            paths.append(argument)
+            continue
+        found = sorted(argument.glob("*.jsonl"), key=lambda path: path.name)
+        if not found:
+            raise CliError(f"{argument}: no *.jsonl Ablation Run results files")
+        paths.extend(found)
+    return paths
 
 
 def _run_proxy(args: argparse.Namespace, transport: httpx.BaseTransport | None) -> int:
