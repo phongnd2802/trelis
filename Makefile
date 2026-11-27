@@ -13,7 +13,7 @@ help:
 	@echo "  build        build trelis with the anydoc engine linked (needs anydoc-lib)"
 	@echo "  build-lite   build trelis without anydoc (no Rust needed; engine unavailable)"
 	@echo "  dev          go run ./cmd/server with anydoc linked (ARGS=... passes flags)"
-	@echo "  test         unit tests that need no archive"
+	@echo "  test         unit tests; the Postgres tests too when the dev database is up"
 	@echo "  test-linked  full tests against the linked anydoc archive"
 	@echo "  eval-lint    ruff lint and format check of the eval harness (needs uv)"
 	@echo "  eval-test    eval harness tests (cd eval && uv run pytest; needs uv)"
@@ -48,11 +48,16 @@ dev:
 	@if [ -f .local/models.env ]; then set -a; . ./.local/models.env; set +a; fi; \
 	CGO_ENABLED=1 go run -tags anydoc ./cmd/server $(ARGS)
 
+# The Postgres-backed tests skip themselves when TRELIS_TEST_POSTGRES_DSN is
+# unset. The script prints an explicit DSN, else the dev Postgres
+# (compose.dev.yaml) when it is up, and the skip hint when it finds no server.
+TEST_DB_ENV = export TRELIS_TEST_POSTGRES_DSN="$$(scripts/test-db-env.sh)";
+
 test:
-	go test ./...
+	@$(TEST_DB_ENV) go test ./...
 
 test-linked:
-	CGO_ENABLED=1 go test -tags anydoc ./...
+	@$(TEST_DB_ENV) CGO_ENABLED=1 go test -tags anydoc ./...
 
 # The external Python eval harness (eval/, ADR-0001); no Go build needed.
 # Kept out of lint/test so the Go jobs need no uv; CI runs both in its eval job.

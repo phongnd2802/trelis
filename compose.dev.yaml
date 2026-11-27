@@ -9,8 +9,8 @@
 #   temporal     localhost:7233
 #   silo         http://localhost:9000   (S3 API; console http://localhost:9001)
 #
-# Integration tests that need Postgres are skipped unless you export
-#   TRELIS_TEST_POSTGRES_DSN=postgres://trelis:trelis@localhost:5432/trelis?sslmode=disable
+# `make test` and `make test-linked` run the Postgres-backed tests on this
+# server when it is up; an exported TRELIS_TEST_POSTGRES_DSN overrides it.
 #
 # Credentials are development defaults; override them through a .env file
 # next to this one (see .env.example).
