@@ -56,6 +56,11 @@ type DocumentRepository interface {
 	// ListPagedReadableDocuments returns a page of the Documents principalID
 	// can read, newest first, and how many there are in all.
 	ListPagedReadableDocuments(ctx context.Context, principalID uuid.UUID, page *types.Pagination) ([]*types.Document, int64, error)
+	// ListReadableDocumentIDs returns the IDs of every Document principalID
+	// can read that has finished ingest. Retrieval passes the set into every
+	// search, so a Document mid-ingest (with partial embeddings) is never
+	// searched.
+	ListReadableDocumentIDs(ctx context.Context, principalID uuid.UUID) ([]uuid.UUID, error)
 	// GetAccessList returns the names on a Document's Access List.
 	GetAccessList(ctx context.Context, id uuid.UUID) (*types.AccessList, error)
 }

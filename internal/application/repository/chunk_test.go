@@ -3,6 +3,8 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"testing"
 
 	"github.com/google/uuid"
@@ -12,8 +14,15 @@ import (
 	"github.com/phongnd2802/trelis/internal/types"
 )
 
-// document creates one pending Document owned by alice.
+// document creates one pending Document owned by ownerID.
 func document(t *testing.T, s db.Store, ownerID uuid.UUID) *types.Document {
+	t.Helper()
+	return documentGranted(t, s, ownerID, types.AccessGrants{})
+}
+
+// documentGranted creates one pending Document owned by ownerID and granted
+// to the Principals and Groups in grants.
+func documentGranted(t *testing.T, s db.Store, ownerID uuid.UUID, grants types.AccessGrants) *types.Document {
 	t.Helper()
 	doc := &types.Document{
 		ID:        uuid.New(),
@@ -26,7 +35,7 @@ func document(t *testing.T, s db.Store, ownerID uuid.UUID) *types.Document {
 		UploadID:  uuid.New(),
 		ObjectKey: "documents/" + uuid.NewString() + "/source",
 	}
-	if err := NewDocumentRepository(s).CreateDocument(context.Background(), doc, types.AccessGrants{}); err != nil {
+	if err := NewDocumentRepository(s).CreateDocument(context.Background(), doc, grants); err != nil {
 		t.Fatalf("create document: %v", err)
 	}
 	return doc
@@ -145,6 +154,141 @@ func TestSetChunkEmbeddingStoresTheVectorAndModel(t *testing.T) {
 	// skipped: the activity then retries against the set it has now.
 	if err := repo.SetChunkEmbedding(ctx, uuid.New(), []float32{1}, "test-embedding"); err == nil {
 		t.Error("SetChunkEmbedding(unknown chunk) = nil, want an error")
+	}
+}
+
+func TestSearchDenseOrdersByCosineAndSkipsUncomparableChunks(t *testing.T) {
+	s, ids := seeded(t)
+	ctx := context.Background()
+	chunks := NewChunkRepository(s)
+	searcher := NewChunkSearcher(s)
+
+	visible := document(t, s, ids["alice"])
+	otherModel := document(t, s, ids["alice"])
+	unembedded := document(t, s, ids["alice"])
+	outside := document(t, s, ids["alice"])
+
+	replaceAndEmbed := func(doc *types.Document, vectors [][]float32, model string) []*types.Chunk {
+		t.Helper()
+		input := make([]*types.Chunk, len(vectors))
+		for i := range vectors {
+			input[i] = &types.Chunk{Seq: i, Content: fmt.Sprintf("chunk %d", i), StartOffset: i, EndOffset: i + 1}
+		}
+		if err := s.ExecTx(ctx, func(ctx context.Context) error {
+			return chunks.ReplaceChunks(ctx, doc.ID, input)
+		}); err != nil {
+			t.Fatalf("ReplaceChunks: %v", err)
+		}
+		stored, err := chunks.ListUnembeddedChunks(ctx, doc.ID, 0, len(input))
+		if err != nil || len(stored) != len(input) {
+			t.Fatalf("ListUnembeddedChunks = %+v, %v; want %d Chunks", stored, err, len(input))
+		}
+		for i, c := range stored {
+			if err := chunks.SetChunkEmbedding(ctx, c.ID, vectors[i], model); err != nil {
+				t.Fatalf("SetChunkEmbedding: %v", err)
+			}
+		}
+		return stored
+	}
+
+	stored := replaceAndEmbed(visible, [][]float32{{1, 0}, {0, 1}, {-1, 0}, {1, 0}}, "test-embedding")
+	replaceAndEmbed(otherModel, [][]float32{{1, 0}}, "other-embedding")
+	// outside is embedded but never in the readable set passed to the search.
+	replaceAndEmbed(outside, [][]float32{{1, 0}}, "test-embedding")
+	// unembedded keeps its Chunk but no vector.
+	if err := s.ExecTx(ctx, func(ctx context.Context) error {
+		return chunks.ReplaceChunks(ctx, unembedded.ID,
+			[]*types.Chunk{{Seq: 0, Content: "no vector", StartOffset: 0, EndOffset: 9}})
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	documentIDs := []uuid.UUID{visible.ID, otherModel.ID, unembedded.ID}
+	got, err := searcher.SearchDense(ctx, documentIDs, []float32{1, 0}, "test-embedding", 10)
+	if err != nil {
+		t.Fatalf("SearchDense: %v", err)
+	}
+	if len(got) != len(stored) {
+		t.Fatalf("SearchDense returned %d matches, want only the %d comparable Chunks", len(got), len(stored))
+	}
+	storedByID := make(map[uuid.UUID]*types.Chunk, len(stored))
+	for _, c := range stored {
+		storedByID[c.ID] = c
+	}
+	wantScores := []float64{1, 1, 0, -1}
+	for i, match := range got {
+		if match.Chunk.DocumentID != visible.ID {
+			t.Errorf("match %d belongs to %s, want only %s", i, match.Chunk.DocumentID, visible.ID)
+		}
+		if math.Abs(match.Score-wantScores[i]) > 1e-5 {
+			t.Errorf("match %d score = %v, want %v", i, match.Score, wantScores[i])
+		}
+		if want, ok := storedByID[match.Chunk.ID]; !ok || match.Chunk.Content != want.Content || match.Chunk.Seq != want.Seq {
+			t.Errorf("match %d Chunk = %+v, want the stored content and seq for %s", i, match.Chunk, match.Chunk.ID)
+		}
+	}
+	if got[0].Chunk.ID.String() >= got[1].Chunk.ID.String() {
+		t.Errorf("ties ordered %s then %s, want ascending Chunk ID", got[0].Chunk.ID, got[1].Chunk.ID)
+	}
+
+	top, err := searcher.SearchDense(ctx, documentIDs, []float32{1, 0}, "test-embedding", 2)
+	if err != nil || len(top) != 2 || math.Abs(top[0].Score-1) > 1e-5 || math.Abs(top[1].Score-1) > 1e-5 {
+		t.Errorf("top_k 2 = %+v, %v; want the two closest Chunks", top, err)
+	}
+
+	other, err := searcher.SearchDense(ctx, documentIDs, []float32{1, 0}, "other-embedding", 10)
+	if err != nil || len(other) != 1 || other[0].Chunk.DocumentID != otherModel.ID {
+		t.Errorf("search for other-embedding = %+v, %v; want only its own Chunk", other, err)
+	}
+
+	none, err := searcher.SearchDense(ctx, nil, []float32{1, 0}, "test-embedding", 10)
+	if err != nil || len(none) != 0 {
+		t.Errorf("search over no documents = %+v, %v; want nothing", none, err)
+	}
+}
+
+func TestSearchDenseSkipsNaNScoresFromZeroVectors(t *testing.T) {
+	s, ids := seeded(t)
+	ctx := context.Background()
+	chunks := NewChunkRepository(s)
+	searcher := NewChunkSearcher(s)
+	doc := document(t, s, ids["alice"])
+
+	if err := s.ExecTx(ctx, func(ctx context.Context) error {
+		return chunks.ReplaceChunks(ctx, doc.ID, []*types.Chunk{
+			{Seq: 0, Content: "zero vector", StartOffset: 0, EndOffset: 11},
+			{Seq: 1, Content: "unit vector", StartOffset: 12, EndOffset: 23},
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := chunks.ListUnembeddedChunks(ctx, doc.ID, 0, 2)
+	if err != nil || len(stored) != 2 {
+		t.Fatalf("ListUnembeddedChunks = %+v, %v; want both Chunks", stored, err)
+	}
+	// Cosine similarity is NaN when either vector has zero norm.
+	if err := chunks.SetChunkEmbedding(ctx, stored[0].ID, []float32{0, 0}, "test-embedding"); err != nil {
+		t.Fatal(err)
+	}
+	if err := chunks.SetChunkEmbedding(ctx, stored[1].ID, []float32{1, 0}, "test-embedding"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := searcher.SearchDense(ctx, []uuid.UUID{doc.ID}, []float32{1, 0}, "test-embedding", 10)
+	if err != nil {
+		t.Fatalf("SearchDense: %v", err)
+	}
+	if len(got) != 1 || got[0].Chunk.ID != stored[1].ID {
+		t.Fatalf("SearchDense = %+v, want only the unit-vector Chunk", got)
+	}
+	if math.IsNaN(got[0].Score) {
+		t.Error("the returned score is NaN")
+	}
+
+	// A zero query vector makes every distance NaN, so nothing can match.
+	none, err := searcher.SearchDense(ctx, []uuid.UUID{doc.ID}, []float32{0, 0}, "test-embedding", 10)
+	if err != nil || len(none) != 0 {
+		t.Errorf("SearchDense with a zero query = %+v, %v; want nothing", none, err)
 	}
 }
 

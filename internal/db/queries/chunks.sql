@@ -28,3 +28,21 @@ WHERE id = sqlc.arg(id);
 
 -- name: CountChunksWithoutEmbedding :one
 SELECT count(*) FROM chunks WHERE document_id = $1 AND embedding IS NULL;
+
+-- Dense retrieval: rank the Chunks of the readable Documents by cosine
+-- similarity to the query vector. Exact scan on purpose: no HNSW index yet,
+-- so recall is perfect while the eval baseline is built; add the index when
+-- latency, not recall, is the constraint. Only Chunks embedded by the same
+-- model are comparable, and NULL embeddings cannot be searched at all.
+-- name: SearchDenseChunks :many
+SELECT id, document_id, seq, content, context_header,
+       (1 - (embedding <=> sqlc.arg(query_embedding)::text::vector))::float8 AS score
+FROM chunks
+WHERE document_id = ANY(sqlc.arg(document_ids)::uuid[])
+  AND embedding_model = sqlc.arg(embedding_model)::text
+  AND embedding IS NOT NULL
+  -- A zero-norm vector makes cosine distance NaN; it can never be a match
+  -- and would not survive JSON encoding either.
+  AND (embedding <=> sqlc.arg(query_embedding)::text::vector) <> 'NaN'::float8
+ORDER BY embedding <=> sqlc.arg(query_embedding)::text::vector, id
+LIMIT sqlc.arg(top_k);

@@ -32,3 +32,15 @@ type ChunkRepository interface {
 	// have no embedding yet.
 	CountChunksWithoutEmbedding(ctx context.Context, documentID uuid.UUID) (int, error)
 }
+
+// ChunkSearcher finds Chunks for retrieval. It is the read side of the Chunk
+// repository: the retrieval service depends only on it, never on the ingest
+// writes.
+type ChunkSearcher interface {
+	// SearchDense returns up to topK Chunks from any of documentIDs whose
+	// embedding was produced by model, most cosine-similar to queryVector
+	// first, ties broken by Chunk ID. Chunks with no embedding, or one by
+	// another model, are skipped because their vectors may not even share a
+	// dimension with the query's.
+	SearchDense(ctx context.Context, documentIDs []uuid.UUID, queryVector []float32, model string, topK int) ([]*types.ChunkMatch, error)
+}

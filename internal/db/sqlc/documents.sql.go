@@ -247,6 +247,36 @@ func (q *Queries) ListDocumentPrincipals(ctx context.Context, documentID uuid.UU
 	return items, nil
 }
 
+const listReadableDocumentIDs = `-- name: ListReadableDocumentIDs :many
+SELECT id FROM documents
+WHERE parse_status = 'completed'
+  AND can_read_document(id, $1::uuid)
+ORDER BY id
+`
+
+// The Documents a Principal can read that finished ingest. Retrieval passes
+// this set into every search; a Document still processing has only part of
+// its Chunks embedded, so it is left out until it is completed.
+func (q *Queries) ListReadableDocumentIDs(ctx context.Context, principalID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listReadableDocumentIDs, principalID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listReadableDocuments = `-- name: ListReadableDocuments :many
 SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, object_key, parse_status, created_at, updated_at, upload_id, parse_error FROM documents
 WHERE can_read_document(id, $1::uuid)

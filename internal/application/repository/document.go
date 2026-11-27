@@ -148,6 +148,18 @@ func (r *documentRepository) ListPagedReadableDocuments(ctx context.Context, pri
 	return docs, total, nil
 }
 
+// ListReadableDocumentIDs returns the IDs of the Documents principalID can
+// read that have finished ingest. The set is resolved on every request, not
+// cached, so a revoked grant or a fresh completed Document takes effect on
+// the next call.
+func (r *documentRepository) ListReadableDocumentIDs(ctx context.Context, principalID uuid.UUID) ([]uuid.UUID, error) {
+	ids, err := r.store.Querier(ctx).ListReadableDocumentIDs(ctx, principalID)
+	if err != nil {
+		return nil, fmt.Errorf("list readable document IDs of principal %s: %w", principalID, err)
+	}
+	return ids, nil
+}
+
 // GetAccessList returns the names on a Document's Access List, sorted.
 func (r *documentRepository) GetAccessList(ctx context.Context, id uuid.UUID) (*types.AccessList, error) {
 	q := r.store.Querier(ctx)

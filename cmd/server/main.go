@@ -271,6 +271,8 @@ func run(configPath string, args []string) (err error) {
 			ingest.NewStarter(temporal, cfg.Temporal.TaskQueue)),
 		cfg.Storage.MaxFileSize(),
 	)
+	retrieval := handler.NewRetrievalHandler(
+		service.NewRetrievalService(docRepo, repository.NewChunkSearcher(dbStore), embedder))
 
 	ready := router.Readiness{Timeout: readyTimeout, Checks: []router.Check{
 		{Name: "postgres", Probe: pool.Ping},
@@ -291,7 +293,7 @@ func run(configPath string, args []string) (err error) {
 	logger.Ctx(ctx).Info("trelis listening", zap.String("addr", ln.Addr().String()), zap.String("config", configPath))
 
 	if err := router.Serve(ctx, ln, router.New(ready, service.NewAuthService(principalRepo, keyRepo),
-		handler.NewPrincipalHandler(principals), docs, cfg.Server.Swagger), cfg.Server.ShutdownTimeout); err != nil {
+		handler.NewPrincipalHandler(principals), docs, retrieval, cfg.Server.Swagger), cfg.Server.ShutdownTimeout); err != nil {
 		return err
 	}
 	logger.Ctx(ctx).Info("trelis stopped")

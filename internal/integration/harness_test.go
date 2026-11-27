@@ -465,6 +465,30 @@ func (tr *trelis) get(t *testing.T, path, key string) *http.Response {
 	return resp
 }
 
+// post sends POST path with body as JSON and key as the bearer token (none
+// when empty). The body is closed when the test ends.
+func (tr *trelis) post(t *testing.T, path, key string, body any) *http.Response {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, tr.url+path, bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", path, err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	return resp
+}
+
 // syncBuffer is a bytes.Buffer safe for concurrent writers.
 type syncBuffer struct {
 	mu  sync.Mutex

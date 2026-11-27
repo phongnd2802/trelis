@@ -36,6 +36,10 @@ type Querier interface {
 	ListDocumentGroups(ctx context.Context, documentID uuid.UUID) ([]string, error)
 	ListDocumentPrincipals(ctx context.Context, documentID uuid.UUID) ([]string, error)
 	ListPrincipalGroups(ctx context.Context, principalID uuid.UUID) ([]ListPrincipalGroupsRow, error)
+	// The Documents a Principal can read that finished ingest. Retrieval passes
+	// this set into every search; a Document still processing has only part of
+	// its Chunks embedded, so it is left out until it is completed.
+	ListReadableDocumentIDs(ctx context.Context, principalID uuid.UUID) ([]uuid.UUID, error)
 	// A page of the Documents a Principal can read, newest first.
 	ListReadableDocuments(ctx context.Context, arg ListReadableDocumentsParams) ([]Document, error)
 	// One batch of embedding work: the Chunks of a seq range that the embed
@@ -44,6 +48,12 @@ type Querier interface {
 	ListUnembeddedChunksByDocument(ctx context.Context, arg ListUnembeddedChunksByDocumentParams) ([]ListUnembeddedChunksByDocumentRow, error)
 	// Revoking twice keeps the first revocation time.
 	RevokeAPIKey(ctx context.Context, id uuid.UUID) (int64, error)
+	// Dense retrieval: rank the Chunks of the readable Documents by cosine
+	// similarity to the query vector. Exact scan on purpose: no HNSW index yet,
+	// so recall is perfect while the eval baseline is built; add the index when
+	// latency, not recall, is the constraint. Only Chunks embedded by the same
+	// model are comparable, and NULL embeddings cannot be searched at all.
+	SearchDenseChunks(ctx context.Context, arg SearchDenseChunksParams) ([]SearchDenseChunksRow, error)
 	// The vector goes in as its text form and is cast here, which is also what
 	// keeps sqlc from having to map the vector type. execrows lets the caller
 	// notice a Chunk that disappeared between listing and updating.

@@ -1,0 +1,237 @@
+//go:build integration
+
+package integration
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/phongnd2802/trelis/internal/models/modeltest"
+)
+
+// retrieveQuery is the query every retrieve test pins its vector for.
+const retrieveQuery = "who won the 2024 election?"
+
+// retrievedChunk is the part of one result the tests read.
+type retrievedChunk struct {
+	ChunkID       string             `json:"chunk_id"`
+	DocumentID    string             `json:"document_id"`
+	Seq           int                `json:"seq"`
+	Content       string             `json:"content"`
+	ContextHeader string             `json:"context_header"`
+	Score         float64            `json:"score"`
+	Scores        map[string]float64 `json:"scores"`
+}
+
+// traceStep is one timed step of a retrieval run.
+type traceStep struct {
+	Step       string `json:"step"`
+	Technique  string `json:"technique"`
+	DurationMS int64  `json:"duration_ms"`
+	Model      string `json:"model"`
+	Candidates int    `json:"candidates"`
+}
+
+// retrievalAnswer is the envelope POST /retrieve answers with.
+type retrievalAnswer struct {
+	Success bool `json:"success"`
+	Data    struct {
+		Results []retrievedChunk `json:"results"`
+		Trace   []traceStep      `json:"trace"`
+	} `json:"data"`
+}
+
+// retrieve POSTs /retrieve as key and returns the decoded answer, failing
+// unless the request succeeded.
+func (tr *trelis) retrieve(t *testing.T, key, query string) retrievalAnswer {
+	t.Helper()
+	resp := tr.post(t, "/retrieve", key, map[string]any{
+		"query":            query,
+		"top_k":            10,
+		"retrieval_config": map[string]any{"techniques": []string{"dense"}},
+	})
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("POST /retrieve = %d %s, want 200", resp.StatusCode, body)
+	}
+	var answer retrievalAnswer
+	if err := json.NewDecoder(resp.Body).Decode(&answer); err != nil {
+		t.Fatalf("decode /retrieve answer: %v", err)
+	}
+	if !answer.Success {
+		t.Fatalf("POST /retrieve answered success = false")
+	}
+	return answer
+}
+
+// chunkVectors reads a Document's stored embeddings straight from Postgres,
+// in seq order, so a test can pin a query vector to one it knows the search
+// compares against.
+func (tr *trelis) chunkVectors(t *testing.T, documentID string) [][]float32 {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
+		pgUser, pgPassword, deps.pg.host, deps.pg.port, tr.dbname))
+	if err != nil {
+		t.Fatalf("connect to database %s: %v", tr.dbname, err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	rows, err := conn.Query(ctx,
+		`SELECT embedding::text FROM chunks WHERE document_id = $1 AND embedding IS NOT NULL ORDER BY seq`, documentID)
+	if err != nil {
+		t.Fatalf("select embeddings of %s: %v", documentID, err)
+	}
+	defer rows.Close()
+	var vectors [][]float32
+	for rows.Next() {
+		var text string
+		if err := rows.Scan(&text); err != nil {
+			t.Fatal(err)
+		}
+		vectors = append(vectors, parseVector(t, text))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return vectors
+}
+
+// parseVector reads pgvector's text form, [0.1,0.2].
+func parseVector(t *testing.T, text string) []float32 {
+	t.Helper()
+	inner := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(text), "["), "]")
+	if inner == "" {
+		return nil
+	}
+	parts := strings.Split(inner, ",")
+	vec := make([]float32, len(parts))
+	for i, part := range parts {
+		f, err := strconv.ParseFloat(strings.TrimSpace(part), 32)
+		if err != nil {
+			t.Fatalf("parse vector %q: %v", text, err)
+		}
+		vec[i] = float32(f)
+	}
+	return vec
+}
+
+// checkTrace asserts the two steps dense retrieval records.
+func checkTrace(t *testing.T, trace []traceStep, candidates int) {
+	t.Helper()
+	if len(trace) != 2 {
+		t.Fatalf("trace = %+v, want the embed and the search steps", trace)
+	}
+	if step := trace[0]; step.Step != "embed_query" || step.Technique != "dense" || step.Model != embeddingModel || step.DurationMS < 0 {
+		t.Errorf("trace[0] = %+v, want the embed step naming %q", step, embeddingModel)
+	}
+	if step := trace[1]; step.Step != "search" || step.Technique != "dense" || step.Candidates != candidates || step.DurationMS < 0 {
+		t.Errorf("trace[1] = %+v, want the search step with %d candidates", step, candidates)
+	}
+}
+
+// TestRetrieveReturnsOnlyChunksOfDocumentsTheCallerCanRead is the leakage
+// test for the retrieval path: Bob never receives Chunks of Alice's
+// Restricted Document, even though the query vector is pinned exactly to one
+// of them, and Alice does receive them, first.
+func TestRetrieveReturnsOnlyChunksOfDocumentsTheCallerCanRead(t *testing.T) {
+	tr := start(t)
+	alice := tr.principalKey(t, "alice")
+	bob := tr.principalKey(t, "bob")
+
+	secretID := tr.upload(t, alice, "secret.md", "# Secret\n\nThe launch code is 1234.\n")
+	// A Document Alice shares with Bob through its Access List.
+	sharedID := tr.uploadBytesWithFields(t, alice, "shared.md",
+		[]byte("# Shared\n\nThis note is for bob.\n"), map[string]string{"principals": "bob"})
+	bobID := tr.upload(t, bob, "bob.md", "# Bob\n\nBob's own note.\n")
+
+	for _, doc := range []struct{ id, key, name string }{
+		{secretID, alice, "Alice's secret"},
+		{sharedID, alice, "Alice's shared"},
+		{bobID, bob, "Bob's own"},
+	} {
+		if got := tr.waitForIngest(t, doc.key, doc.id); got.ParseStatus != "completed" {
+			t.Fatalf("%s Document parse_status = %q (%q), want completed", doc.name, got.ParseStatus, got.ParseError)
+		}
+	}
+
+	// Pin the query to the secret's first Chunk vector: if the search ignored
+	// the readable set, that Chunk would rank first for Bob too.
+	vectors := tr.chunkVectors(t, secretID)
+	if len(vectors) == 0 {
+		t.Fatal("the secret Document has no embedded Chunk")
+	}
+	tr.provider.EmbedAs(retrieveQuery, vectors[0])
+
+	bobAnswer := tr.retrieve(t, bob, retrieveQuery)
+	bobDocs := map[string]bool{}
+	for _, result := range bobAnswer.Data.Results {
+		if result.DocumentID == secretID {
+			t.Errorf("bob received Chunk %s of alice's Restricted Document", result.ChunkID)
+		}
+		bobDocs[result.DocumentID] = true
+	}
+	if !bobDocs[sharedID] {
+		t.Errorf("bob's results = %v, want the shared Document %s", bobDocs, sharedID)
+	}
+	if !bobDocs[bobID] {
+		t.Errorf("bob's results = %v, want his own Document %s", bobDocs, bobID)
+	}
+	if len(bobAnswer.Data.Results) == 0 {
+		t.Fatal("bob received no results, want the Documents he can read")
+	}
+	for i, result := range bobAnswer.Data.Results {
+		if dense, ok := result.Scores["dense"]; !ok || math.Abs(dense-result.Score) > 1e-9 {
+			t.Errorf("result %s scores = %v, score %v; want a matching dense entry", result.ChunkID, result.Scores, result.Score)
+		}
+		if i > 0 && bobAnswer.Data.Results[i-1].Score < result.Score {
+			t.Errorf("results out of order at %d: %v then %v", i, bobAnswer.Data.Results[i-1].Score, result.Score)
+		}
+	}
+	checkTrace(t, bobAnswer.Data.Trace, len(bobAnswer.Data.Results))
+
+	aliceAnswer := tr.retrieve(t, alice, retrieveQuery)
+	if len(aliceAnswer.Data.Results) == 0 {
+		t.Fatal("alice received no results, want her own Documents")
+	}
+	first := aliceAnswer.Data.Results[0]
+	if first.DocumentID != secretID {
+		t.Errorf("alice's first result is from %s, want the secret Document %s its pinned vector ranks first",
+			first.DocumentID, secretID)
+	}
+	if math.Abs(first.Score-1) > 1e-4 {
+		t.Errorf("alice's first result score = %v, want cosine similarity 1", first.Score)
+	}
+	if first.Content == "" || first.ChunkID == "" || first.Scores["dense"] != first.Score {
+		t.Errorf("alice's first result = %+v, want a Chunk with content and a dense score", first)
+	}
+	checkTrace(t, aliceAnswer.Data.Trace, len(aliceAnswer.Data.Results))
+
+	// The query itself is what the service embedded, not a Chunk or a batch
+	// of them.
+	sawQuery := false
+	for _, req := range tr.provider.Requests(modeltest.Embeddings) {
+		var body struct {
+			Input []string `json:"input"`
+		}
+		if json.Unmarshal(req.Body, &body) != nil {
+			continue
+		}
+		for _, text := range body.Input {
+			if text == retrieveQuery {
+				sawQuery = true
+			}
+		}
+	}
+	if !sawQuery {
+		t.Error("the embedding provider never saw the query text on /embeddings")
+	}
+}

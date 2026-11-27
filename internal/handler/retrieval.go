@@ -1,0 +1,124 @@
+package handler
+
+import (
+	"bytes"
+	"encoding/json"
+	stderrors "errors"
+	"io"
+	"net/http"
+	"strings"
+
+	"github.com/phongnd2802/trelis/internal/errors"
+	"github.com/phongnd2802/trelis/internal/types"
+	"github.com/phongnd2802/trelis/internal/types/interfaces"
+)
+
+// retrievalBodyLimit bounds a POST /retrieve body. The request is a query
+// and a small config, so anything larger is a client mistake worth refusing
+// before it is decoded.
+const retrievalBodyLimit = 64 << 10
+
+// unknownJSONFieldPrefix is how encoding/json reports a field the struct does
+// not declare when DisallowUnknownFields is set.
+const unknownJSONFieldPrefix = `json: unknown field "`
+
+// RetrievalHandler processes HTTP requests that search the Documents the
+// caller can read.
+type RetrievalHandler struct {
+	service interfaces.RetrievalService
+}
+
+// NewRetrievalHandler creates a new retrieval handler.
+func NewRetrievalHandler(service interfaces.RetrievalService) *RetrievalHandler {
+	return &RetrievalHandler{service: service}
+}
+
+// Retrieve answers POST /retrieve with the ranked Chunks of the Documents the
+// caller can read, the score of every Retrieval Technique that found them and
+// a trace of the steps. A caller who can read nothing gets an empty result,
+// never a 404, so the answer reveals nothing about what exists.
+//
+//	@Summary		Retrieve Chunks for a query
+//	@Description	Runs the Retrieval Techniques named in retrieval_config (dense today) over the Documents the caller can read and returns the ranked Chunks with per-technique scores and a step trace. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values and unknown techniques are 400; a body over 64 KiB is 413; without models.embedding, dense retrieval is 503.
+//	@Tags			retrieval
+//	@Accept			json
+//	@Produce		json
+//	@Security		bearerAuth
+//	@Param			request	body		types.RetrievalRequest	true	"The query, how many Chunks to return and which Retrieval Techniques to run"
+//	@Success		200		{object}	handler.DataResponse{data=types.RetrievalResult}
+//	@Failure		400		{object}	handler.ErrorResponse	"Body that is not one JSON object, an unknown field or wrong value type, a blank or too-long query, an out-of-range top_k or an invalid retrieval_config"
+//	@Failure		401		{object}	router.ErrorResponse	"Missing or invalid API key"
+//	@Failure		413		{object}	handler.ErrorResponse	"Request body larger than 64 KiB"
+//	@Failure		500		{object}	handler.ErrorResponse	"Internal server error; a failed API key check answers the router's error body instead"
+//	@Failure		503		{object}	handler.ErrorResponse	"models.embedding is not configured, so dense retrieval is unavailable"
+//	@Router			/retrieve [post]
+func (h *RetrievalHandler) Retrieve(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, retrievalBodyLimit)
+	req, appErr := decodeRetrievalRequest(r)
+	if appErr != nil {
+		writeError(w, r, appErr)
+		return
+	}
+	result, err := h.service.Retrieve(r.Context(), req)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeData(r.Context(), w, http.StatusOK, result)
+}
+
+// decodeRetrievalRequest decodes the one JSON object a POST /retrieve body
+// must hold. A body that is not JSON, not an object, or holds more than one
+// object is an ErrBadRequest; an unknown field or a field of the wrong type
+// is a validation error, the same kind of client mistake as a bad
+// retrieval_config.
+func decodeRetrievalRequest(r *http.Request) (*types.RetrievalRequest, *errors.AppError) {
+	dec := json.NewDecoder(r.Body)
+	var raw json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
+		return nil, retrievalBodyError(err)
+	}
+	// The one-object check stays a bad request whatever the second value is.
+	if err := dec.Decode(&struct{}{}); !stderrors.Is(err, io.EOF) {
+		if isRequestBodyTooLarge(err) {
+			return nil, errors.NewRequestEntityTooLargeError("Request body cannot exceed 64KB")
+		}
+		return nil, errors.NewBadRequestError("Invalid request body").
+			WithDetails("the body must hold exactly one JSON object")
+	}
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, errors.NewBadRequestError("Invalid request body").
+			WithDetails("the body must be a JSON object")
+	}
+
+	var req types.RetrievalRequest
+	obj := json.NewDecoder(bytes.NewReader(raw))
+	// A typo in a config key must be an error, not a silently ignored field
+	// that changes which techniques run.
+	obj.DisallowUnknownFields()
+	if err := obj.Decode(&req); err != nil {
+		return nil, retrievalBodyError(err)
+	}
+	return &req, nil
+}
+
+// retrievalBodyError maps a decoding failure to the status its kind deserves.
+func retrievalBodyError(err error) *errors.AppError {
+	if isRequestBodyTooLarge(err) {
+		return errors.NewRequestEntityTooLargeError("Request body cannot exceed 64KB")
+	}
+	if isRetrievalValidationError(err) {
+		return errors.NewValidationError("Invalid request body").WithDetails(err.Error())
+	}
+	return errors.NewBadRequestError("Invalid request body").WithDetails(err.Error())
+}
+
+// isRetrievalValidationError reports whether err is a well-formed JSON body
+// with a field or value the request does not accept.
+func isRetrievalValidationError(err error) bool {
+	if strings.HasPrefix(err.Error(), unknownJSONFieldPrefix) {
+		return true
+	}
+	var typeErr *json.UnmarshalTypeError
+	return stderrors.As(err, &typeErr)
+}

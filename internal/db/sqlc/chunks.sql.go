@@ -112,6 +112,73 @@ func (q *Queries) ListUnembeddedChunksByDocument(ctx context.Context, arg ListUn
 	return items, nil
 }
 
+const searchDenseChunks = `-- name: SearchDenseChunks :many
+SELECT id, document_id, seq, content, context_header,
+       (1 - (embedding <=> $1::text::vector))::float8 AS score
+FROM chunks
+WHERE document_id = ANY($2::uuid[])
+  AND embedding_model = $3::text
+  AND embedding IS NOT NULL
+  -- A zero-norm vector makes cosine distance NaN; it can never be a match
+  -- and would not survive JSON encoding either.
+  AND (embedding <=> $1::text::vector) <> 'NaN'::float8
+ORDER BY embedding <=> $1::text::vector, id
+LIMIT $4
+`
+
+type SearchDenseChunksParams struct {
+	QueryEmbedding string
+	DocumentIds    []uuid.UUID
+	EmbeddingModel string
+	TopK           int32
+}
+
+type SearchDenseChunksRow struct {
+	ID            uuid.UUID
+	DocumentID    uuid.UUID
+	Seq           int32
+	Content       string
+	ContextHeader string
+	Score         float64
+}
+
+// Dense retrieval: rank the Chunks of the readable Documents by cosine
+// similarity to the query vector. Exact scan on purpose: no HNSW index yet,
+// so recall is perfect while the eval baseline is built; add the index when
+// latency, not recall, is the constraint. Only Chunks embedded by the same
+// model are comparable, and NULL embeddings cannot be searched at all.
+func (q *Queries) SearchDenseChunks(ctx context.Context, arg SearchDenseChunksParams) ([]SearchDenseChunksRow, error) {
+	rows, err := q.db.Query(ctx, searchDenseChunks,
+		arg.QueryEmbedding,
+		arg.DocumentIds,
+		arg.EmbeddingModel,
+		arg.TopK,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SearchDenseChunksRow
+	for rows.Next() {
+		var i SearchDenseChunksRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.DocumentID,
+			&i.Seq,
+			&i.Content,
+			&i.ContextHeader,
+			&i.Score,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const setChunkEmbedding = `-- name: SetChunkEmbedding :execrows
 UPDATE chunks
 SET embedding = $1::text::vector,

@@ -42,6 +42,15 @@ LIMIT @page_limit OFFSET @page_offset;
 -- name: CountReadableDocuments :one
 SELECT count(*) FROM documents WHERE can_read_document(id, @principal_id::uuid);
 
+-- The Documents a Principal can read that finished ingest. Retrieval passes
+-- this set into every search; a Document still processing has only part of
+-- its Chunks embedded, so it is left out until it is completed.
+-- name: ListReadableDocumentIDs :many
+SELECT id FROM documents
+WHERE parse_status = 'completed'
+  AND can_read_document(id, @principal_id::uuid)
+ORDER BY id;
+
 -- No row when the Document does not exist or the Principal cannot read it,
 -- so callers cannot tell the two apart.
 -- name: GetReadableDocument :one

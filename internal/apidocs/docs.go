@@ -382,6 +382,87 @@ const docTemplate = `{
                     }
                 }
             }
+        },
+        "/retrieve": {
+            "post": {
+                "security": [
+                    {
+                        "bearerAuth": []
+                    }
+                ],
+                "description": "Runs the Retrieval Techniques named in retrieval_config (dense today) over the Documents the caller can read and returns the ranked Chunks with per-technique scores and a step trace. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values and unknown techniques are 400; a body over 64 KiB is 413; without models.embedding, dense retrieval is 503.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "retrieval"
+                ],
+                "summary": "Retrieve Chunks for a query",
+                "parameters": [
+                    {
+                        "description": "The query, how many Chunks to return and which Retrieval Techniques to run",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/types.RetrievalRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/handler.DataResponse"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/types.RetrievalResult"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "400": {
+                        "description": "Body that is not one JSON object, an unknown field or wrong value type, a blank or too-long query, an out-of-range top_k or an invalid retrieval_config",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Missing or invalid API key",
+                        "schema": {
+                            "$ref": "#/definitions/router.ErrorResponse"
+                        }
+                    },
+                    "413": {
+                        "description": "Request body larger than 64 KiB",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error; a failed API key check answers the router's error body instead",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "models.embedding is not configured, so dense retrieval is unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
+            }
         }
     },
     "definitions": {
@@ -625,6 +706,124 @@ const docTemplate = `{
                     "type": "string"
                 }
             }
+        },
+        "types.RetrievalConfig": {
+            "type": "object",
+            "properties": {
+                "techniques": {
+                    "description": "Techniques is the set of Retrieval Techniques to run, without\nduplicates.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/types.RetrievalTechnique"
+                    }
+                }
+            }
+        },
+        "types.RetrievalRequest": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "description": "Query is the question to find Chunks for.",
+                    "type": "string"
+                },
+                "retrieval_config": {
+                    "description": "RetrievalConfig is the combination of techniques to run; nil means\ndense alone.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/types.RetrievalConfig"
+                        }
+                    ]
+                },
+                "top_k": {
+                    "description": "TopK is how many Chunks to return; nil means the default. An explicit\n0 is invalid, so a client that sends it learns it is out of range\ninstead of silently getting the default.",
+                    "type": "integer"
+                }
+            }
+        },
+        "types.RetrievalResult": {
+            "type": "object",
+            "properties": {
+                "results": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/types.RetrievedChunk"
+                    }
+                },
+                "trace": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/types.TraceStep"
+                    }
+                }
+            }
+        },
+        "types.RetrievalTechnique": {
+            "type": "string",
+            "enum": [
+                "dense"
+            ],
+            "x-enum-varnames": [
+                "RetrievalTechniqueDense"
+            ]
+        },
+        "types.RetrievedChunk": {
+            "type": "object",
+            "properties": {
+                "chunk_id": {
+                    "type": "string"
+                },
+                "content": {
+                    "type": "string"
+                },
+                "context_header": {
+                    "type": "string"
+                },
+                "document_id": {
+                    "type": "string"
+                },
+                "score": {
+                    "type": "number"
+                },
+                "scores": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "number",
+                        "format": "float64"
+                    }
+                },
+                "seq": {
+                    "type": "integer"
+                }
+            }
+        },
+        "types.TraceStep": {
+            "type": "object",
+            "properties": {
+                "candidates": {
+                    "description": "Candidates is how many Chunks the search returned, on the search step.\nIt is a pointer so the search step reports 0 while the embed step,\nwhich has no candidate count, leaves the field out.",
+                    "type": "integer"
+                },
+                "duration_ms": {
+                    "description": "DurationMS is how long the step took, in milliseconds.",
+                    "type": "integer"
+                },
+                "model": {
+                    "description": "Model is the embedding model, on the step that called one.",
+                    "type": "string"
+                },
+                "step": {
+                    "description": "Step names what ran, e.g. TraceStepEmbedQuery.",
+                    "type": "string"
+                },
+                "technique": {
+                    "description": "Technique is the Retrieval Technique the step belongs to.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/types.RetrievalTechnique"
+                        }
+                    ]
+                }
+            }
         }
     },
     "securityDefinitions": {
@@ -644,7 +843,7 @@ var SwaggerInfo = &swag.Spec{
 	BasePath:         "/",
 	Schemes:          []string{},
 	Title:            "Trelis API",
-	Description:      "HTTP API for uploading and reading Documents. Every route except the probes needs an API key.",
+	Description:      "HTTP API for uploading, reading and searching Documents. Every route except the probes needs an API key.",
 	InfoInstanceName: "swagger",
 	SwaggerTemplate:  docTemplate,
 	LeftDelim:        "{{",

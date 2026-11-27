@@ -171,10 +171,97 @@ definitions:
       name:
         type: string
     type: object
+  types.RetrievalConfig:
+    properties:
+      techniques:
+        description: |-
+          Techniques is the set of Retrieval Techniques to run, without
+          duplicates.
+        items:
+          $ref: '#/definitions/types.RetrievalTechnique'
+        type: array
+    type: object
+  types.RetrievalRequest:
+    properties:
+      query:
+        description: Query is the question to find Chunks for.
+        type: string
+      retrieval_config:
+        allOf:
+        - $ref: '#/definitions/types.RetrievalConfig'
+        description: |-
+          RetrievalConfig is the combination of techniques to run; nil means
+          dense alone.
+      top_k:
+        description: |-
+          TopK is how many Chunks to return; nil means the default. An explicit
+          0 is invalid, so a client that sends it learns it is out of range
+          instead of silently getting the default.
+        type: integer
+    type: object
+  types.RetrievalResult:
+    properties:
+      results:
+        items:
+          $ref: '#/definitions/types.RetrievedChunk'
+        type: array
+      trace:
+        items:
+          $ref: '#/definitions/types.TraceStep'
+        type: array
+    type: object
+  types.RetrievalTechnique:
+    enum:
+    - dense
+    type: string
+    x-enum-varnames:
+    - RetrievalTechniqueDense
+  types.RetrievedChunk:
+    properties:
+      chunk_id:
+        type: string
+      content:
+        type: string
+      context_header:
+        type: string
+      document_id:
+        type: string
+      score:
+        type: number
+      scores:
+        additionalProperties:
+          format: float64
+          type: number
+        type: object
+      seq:
+        type: integer
+    type: object
+  types.TraceStep:
+    properties:
+      candidates:
+        description: |-
+          Candidates is how many Chunks the search returned, on the search step.
+          It is a pointer so the search step reports 0 while the embed step,
+          which has no candidate count, leaves the field out.
+        type: integer
+      duration_ms:
+        description: DurationMS is how long the step took, in milliseconds.
+        type: integer
+      model:
+        description: Model is the embedding model, on the step that called one.
+        type: string
+      step:
+        description: Step names what ran, e.g. TraceStepEmbedQuery.
+        type: string
+      technique:
+        allOf:
+        - $ref: '#/definitions/types.RetrievalTechnique'
+        description: Technique is the Retrieval Technique the step belongs to.
+    type: object
 info:
   contact: {}
-  description: HTTP API for uploading and reading Documents. Every route except the
-    probes needs an API key.
+  description: HTTP API for uploading, reading and searching Documents. Every route
+    except the probes needs an API key.
   title: Trelis API
   version: 0.1.0
 paths:
@@ -425,6 +512,64 @@ paths:
       summary: Readiness probe
       tags:
       - system
+  /retrieve:
+    post:
+      consumes:
+      - application/json
+      description: Runs the Retrieval Techniques named in retrieval_config (dense
+        today) over the Documents the caller can read and returns the ranked Chunks
+        with per-technique scores and a step trace. A caller who can read nothing
+        gets 200 with an empty results list. Malformed JSON, unknown fields, invalid
+        values and unknown techniques are 400; a body over 64 KiB is 413; without
+        models.embedding, dense retrieval is 503.
+      parameters:
+      - description: The query, how many Chunks to return and which Retrieval Techniques
+          to run
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/types.RetrievalRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/handler.DataResponse'
+            - properties:
+                data:
+                  $ref: '#/definitions/types.RetrievalResult'
+              type: object
+        "400":
+          description: Body that is not one JSON object, an unknown field or wrong
+            value type, a blank or too-long query, an out-of-range top_k or an invalid
+            retrieval_config
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "401":
+          description: Missing or invalid API key
+          schema:
+            $ref: '#/definitions/router.ErrorResponse'
+        "413":
+          description: Request body larger than 64 KiB
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal server error; a failed API key check answers the router's
+            error body instead
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "503":
+          description: models.embedding is not configured, so dense retrieval is unavailable
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - bearerAuth: []
+      summary: Retrieve Chunks for a query
+      tags:
+      - retrieval
 securityDefinitions:
   bearerAuth:
     description: Paste "Bearer <key>", with a key from `trelis admin key create <principal>`
