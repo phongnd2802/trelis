@@ -21,8 +21,9 @@ The first row of the Ablation Matrix: dense retrieval alone.
 | nDCG@10 | 0.678 |
 | Latency p50 / p95 | 23.9 s / 34.5 s at concurrency 4 |
 
-The 59 `null_query` questions are skipped, with 0 errors. These are point
-estimates; confidence intervals come with #40.
+The 59 `null_query` questions are skipped, with 0 errors. Run
+`uv run --project eval trelis-eval report eval/baselines` for the 95%
+confidence interval on every value.
 
 How it was produced (2026-11-27, Trelis `6beccaa`, harness 0.1.0):
 
@@ -67,7 +68,8 @@ Set.
 | `bm25+dense` | 0.666 | 0.811 | 0.828 | 0.714 | 244 ms / 259 ms |
 
 n = 441 scored for each, with the 59 `null_query` questions skipped and 0
-errors. These are point estimates; confidence intervals come with #40.
+errors. Run `uv run --project eval trelis-eval report eval/baselines` for the
+95% confidence interval on every value.
 
 The re-run dense row matches `dense-strat500-seed1.jsonl` to within 0.002 on
 every metric, which is why that file stays the dense reference.

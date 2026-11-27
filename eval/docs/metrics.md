@@ -87,6 +87,62 @@ flight at once, recorded in the header): requests that share Trelis and the
 model provider wait on each other, so compare latencies only between runs at
 the same concurrency. The metrics do not depend on it.
 
+## Confidence intervals
+
+The Ablation Matrix report gives every metric mean and both latency
+percentiles a 95% confidence interval. The interval is a percentile bootstrap
+over the questions that were scored:
+
+- each resample draws the scored questions with replacement at the same size
+  as the scored set; a metric's per-question value is one observation, and the
+  latency percentiles use the per-call `latency_ms` of the same questions;
+- the statistic is computed on every resample: the mean for Recall@5,
+  Recall@10, MRR and nDCG@10, and the nearest-rank percentile for latency;
+- the resample statistics are sorted, and the bounds are the values at rank
+  `ceil(q * resamples)` (1-based, at least 1) for `q = 0.025` and
+  `q = 0.975`, computed with exact integer arithmetic. The tail is rounded
+  once to basis points, so the 0.95 default is exactly 2.5% and not the
+  nearest binary float. This is the same nearest-rank rule as the latency
+  summary;
+- the default is 10,000 resamples with seed 1. A row with no scored question
+  shows `n/a` for every metric and both latencies, never `0`; constant values
+  give the value at both bounds.
+
+The bootstrap is seeded, and each (row, metric) draws from its own
+`random.Random(f"{seed}:{config_name}:{metric}")`, so adding, removing or
+reordering rows leaves another row's interval unchanged. The same results
+files and seed give byte-identical Markdown and HTML. The interval describes
+the sampled Golden questions, not a rerun of the same questions.
+
+## The Ablation Matrix report
+
+`trelis-eval report` turns results files into the Ablation Matrix:
+
+```sh
+uv run --project eval trelis-eval report eval/baselines
+```
+
+`RESULTS` is one or more results files; a directory contributes every
+`*.jsonl` in it, sorted by name. The command writes
+`<out-dir>/ablation-matrix.md` and `<out-dir>/ablation-matrix.html` (default
+`eval/reports`) and prints both paths. It reads the files only: no HTTP
+request and no API key. Nothing in the report depends on the wall clock, so
+the same files and seed reproduce it byte for byte.
+
+The matrix has one row per Retrieval Config: Recall@5, Recall@10, MRR,
+nDCG@10, latency p50 and p95, each as `point [low, high]`, then the scored,
+skipped and error counts and the run's `concurrency`. The header records the
+Golden Set path and SHA-256, its question count, `top_k`, the seed, the
+resample count and the confidence level; a second table records each row's
+`run_id` and harness version.
+
+The files must share the Golden Set SHA-256 and `top_k`, and no two may name
+the same Retrieval Config; different `run_id`s are fine, because the baselines
+come from different runs. The command exits 1 with `error: ...` when they do
+not. Latency is measured under the run's `concurrency`, which is shown per
+row; a report mixing concurrency levels says so, because latency compares
+only at the same one.
+
 ## Questions that are not scored
 
 A `null_query` has no evidence: its expected answer is "insufficient
