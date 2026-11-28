@@ -35,6 +35,8 @@ type Chunk struct {
 	Embedding string
 	// Model that produced embedding; NULL while embedding is NULL
 	EmbeddingModel pgtype.Text
+	// Parent Chunk of the Chunk; NULL when the Document was ingested without parent-child mode or before it was enabled, so a reader falls back to the Chunk itself
+	ParentID pgtype.UUID
 }
 
 type Document struct {
@@ -74,6 +76,20 @@ type Group struct {
 type GroupMember struct {
 	GroupID     uuid.UUID
 	PrincipalID uuid.UUID
+}
+
+type ParentChunk struct {
+	ID         uuid.UUID
+	DocumentID uuid.UUID
+	// Position of the Parent Chunk in its Document, from 0
+	Seq           int32
+	Content       string
+	ContextHeader string
+	// First rune of the Markdown held in content
+	StartOffset int32
+	// Rune just past the last one held in content
+	EndOffset int32
+	CreatedAt time.Time
 }
 
 type Principal struct {

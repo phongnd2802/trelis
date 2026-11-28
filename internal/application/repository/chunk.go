@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/phongnd2802/trelis/internal/db"
 	"github.com/phongnd2802/trelis/internal/db/sqlc"
@@ -62,24 +63,65 @@ func (r *chunkRepository) GetReadableChunk(ctx context.Context, principalID, id 
 	}, nil
 }
 
-// ReplaceChunks deletes a Document's Chunks and inserts chunks in order. It
-// starts no transaction of its own: call it inside the service's ExecTx so a
-// failed insert leaves the previous set in place.
-func (r *chunkRepository) ReplaceChunks(ctx context.Context, documentID uuid.UUID, chunks []*types.Chunk) error {
+// ReplaceChunks deletes a Document's Chunks and Parent Chunks and inserts set
+// in order. It starts no transaction of its own: call it inside the service's
+// ExecTx so a failed insert leaves the previous set in place. It deletes the
+// Chunks before the Parent Chunks because the Chunks carry the Parent Chunk
+// links, then inserts the Parent Chunks before the Chunks because the Chunks
+// need their IDs; a Document re-ingested without parent-child mode keeps no
+// Parent Chunk.
+func (r *chunkRepository) ReplaceChunks(ctx context.Context, documentID uuid.UUID, set types.ChunkSet) error {
+	if len(set.Parents) == 0 && len(set.ParentOf) != 0 {
+		return fmt.Errorf("replace chunks of document %s: %d Parent Chunk links but no Parent Chunks", documentID, len(set.ParentOf))
+	}
+	if len(set.Parents) != 0 && len(set.ParentOf) != len(set.Chunks) {
+		return fmt.Errorf("replace chunks of document %s: %d Parent Chunk links for %d Chunks",
+			documentID, len(set.ParentOf), len(set.Chunks))
+	}
+	for i, parent := range set.ParentOf {
+		if parent < 0 || parent >= len(set.Parents) {
+			return fmt.Errorf("replace chunks of document %s: Chunk %d names Parent Chunk %d of %d",
+				documentID, i, parent, len(set.Parents))
+		}
+	}
+
 	q := r.store.Querier(ctx)
 	if err := q.DeleteChunksByDocument(ctx, documentID); err != nil {
 		return fmt.Errorf("delete chunks of document %s: %w", documentID, err)
 	}
-	for _, c := range chunks {
-		err := q.InsertChunk(ctx, sqlc.InsertChunkParams{
+	if err := q.DeleteParentChunksByDocument(ctx, documentID); err != nil {
+		return fmt.Errorf("delete Parent Chunks of document %s: %w", documentID, err)
+	}
+
+	parentIDs := make([]uuid.UUID, len(set.Parents))
+	for i, p := range set.Parents {
+		id, err := q.InsertParentChunk(ctx, sqlc.InsertParentChunkParams{
+			DocumentID:    documentID,
+			Seq:           int32(p.Seq),
+			Content:       p.Content,
+			ContextHeader: p.ContextHeader,
+			StartOffset:   int32(p.StartOffset),
+			EndOffset:     int32(p.EndOffset),
+		})
+		if err != nil {
+			return fmt.Errorf("insert Parent Chunk %d of document %s: %w", p.Seq, documentID, err)
+		}
+		parentIDs[i] = id
+	}
+
+	for i, c := range set.Chunks {
+		params := sqlc.InsertChunkParams{
 			DocumentID:    documentID,
 			Seq:           int32(c.Seq),
 			Content:       c.Content,
 			ContextHeader: c.ContextHeader,
 			StartOffset:   int32(c.StartOffset),
 			EndOffset:     int32(c.EndOffset),
-		})
-		if err != nil {
+		}
+		if len(set.ParentOf) != 0 {
+			params.ParentID = pgtype.UUID{Bytes: parentIDs[set.ParentOf[i]], Valid: true}
+		}
+		if err := q.InsertChunk(ctx, params); err != nil {
 			return fmt.Errorf("insert chunk %d of document %s: %w", c.Seq, documentID, err)
 		}
 	}

@@ -20,8 +20,8 @@ const (
 const (
 	DefaultChunkSize    = 512
 	DefaultChunkOverlap = 80
-	// DefaultParentChunkSize is the default size of a parent window in
-	// parent-child mode. #31 will set it as the config default.
+	// DefaultParentChunkSize is the default size of a Parent Chunk in
+	// parent-child mode.
 	DefaultParentChunkSize = 2048
 )
 
@@ -48,11 +48,11 @@ type SplitterConfig struct {
 	// Languages hints the language for token estimates. Empty means
 	// detect it from the text.
 	Languages []string
-	// ParentChunkSize turns on parent-child splitting when over 0: parents
-	// pack consecutive child Chunks into windows of at most this many runes.
+	// ParentChunkSize turns on parent-child splitting when over 0: Parent Chunks
+	// pack consecutive Chunks into groups of at most this many runes.
 	// NormalizeSplitterConfig raises a set value below twice ChunkSize,
-	// because a parent barely larger than a child makes the mode pointless.
-	// A negative value means off, like 0.
+	// because a Parent Chunk barely larger than a Chunk makes the mode
+	// pointless. A negative value means off, like 0.
 	ParentChunkSize int
 }
 

@@ -25,54 +25,60 @@ type ingestService struct {
 	chunks    interfaces.ChunkRepository
 	files     interfaces.FileService
 	parser    interfaces.DocumentParser
+	// splitter is the tier, sizes and parent-child mode ingest runs.
+	splitter chunker.SplitterConfig
 	// embedder is nil when models.embedding is not configured, which makes
 	// EmbedBatch fail with a *types.EmbeddingUnconfiguredError.
 	embedder interfaces.Embedder
 }
 
 // NewIngestService returns the use cases the ingest activities run. embedder
-// may be nil when no embedding model is configured.
+// may be nil when no embedding model is configured. splitter carries the
+// chunking settings; a zero value splits with the chunker defaults.
 func NewIngestService(store db.Store, documents interfaces.DocumentRepository,
 	chunks interfaces.ChunkRepository, files interfaces.FileService, parser interfaces.DocumentParser,
-	embedder interfaces.Embedder,
+	embedder interfaces.Embedder, splitter chunker.SplitterConfig,
 ) interfaces.IngestService {
-	return &ingestService{store: store, documents: documents, chunks: chunks, files: files, parser: parser, embedder: embedder}
+	return &ingestService{store: store, documents: documents, chunks: chunks, files: files,
+		parser: parser, embedder: embedder, splitter: splitter}
 }
 
 // ParseAndChunk parses a Document's Source File, splits the Markdown into
-// Chunks and, in one transaction, replaces the Document's Chunks. It leaves
-// the Document processing for the embed batches; Complete marks it completed
-// once every Chunk has a vector. It returns how many Chunks it stored. A
-// *types.UnparseableError means the Source File cannot be turned into text; a
-// *types.DocumentNotFoundError means the row is gone. Neither can be fixed
-// by retrying; a storage or database failure is not, so the activity retries
-// it.
-func (s *ingestService) ParseAndChunk(ctx context.Context, documentID uuid.UUID) (int, error) {
+// Chunks and, in one transaction, replaces the Document's Chunks and Parent
+// Chunks. It leaves the Document processing for the embed batches; Complete
+// marks it completed once every Chunk has a vector. It reports what it stored
+// and how the tier chain chose it. With parent-child mode off only the Chunks
+// are stored; with it on the Parent Chunks are stored as well but never
+// embedded. A *types.UnparseableError means the Source File cannot be turned
+// into text; a *types.DocumentNotFoundError means the row is gone. Neither
+// can be fixed by retrying; a storage or database failure is not, so the
+// activity retries it.
+func (s *ingestService) ParseAndChunk(ctx context.Context, documentID uuid.UUID) (types.ChunkingResult, error) {
 	doc, err := s.documents.GetDocumentByID(ctx, documentID)
 	if errors.Is(err, repository.ErrDocumentNotFound) {
-		return 0, &types.DocumentNotFoundError{}
+		return types.ChunkingResult{}, &types.DocumentNotFoundError{}
 	}
 	if err != nil {
-		return 0, err
+		return types.ChunkingResult{}, err
 	}
 	if err := s.documents.SetParseStatus(ctx, documentID, types.ParseStatusProcessing, ""); err != nil {
 		if errors.Is(err, repository.ErrDocumentNotFound) {
-			return 0, &types.DocumentNotFoundError{}
+			return types.ChunkingResult{}, &types.DocumentNotFoundError{}
 		}
-		return 0, err
+		return types.ChunkingResult{}, err
 	}
 
 	body, err := s.files.GetFile(ctx, doc.ObjectKey)
 	if err != nil {
-		return 0, fmt.Errorf("open Source File of document %s: %w", documentID, err)
+		return types.ChunkingResult{}, fmt.Errorf("open Source File of document %s: %w", documentID, err)
 	}
 	fileContent, readErr := io.ReadAll(body)
 	closeErr := body.Close()
 	if readErr != nil {
-		return 0, fmt.Errorf("read Source File of document %s: %w", documentID, readErr)
+		return types.ChunkingResult{}, fmt.Errorf("read Source File of document %s: %w", documentID, readErr)
 	}
 	if closeErr != nil {
-		return 0, fmt.Errorf("close Source File of document %s: %w", documentID, closeErr)
+		return types.ChunkingResult{}, fmt.Errorf("close Source File of document %s: %w", documentID, closeErr)
 	}
 
 	result, err := s.parser.Parse(ctx, &types.ParseRequest{
@@ -82,33 +88,82 @@ func (s *ingestService) ParseAndChunk(ctx context.Context, documentID uuid.UUID)
 		Title:       doc.Title,
 	})
 	if err != nil {
-		return 0, types.NewUnparseableError("the Source File could not be parsed", err)
+		return types.ChunkingResult{}, types.NewUnparseableError("the Source File could not be parsed", err)
 	}
-	pieces := chunker.Split(result.MarkdownContent, chunker.DefaultConfig())
-	if len(pieces) == 0 {
-		// Split has no Chunks only when the Markdown is blank, which no
+	split, diag := chunker.SplitParentChildWithDiagnostics(result.MarkdownContent, s.splitter)
+	if len(split.Children) == 0 {
+		// The splitter has no Chunks only when the Markdown is blank, which no
 		// retry can change.
-		return 0, types.NewUnparseableError("the Source File has no extractable text", nil)
+		return types.ChunkingResult{}, types.NewUnparseableError("the Source File has no extractable text", nil)
 	}
-	chunks := make([]*types.Chunk, 0, len(pieces))
-	for _, piece := range pieces {
-		chunks = append(chunks, &types.Chunk{
-			DocumentID:    documentID,
-			Seq:           piece.Seq,
-			Content:       piece.Content,
-			ContextHeader: piece.ContextHeader,
-			StartOffset:   piece.Start,
-			EndOffset:     piece.End,
-		})
-	}
+	withParents := s.splitter.ParentChunkSize > 0
+	set := chunkSet(documentID, split, withParents)
 
 	err = s.store.ExecTx(ctx, func(ctx context.Context) error {
-		return s.chunks.ReplaceChunks(ctx, documentID, chunks)
+		return s.chunks.ReplaceChunks(ctx, documentID, set)
 	})
 	if err != nil {
-		return 0, err
+		return types.ChunkingResult{}, err
 	}
-	return len(chunks), nil
+	return chunkingResult(split, diag, withParents), nil
+}
+
+// chunkSet converts a parent-child split into the Chunk set to store. When
+// the mode is off only the Chunks are stored, so a Document ingested without
+// it has no Parent Chunk rows.
+func chunkSet(documentID uuid.UUID, split chunker.ParentChildResult, parents bool) types.ChunkSet {
+	set := types.ChunkSet{Chunks: make([]*types.Chunk, len(split.Children))}
+	for i, child := range split.Children {
+		set.Chunks[i] = &types.Chunk{
+			DocumentID:    documentID,
+			Seq:           child.Seq,
+			Content:       child.Content,
+			ContextHeader: child.ContextHeader,
+			StartOffset:   child.Start,
+			EndOffset:     child.End,
+		}
+	}
+	if !parents {
+		return set
+	}
+	set.Parents = make([]*types.ParentChunk, len(split.Parents))
+	for i, parent := range split.Parents {
+		set.Parents[i] = &types.ParentChunk{
+			DocumentID:    documentID,
+			Seq:           parent.Seq,
+			Content:       parent.Content,
+			ContextHeader: parent.ContextHeader,
+			StartOffset:   parent.Start,
+			EndOffset:     parent.End,
+		}
+	}
+	set.ParentOf = make([]int, len(split.Children))
+	for i, child := range split.Children {
+		set.ParentOf[i] = child.Parent
+	}
+	return set
+}
+
+// chunkingResult is the activity-facing report of a split: the stored
+// counts and the tier chain's diagnostics as strings. ParentChunks counts
+// only Parent Chunks that were stored, so it is 0 with parent-child mode off.
+func chunkingResult(split chunker.ParentChildResult, diag *chunker.Diagnostics, parents bool) types.ChunkingResult {
+	result := types.ChunkingResult{
+		Chunks:    len(split.Children),
+		Tier:      string(diag.SelectedTier),
+		TierChain: make([]string, len(diag.TierChain)),
+		Rejected:  make([]types.ChunkingRejection, len(diag.Rejected)),
+	}
+	if parents {
+		result.ParentChunks = len(split.Parents)
+	}
+	for i, tier := range diag.TierChain {
+		result.TierChain[i] = string(tier)
+	}
+	for i, rejection := range diag.Rejected {
+		result.Rejected[i] = types.ChunkingRejection{Tier: string(rejection.Tier), Reason: rejection.Reason}
+	}
+	return result
 }
 
 // EmbedBatch embeds the Chunks of a Document whose Seq is in [from, to) and

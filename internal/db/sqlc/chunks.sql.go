@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const countChunksWithoutEmbedding = `-- name: CountChunksWithoutEmbedding :one
@@ -29,6 +30,15 @@ DELETE FROM chunks WHERE document_id = $1
 
 func (q *Queries) DeleteChunksByDocument(ctx context.Context, documentID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteChunksByDocument, documentID)
+	return err
+}
+
+const deleteParentChunksByDocument = `-- name: DeleteParentChunksByDocument :exec
+DELETE FROM parent_chunks WHERE document_id = $1
+`
+
+func (q *Queries) DeleteParentChunksByDocument(ctx context.Context, documentID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, deleteParentChunksByDocument, documentID)
 	return err
 }
 
@@ -77,8 +87,8 @@ func (q *Queries) GetReadableChunk(ctx context.Context, arg GetReadableChunkPara
 }
 
 const insertChunk = `-- name: InsertChunk :exec
-INSERT INTO chunks (document_id, seq, content, context_header, start_offset, end_offset)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO chunks (document_id, seq, content, context_header, start_offset, end_offset, parent_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 `
 
 type InsertChunkParams struct {
@@ -88,8 +98,12 @@ type InsertChunkParams struct {
 	ContextHeader string
 	StartOffset   int32
 	EndOffset     int32
+	ParentID      pgtype.UUID
 }
 
+// parent_id is NULL when the Document was ingested without parent-child
+// mode, or before it was enabled, and the ID of the Parent Chunk the Chunk
+// belongs to otherwise. A NULL means a reader falls back to the Chunk itself.
 func (q *Queries) InsertChunk(ctx context.Context, arg InsertChunkParams) error {
 	_, err := q.db.Exec(ctx, insertChunk,
 		arg.DocumentID,
@@ -98,8 +112,38 @@ func (q *Queries) InsertChunk(ctx context.Context, arg InsertChunkParams) error 
 		arg.ContextHeader,
 		arg.StartOffset,
 		arg.EndOffset,
+		arg.ParentID,
 	)
 	return err
+}
+
+const insertParentChunk = `-- name: InsertParentChunk :one
+INSERT INTO parent_chunks (document_id, seq, content, context_header, start_offset, end_offset)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id
+`
+
+type InsertParentChunkParams struct {
+	DocumentID    uuid.UUID
+	Seq           int32
+	Content       string
+	ContextHeader string
+	StartOffset   int32
+	EndOffset     int32
+}
+
+func (q *Queries) InsertParentChunk(ctx context.Context, arg InsertParentChunkParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, insertParentChunk,
+		arg.DocumentID,
+		arg.Seq,
+		arg.Content,
+		arg.ContextHeader,
+		arg.StartOffset,
+		arg.EndOffset,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const listUnembeddedChunksByDocument = `-- name: ListUnembeddedChunksByDocument :many

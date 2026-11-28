@@ -80,6 +80,26 @@ storage:
     secret_access_key: trelis-dev-secret
     create_bucket: true
 
+# Chunking. A Chunk is the unit retrieval embeds and searches; with
+# parent-child mode on, ingest also stores a wider Parent Chunk around
+# consecutive Chunks as context, but only the Chunks are embedded.
+# Strategy auto tries the headings, then the heuristic sections, then the
+# recursive split; recursive always uses the recursive split alone.
+chunking:
+  strategy: auto
+  # Runes per embedded Chunk, and the most runes repeated from the previous
+  # Chunk. The overlap must be smaller than the size.
+  chunk_size: 512
+  chunk_overlap: 80
+  # Store Parent Chunks around consecutive Chunks. With it off, only the
+  # Chunks are stored. Turning it on does not re-ingest earlier Documents:
+  # their Chunks keep a NULL parent_id, so a reader of Parent Chunks falls
+  # back to the Chunk.
+  parent_child: false
+  # Runes per Parent Chunk, used only when parent_child is true. It must be
+  # at least twice chunk_size.
+  parent_chunk_size: 2048
+
 # Model roles. Each role points at its own OpenAI-compatible provider
 # (base_url, model, api_key); a role left empty is unconfigured. Keep keys
 # out of this file: set TRELIS_MODELS_<ROLE>_API_KEY instead.

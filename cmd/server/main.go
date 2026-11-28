@@ -280,7 +280,8 @@ func run(configPath string, args []string) (err error) {
 		logger.Ctx(ctx).Warn("no chat model configured; pipeline answers will answer service unavailable")
 	}
 	ingestActivities := ingest.NewActivities(service.NewIngestService(dbStore, docRepo,
-		repository.NewChunkRepository(dbStore), files, parser.NewFormatRouter(false), embedder))
+		repository.NewChunkRepository(dbStore), files, parser.NewFormatRouter(false), embedder,
+		cfg.Chunking.SplitterConfig()))
 	stopIngestWorker := startWorker(ctx, "ingest", cfg.Temporal.TaskQueue, func() worker.Worker {
 		return ingest.NewWorker(temporal, cfg.Temporal.TaskQueue, cfg.Temporal.ModelTaskQueue,
 			cfg.Models.Embedding.BatchSize, ingestActivities)

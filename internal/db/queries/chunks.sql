@@ -1,9 +1,20 @@
 -- name: DeleteChunksByDocument :exec
 DELETE FROM chunks WHERE document_id = $1;
 
+-- name: DeleteParentChunksByDocument :exec
+DELETE FROM parent_chunks WHERE document_id = $1;
+
+-- name: InsertParentChunk :one
+INSERT INTO parent_chunks (document_id, seq, content, context_header, start_offset, end_offset)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id;
+
+-- parent_id is NULL when the Document was ingested without parent-child
+-- mode, or before it was enabled, and the ID of the Parent Chunk the Chunk
+-- belongs to otherwise. A NULL means a reader falls back to the Chunk itself.
 -- name: InsertChunk :exec
-INSERT INTO chunks (document_id, seq, content, context_header, start_offset, end_offset)
-VALUES ($1, $2, $3, $4, $5, $6);
+INSERT INTO chunks (document_id, seq, content, context_header, start_offset, end_offset, parent_id)
+VALUES ($1, $2, $3, $4, $5, $6, sqlc.narg(parent_id));
 
 -- One batch of embedding work: the Chunks of a seq range that the embed
 -- activity has not written a vector for yet. Re-running a range, as a retry

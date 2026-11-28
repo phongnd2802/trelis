@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/phongnd2802/trelis/internal/chunker"
 	"github.com/phongnd2802/trelis/internal/models/api"
 )
 
@@ -627,5 +628,122 @@ func TestConfigErrorNamesAnEnvOverrideOnce(t *testing.T) {
 	}
 	if n := strings.Count(err.Error(), "TRELIS_LOG_LEVEL"); n != 1 {
 		t.Errorf("error names TRELIS_LOG_LEVEL %d times, want once: %v", n, err)
+	}
+}
+
+func TestChunkingDefaults(t *testing.T) {
+	cfg, err := Load(writeConfig(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := Chunking{
+		Strategy:        chunker.StrategyAuto,
+		ChunkSize:       chunker.DefaultChunkSize,
+		ChunkOverlap:    chunker.DefaultChunkOverlap,
+		ParentChild:     false,
+		ParentChunkSize: chunker.DefaultParentChunkSize,
+	}
+	if cfg.Chunking != want {
+		t.Errorf("Chunking = %+v, want %+v", cfg.Chunking, want)
+	}
+	// Off means no Parent Chunk size reaches the chunker, so it returns one
+	// Parent Chunk per Chunk and the service stores only the Chunks.
+	if got := cfg.Chunking.SplitterConfig().ParentChunkSize; got != 0 {
+		t.Errorf("SplitterConfig().ParentChunkSize = %d with parent-child off, want 0", got)
+	}
+}
+
+func TestChunkingIsReadFromEnv(t *testing.T) {
+	for key, value := range map[string]string{
+		"TRELIS_CHUNKING_STRATEGY":          chunker.StrategyRecursive,
+		"TRELIS_CHUNKING_CHUNK_SIZE":        "300",
+		"TRELIS_CHUNKING_CHUNK_OVERLAP":     "20",
+		"TRELIS_CHUNKING_PARENT_CHILD":      "true",
+		"TRELIS_CHUNKING_PARENT_CHUNK_SIZE": "900",
+	} {
+		t.Setenv(key, value)
+	}
+
+	cfg, err := Load(writeConfig(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := Chunking{
+		Strategy:        chunker.StrategyRecursive,
+		ChunkSize:       300,
+		ChunkOverlap:    20,
+		ParentChild:     true,
+		ParentChunkSize: 900,
+	}
+	if cfg.Chunking != want {
+		t.Errorf("Chunking = %+v, want the env values %+v", cfg.Chunking, want)
+	}
+	splitter := cfg.Chunking.SplitterConfig()
+	if splitter.Strategy != chunker.StrategyRecursive || splitter.ChunkSize != 300 ||
+		splitter.ChunkOverlap != 20 || splitter.ParentChunkSize != 900 {
+		t.Errorf("SplitterConfig() = %+v, want the env values", splitter)
+	}
+}
+
+func TestChunkingIsReadFromYAML(t *testing.T) {
+	cfg, err := Load(writeConfig(t, validYAML+`
+chunking:
+  strategy: recursive
+  chunk_size: 256
+  chunk_overlap: 32
+  parent_child: true
+  parent_chunk_size: 1024
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := Chunking{
+		Strategy:        chunker.StrategyRecursive,
+		ChunkSize:       256,
+		ChunkOverlap:    32,
+		ParentChild:     true,
+		ParentChunkSize: 1024,
+	}
+	if cfg.Chunking != want {
+		t.Errorf("Chunking = %+v, want %+v", cfg.Chunking, want)
+	}
+}
+
+func TestLoadRejectsInvalidChunking(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     map[string]string
+		wantMsg string
+	}{
+		{"unknown strategy", map[string]string{"TRELIS_CHUNKING_STRATEGY": "heading"}, "chunking.strategy"},
+		{"zero chunk size", map[string]string{"TRELIS_CHUNKING_CHUNK_SIZE": "0"}, "chunking.chunk_size"},
+		{"negative chunk size", map[string]string{"TRELIS_CHUNKING_CHUNK_SIZE": "-8"}, "chunking.chunk_size"},
+		{"negative overlap", map[string]string{"TRELIS_CHUNKING_CHUNK_OVERLAP": "-1"}, "chunking.chunk_overlap"},
+		{"overlap equals chunk size", map[string]string{
+			"TRELIS_CHUNKING_CHUNK_SIZE": "300", "TRELIS_CHUNKING_CHUNK_OVERLAP": "300"}, "chunking.chunk_overlap"},
+		{"Parent Chunk size below twice the Chunk size", map[string]string{
+			"TRELIS_CHUNKING_PARENT_CHILD": "true", "TRELIS_CHUNKING_PARENT_CHUNK_SIZE": "1000"}, "chunking.parent_chunk_size"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			_, err := Load(writeConfig(t, validYAML))
+			if err == nil {
+				t.Fatal("Load succeeded, want an error")
+			}
+			if !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Errorf("error %q does not mention %q", err, tc.wantMsg)
+			}
+		})
+	}
+}
+
+func TestAParentChunkSizeIsIgnoredWhenParentChildIsOff(t *testing.T) {
+	t.Setenv("TRELIS_CHUNKING_PARENT_CHUNK_SIZE", "100")
+
+	if _, err := Load(writeConfig(t, validYAML)); err != nil {
+		t.Errorf("Load = %v, want a small Parent Chunk size accepted while parent-child is off", err)
 	}
 }

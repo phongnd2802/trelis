@@ -33,6 +33,7 @@ type Config struct {
 	Temporal Temporal `mapstructure:"temporal"`
 	Storage  Storage  `mapstructure:"storage"`
 	Models   Models   `mapstructure:"models"`
+	Chunking Chunking `mapstructure:"chunking"`
 	Log      Log      `mapstructure:"log"`
 }
 
@@ -225,6 +226,7 @@ func (c *Config) validate() error {
 	}
 	errs = append(errs, c.Storage.S3.validate()...)
 	errs = append(errs, c.Models.validate()...)
+	errs = append(errs, c.Chunking.validate()...)
 	errs = append(errs, c.Log.validate()...)
 
 	return errors.Join(errs...)
