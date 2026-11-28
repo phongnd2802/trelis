@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -58,5 +59,48 @@ func TestListReadableDocumentIDsReturnsOnlyCompletedReadableDocuments(t *testing
 	want = sortedIDs([]uuid.UUID{sharedWithAlice.ID, bobPrivate.ID})
 	if !slices.Equal(got, want) {
 		t.Errorf("bob's IDs = %v, want %v", got, want)
+	}
+}
+
+func TestListPendingDocumentIDsReturnsOnlyPendingDocuments(t *testing.T) {
+	s, ids := seeded(t)
+	ctx := context.Background()
+	docs := NewDocumentRepository(s)
+
+	pending := document(t, s, ids["alice"])
+	for _, status := range []string{types.ParseStatusProcessing, types.ParseStatusCompleted, types.ParseStatusFailed} {
+		doc := document(t, s, ids["alice"])
+		if err := docs.SetParseStatus(ctx, doc.ID, status, ""); err != nil {
+			t.Fatalf("SetParseStatus(%s): %v", status, err)
+		}
+	}
+
+	got, err := docs.ListPendingDocumentIDs(ctx)
+	if err != nil {
+		t.Fatalf("ListPendingDocumentIDs: %v", err)
+	}
+	if want := []uuid.UUID{pending.ID}; !slices.Equal(got, want) {
+		t.Errorf("pending IDs = %v, want %v", got, want)
+	}
+}
+
+func TestListDocumentUploadIDsReturnsTheCurrentUploadOfEachDocument(t *testing.T) {
+	s, ids := seeded(t)
+	ctx := context.Background()
+	docs := NewDocumentRepository(s)
+	aliceDoc, bobDoc := document(t, s, ids["alice"]), document(t, s, ids["bob"])
+
+	got, err := docs.ListDocumentUploadIDs(ctx, []uuid.UUID{aliceDoc.ID, bobDoc.ID, uuid.New()})
+	if err != nil {
+		t.Fatalf("ListDocumentUploadIDs: %v", err)
+	}
+	want := map[uuid.UUID]uuid.UUID{aliceDoc.ID: aliceDoc.UploadID, bobDoc.ID: bobDoc.UploadID}
+	if !maps.Equal(got, want) {
+		t.Errorf("upload IDs = %v, want %v", got, want)
+	}
+
+	got, err = docs.ListDocumentUploadIDs(ctx, nil)
+	if err != nil || len(got) != 0 {
+		t.Errorf("ListDocumentUploadIDs(nil) = %v, %v; want an empty map and no error", got, err)
 	}
 }

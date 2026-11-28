@@ -63,4 +63,12 @@ type DocumentRepository interface {
 	ListReadableDocumentIDs(ctx context.Context, principalID uuid.UUID) ([]uuid.UUID, error)
 	// GetAccessList returns the names on a Document's Access List.
 	GetAccessList(ctx context.Context, id uuid.UUID) (*types.AccessList, error)
+	// ListPendingDocumentIDs returns the IDs of Documents with parse_status
+	// pending, ordered by ID. That includes a Document whose workflow is
+	// queued but has not set processing yet; starting it again joins the open
+	// run because the workflow ID is the Document ID.
+	ListPendingDocumentIDs(ctx context.Context) ([]uuid.UUID, error)
+	// ListDocumentUploadIDs returns the current upload ID of each Document in
+	// ids that still exists, keyed by Document ID.
+	ListDocumentUploadIDs(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]uuid.UUID, error)
 }

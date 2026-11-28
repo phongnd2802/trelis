@@ -4,11 +4,43 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 )
+
+// fakeReconcileService records each pass without blocking the loop.
+type fakeReconcileService struct {
+	passes chan struct{}
+	err    error
+}
+
+func (f *fakeReconcileService) Reconcile(context.Context) error {
+	select {
+	case f.passes <- struct{}{}:
+	default:
+	}
+	return f.err
+}
+
+// TestStartReconcilerRunsAPassImmediatelyAndKeepsGoingAfterFailures checks
+// that the loop does not wait for the first tick and that a failed pass does
+// not end it.
+func TestStartReconcilerRunsAPassImmediatelyAndKeepsGoingAfterFailures(t *testing.T) {
+	svc := &fakeReconcileService{passes: make(chan struct{}, 3), err: errors.New("temporal unavailable")}
+	stop := startReconciler(context.Background(), svc, 10*time.Millisecond)
+	defer stop()
+
+	for i := 1; i <= 3; i++ {
+		select {
+		case <-svc.passes:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("pass %d did not run within 5s", i)
+		}
+	}
+}
 
 // TestLogExit checks the decision the run defer makes: admin failures and a
 // clean server exit stay silent, and a server failure logs once without the

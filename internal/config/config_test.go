@@ -747,3 +747,41 @@ func TestAParentChunkSizeIsIgnoredWhenParentChildIsOff(t *testing.T) {
 		t.Errorf("Load = %v, want a small Parent Chunk size accepted while parent-child is off", err)
 	}
 }
+
+func TestReconcilerIntervalDefaultsToOneMinute(t *testing.T) {
+	cfg, err := Load(writeConfig(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Reconciler.Interval != time.Minute {
+		t.Errorf("Reconciler.Interval = %v, want 1m", cfg.Reconciler.Interval)
+	}
+}
+
+func TestReconcilerIntervalIsReadFromEnv(t *testing.T) {
+	t.Setenv("TRELIS_RECONCILER_INTERVAL", "15s")
+
+	cfg, err := Load(writeConfig(t, validYAML))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Reconciler.Interval != 15*time.Second {
+		t.Errorf("Reconciler.Interval = %v, want the env value 15s", cfg.Reconciler.Interval)
+	}
+}
+
+func TestLoadRejectsNonPositiveReconcilerInterval(t *testing.T) {
+	for _, value := range []string{"0s", "-1s"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("TRELIS_RECONCILER_INTERVAL", value)
+
+			_, err := Load(writeConfig(t, validYAML))
+			if err == nil {
+				t.Fatal("Load succeeded, want an error")
+			}
+			if !strings.Contains(err.Error(), "reconciler.interval") {
+				t.Errorf("error %q does not mention reconciler.interval", err)
+			}
+		})
+	}
+}

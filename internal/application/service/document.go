@@ -46,8 +46,8 @@ func NewDocumentService(store db.Store, repo interfaces.DocumentRepository,
 // CreateKnowledgeFromFile: check the type, hash for deduplication, validate
 // the name, save the file, then the record, removing the file again if the
 // record cannot be saved. A workflow that will not start is a warning, not a
-// failed upload: the Document stays pending for the reconciler (#26) to pick
-// up.
+// failed upload: the Document stays pending for the reconciler to start on
+// one of its passes (reconciler.interval).
 func (s *documentService) CreateDocumentFromFile(ctx context.Context,
 	file *multipart.FileHeader, accessList types.AccessList,
 ) (*types.Document, error) {

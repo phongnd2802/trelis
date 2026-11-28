@@ -133,6 +133,37 @@ func startWorker(ctx context.Context, name, taskQueue string, newWorker func() w
 	}
 }
 
+// startReconciler runs one Reconcile pass in the background, then one every
+// interval, until ctx ends. Every replica runs it; every step is idempotent,
+// so two replicas cannot start a workflow twice or delete a live prefix
+// (ADR-0005, ADR-0006). A failed pass logs at warn and the next tick tries
+// again. The returned stop function cancels the loop and waits for a pass in
+// flight, so shutdown finishes before its Temporal client closes.
+func startReconciler(ctx context.Context, svc interfaces.ReconcileService, interval time.Duration) (stop func()) {
+	loopCtx, cancel := context.WithCancel(ctx)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			// A pass cut short by shutdown is not a failure.
+			if err := svc.Reconcile(loopCtx); err != nil && loopCtx.Err() == nil {
+				logger.Ctx(ctx).Warn("reconciler pass failed", zap.Error(err))
+			}
+			select {
+			case <-loopCtx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-stopped
+	}
+}
+
 // readyTimeout bounds each dependency probe behind /readyz.
 const readyTimeout = 2 * time.Second
 
@@ -292,9 +323,12 @@ func run(configPath string, args []string) (err error) {
 			cfg.Temporal.ModelActivitiesPerSecond, ingestActivities)
 	})
 	defer stopModelWorker()
+	starter := ingest.NewStarter(temporal, cfg.Temporal.TaskQueue)
+	stopReconciler := startReconciler(ctx,
+		service.NewReconcileService(docRepo, files, starter), cfg.Reconciler.Interval)
+	defer stopReconciler()
 	docs := handler.NewDocumentHandler(
-		service.NewDocumentService(dbStore, docRepo, principalRepo, files,
-			ingest.NewStarter(temporal, cfg.Temporal.TaskQueue)),
+		service.NewDocumentService(dbStore, docRepo, principalRepo, files, starter),
 		cfg.Storage.MaxFileSize(),
 	)
 	retrievalService := service.NewRetrievalService(docRepo, repository.NewChunkSearcher(dbStore), embedder, reranker)

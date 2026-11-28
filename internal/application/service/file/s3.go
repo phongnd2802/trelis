@@ -35,6 +35,8 @@ const (
 	// objectStorageTransferTimeout bounds one upload or download when the
 	// caller's context has no deadline of its own.
 	objectStorageTransferTimeout = 30 * time.Minute
+	// deleteBatchSize is the most keys DeleteObjects accepts in one request.
+	deleteBatchSize = 1000
 )
 
 // S3Options configures the S3-compatible store.
@@ -226,6 +228,63 @@ func (s *S3FileService) DeleteFile(ctx context.Context, key string) error {
 	})
 	if err != nil {
 		return fmt.Errorf("s3: delete %s: %w", key, err)
+	}
+	return nil
+}
+
+// ListObjects pages through every object under prefix.
+func (s *S3FileService) ListObjects(ctx context.Context, prefix string) ([]interfaces.ObjectInfo, error) {
+	ctx, cancel := transferContext(ctx)
+	defer cancel()
+	pages := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucketName),
+		Prefix: aws.String(prefix),
+	})
+	var objects []interfaces.ObjectInfo
+	for pages.HasMorePages() {
+		page, err := pages.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("s3: list %s: %w", prefix, err)
+		}
+		for _, object := range page.Contents {
+			info := interfaces.ObjectInfo{Key: aws.ToString(object.Key)}
+			if object.LastModified != nil {
+				info.LastModified = *object.LastModified
+			}
+			objects = append(objects, info)
+		}
+	}
+	return objects, nil
+}
+
+// DeletePrefix deletes every object under prefix in batches of
+// deleteBatchSize. An empty prefix is not an error, so a prefix that two
+// passes race to remove is removed once and not reported.
+func (s *S3FileService) DeletePrefix(ctx context.Context, prefix string) error {
+	objects, err := s.ListObjects(ctx, prefix)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := transferContext(ctx)
+	defer cancel()
+	for start := 0; start < len(objects); start += deleteBatchSize {
+		batch := objects[start:min(start+deleteBatchSize, len(objects))]
+		identifiers := make([]s3types.ObjectIdentifier, 0, len(batch))
+		for _, object := range batch {
+			identifiers = append(identifiers, s3types.ObjectIdentifier{Key: aws.String(object.Key)})
+		}
+		out, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(s.bucketName),
+			Delete: &s3types.Delete{Objects: identifiers, Quiet: aws.Bool(true)},
+		})
+		if err != nil {
+			return fmt.Errorf("s3: delete %d objects under %s: %w", len(batch), prefix, err)
+		}
+		if len(out.Errors) > 0 {
+			first := out.Errors[0]
+			return fmt.Errorf("s3: delete %d of %d objects under %s: %s failed with %s",
+				len(out.Errors), len(batch), prefix, aws.ToString(first.Key), aws.ToString(first.Code))
+		}
 	}
 	return nil
 }
