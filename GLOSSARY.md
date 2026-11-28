@@ -151,7 +151,7 @@ The table of Ablation Runs across Retrieval Configs that shows what each Retriev
 _Avoid_: Leaderboard, benchmark results
 
 **Grader**:
-One check that scores an answer on one aspect, either by rule or by a judge model, and says when it could not score.
+One check that scores an answer on one aspect, either by rule or by a judge model, and says when it could not score or had nothing to score.
 _Avoid_: Metric (when meaning the check itself), evaluator, scorer
 
 **Slice**:

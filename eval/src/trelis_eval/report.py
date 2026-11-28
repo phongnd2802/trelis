@@ -28,6 +28,7 @@ from .ablation_run import (
     AblationRun,
     AblationRunFile,
     GoldenSetRef,
+    GradeOutcomes,
     QuestionStatus,
     RunKind,
     grade_outcomes,
@@ -68,7 +69,7 @@ class MatrixRow:
     skipped: int
     error: int
     graders: frozenset[str]
-    grader_errors: dict[str, int]
+    grader_outcomes: dict[str, GradeOutcomes]
     estimates: dict[str, MetricEstimate | None]
 
 
@@ -145,13 +146,10 @@ def build_matrix(
         metric_values: dict[str, list[float]] = {name: [] for name in METRIC_NAMES}
         latencies: list[float] = []
         run_graders = _graders_in_run(run)
-        grader_values: dict[str, list[float]] = {}
-        grader_errors: dict[str, int] = {}
+        grader_outcomes: dict[str, GradeOutcomes] = {}
         for name in grader_names:
             if name in run_graders:
-                scores, error_count = grade_outcomes(run.questions, name)
-                grader_values[name] = scores
-                grader_errors[name] = error_count
+                grader_outcomes[name] = grade_outcomes(run.questions, name)
 
         for result in run.questions:
             if result.status is not QuestionStatus.SCORED:
@@ -165,11 +163,7 @@ def build_matrix(
         config = run.config.name
         series = [
             *((name, metric_values[name], _resample_mean) for name in METRIC_NAMES),
-            *(
-                (name, grader_values[name], _resample_mean)
-                for name in grader_names
-                if name in grader_values
-            ),
+            *((name, outcome.scores, _resample_mean) for name, outcome in grader_outcomes.items()),
             (LATENCY_P50, latencies, _resample_percentile(50)),
             (LATENCY_P95, latencies, _resample_percentile(95)),
         ]
@@ -198,7 +192,7 @@ def build_matrix(
                 skipped=run.summary.skipped,
                 error=run.summary.error,
                 graders=run_graders,
-                grader_errors=grader_errors,
+                grader_outcomes=grader_outcomes,
                 estimates=estimates,
             )
         )
@@ -468,24 +462,28 @@ def _cell(
 
 
 def _grader_cell(name: str) -> Callable[[MatrixRow], str]:
-    """Return the formatter for one Grader column, showing grader_error beside it."""
+    """Return the formatter for one Grader column, with its non-zero counts beside it."""
 
     def format_cell(row: MatrixRow) -> str:
         if name not in row.graders:
             return "—"
-        cell = _format_metric(row.estimates.get(name))
-        errors = row.grader_errors.get(name, 0)
-        if errors:
-            noun = "error" if errors == 1 else "errors"
-            return f"{cell} · {errors} {noun}"
-        return cell
+        estimate = row.estimates.get(name)
+        parts = ["—" if estimate is None else _format_metric(estimate)]
+        outcomes = row.grader_outcomes.get(name)
+        if outcomes is not None and outcomes.grader_error:
+            count = outcomes.grader_error
+            parts.append(f"{count} {'error' if count == 1 else 'errors'}")
+        if outcomes is not None and outcomes.not_applicable:
+            parts.append(f"{outcomes.not_applicable} n/a")
+        return " · ".join(parts)
 
     return format_cell
 
 
 _CI_NOTE = (
     "Confidence intervals are percentile bootstrap intervals over the observations each "
-    "estimate uses; a Grader's interval covers its ok grades and excludes grader_error."
+    "estimate uses; a Grader's interval covers its ok grades and excludes grader_error and "
+    "not_applicable."
 )
 
 

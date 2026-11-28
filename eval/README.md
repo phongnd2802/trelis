@@ -10,9 +10,10 @@ versioned files, not server state.
 The harness fetches the MultiHop-RAG Benchmark Corpus, ingests a subset as
 Documents, waits for ingest to finish, reads and writes Golden Sets, and
 scores Ablation Runs under Retrieval Configs with Recall@5, Recall@10, MRR and
-nDCG@10. Answer Ablation Runs also grade each answer with a Grader, starting
-with correctness. It also runs an OpenAI-compatible record/replay proxy so
-paid model calls are recorded once and replayed for free.
+nDCG@10. Answer Ablation Runs also grade each answer with a Grader:
+correctness, faithfulness and citation precision. It also runs an
+OpenAI-compatible record/replay proxy so paid model calls are recorded once
+and replayed for free.
 
 Terms are the ones in [GLOSSARY.md](../GLOSSARY.md): Corpus, Benchmark
 Corpus, Document, Principal, Access List, Golden Set, Slice, Grader.
@@ -215,11 +216,19 @@ uv run --project eval trelis-eval answer run \
 
 `--judge-base-url` and `--judge-model` override the first two variables; the
 key is read from `TRELIS_EVAL_JUDGE_API_KEY` only, never from a flag.
-`--graders` takes a comma list and defaults to every registered Grader.
-`correctness` is the first one ([docs/metrics.md](docs/metrics.md#graders)):
-a normalized match scores 1 without a judge call, otherwise the judge is asked
-for a JSON verdict. A judge that cannot answer is a `grader_error`, excluded
-from the mean and counted, never a zero.
+`--graders` takes a comma list and defaults to every registered Grader:
+`correctness`, `faithfulness` and `citation_precision`. A default answer run
+therefore makes up to three judge calls per question, one per judge-based
+Grader; `--graders correctness` makes at most one.
+[docs/metrics.md](docs/metrics.md#graders) defines the three. `correctness`
+scores a normalized match 1 without a judge call. `faithfulness` scores the
+share of the answer's claims its cited Chunks support, and
+`citation_precision` the share of cited markers whose Chunk supports the
+statement the marker is attached to. Both read a cited Chunk's
+`context_header` and content from the answer's debug payload, and both are
+`not_applicable` rather than a zero when the answer gives them nothing to
+check. A judge that cannot answer is a `grader_error`, excluded from the mean
+and counted apart from `not_applicable`, never a zero.
 
 The other options are `retrieval run`'s: `--config` (repeatable), `--top-k`,
 `--concurrency`, `--max-consecutive-errors`, `--request-timeout`, `--out-dir`,

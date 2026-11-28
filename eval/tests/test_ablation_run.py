@@ -14,14 +14,18 @@ from trelis_eval.ablation_run import (
     AblationAborted,
     AblationRunFile,
     GoldenSetRef,
+    GradeOutcomes,
     GradeSummary,
     Manifest,
     ManifestRef,
+    QuestionMetrics,
+    QuestionResult,
     QuestionStatus,
     RetrievalConfig,
     RunKind,
     default_run_id,
     file_sha256,
+    grade_outcomes,
     load_ablation_run,
     load_manifest,
     parse_retrieval_config,
@@ -29,9 +33,9 @@ from trelis_eval.ablation_run import (
     run_answer_ablation,
     write_ablation_run,
 )
-from trelis_eval.client import TraceStep, TrelisClient
+from trelis_eval.client import TraceStep, TrelisClient, Usage
 from trelis_eval.golden import Evidence, GoldenQuestion, write_golden_set
-from trelis_eval.graders import CorrectnessGrader, Grade, GradeStatus
+from trelis_eval.graders import CorrectnessGrader, FaithfulnessGrader, Grade, GradeStatus
 
 BASE_URL = "http://trelis.test"
 API_KEY = "test-key-never-logged"
@@ -1209,7 +1213,7 @@ def test_repeated_answer_question_errors_abort_the_run():
     assert len(server.requests) == 2
 
 
-def build_answer_run_file(tmp_path, golden, server, judge):
+def build_answer_run_file(tmp_path, golden, server, judge, graders=None):
     manifest_path = write_manifest_lines(
         tmp_path / "manifest.jsonl",
         [
@@ -1233,7 +1237,7 @@ def build_answer_run_file(tmp_path, golden, server, judge):
             golden,
             manifest,
             RetrievalConfig(name="dense", techniques=("dense",)),
-            [CorrectnessGrader(judge)],
+            [CorrectnessGrader(judge)] if graders is None else graders,
             judge_model="judge-model",
             clock=scripted_clock([0.0, 0.007]),
         )
@@ -1287,7 +1291,14 @@ def test_an_answer_jsonl_round_trips_losslessly(tmp_path):
             "status": "ok",
         }
     }
-    assert lines[-1]["grades"] == {"correctness": {"mean": 1.0, "ok": 1, "grader_error": 0}}
+    assert lines[-1]["grades"] == {
+        "correctness": {
+            "mean": 1.0,
+            "ok": 1,
+            "grader_error": 0,
+            "not_applicable": 0,
+        }
+    }
 
 
 def test_an_answer_error_question_round_trips(tmp_path):
@@ -1310,6 +1321,99 @@ def test_an_answer_error_question_round_trips(tmp_path):
     assert lines[1]["finish_reason"] is None
     assert lines[1]["usage"] is None
     assert lines[1]["grades"] == {}
+
+
+def graded_result(question_id, grade):
+    return QuestionResult(
+        id=question_id,
+        slices=("inference_query",),
+        status=QuestionStatus.SCORED,
+        evidence=("https://example.com/a",),
+        retrieved=(),
+        trace=(),
+        metrics=QuestionMetrics(1.0, 1.0, 1.0, 1.0),
+        latency_ms=10.0,
+        answer="An answer.",
+        finish_reason="stop",
+        usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        grades={"faithfulness": grade},
+    )
+
+
+def test_grade_outcomes_counts_not_applicable_apart_from_grader_error():
+    results = [
+        graded_result("q1", Grade(score=1.0, rationale="supported", status=GradeStatus.OK)),
+        graded_result(
+            "q2",
+            Grade(score=None, rationale="judge failed", status=GradeStatus.GRADER_ERROR),
+        ),
+        graded_result(
+            "q3",
+            Grade(score=None, rationale="empty answer", status=GradeStatus.NOT_APPLICABLE),
+        ),
+        QuestionResult(
+            id="q4",
+            slices=(),
+            status=QuestionStatus.ERROR,
+            evidence=(),
+            retrieved=(),
+            trace=(),
+            metrics=None,
+            latency_ms=0.0,
+            error="HTTP 500",
+        ),
+    ]
+
+    assert grade_outcomes(results, "faithfulness") == GradeOutcomes(
+        scores=(1.0,), grader_error=1, not_applicable=1
+    )
+
+
+def write_not_applicable_run_file(tmp_path):
+    golden = [answer_question("q1")]
+    server = AnswerServer({"Question q1?": {"answer": "", "results": [chunk("doc-a", "chunk-1")]}})
+    run_file = build_answer_run_file(
+        tmp_path,
+        golden,
+        server,
+        ScriptedJudge(),
+        graders=[FaithfulnessGrader(ScriptedJudge())],
+    )
+    path = tmp_path / "runs" / "not-applicable" / "dense.jsonl"
+    write_ablation_run(path, run_file)
+    return path, run_file
+
+
+def test_a_not_applicable_grade_and_its_summary_count_round_trip(tmp_path):
+    path, run_file = write_not_applicable_run_file(tmp_path)
+
+    assert load_ablation_run(path) == run_file
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert lines[1]["grades"]["faithfulness"] == {
+        "score": None,
+        "rationale": "empty answer",
+        "status": "not_applicable",
+    }
+    assert lines[-1]["grades"]["faithfulness"] == {
+        "mean": None,
+        "ok": 0,
+        "grader_error": 0,
+        "not_applicable": 1,
+    }
+
+
+def test_a_summary_without_not_applicable_loads_it_as_zero(tmp_path):
+    path, _ = write_not_applicable_run_file(tmp_path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    summary = json.loads(lines[-1])
+    del summary["grades"]["faithfulness"]["not_applicable"]
+    path.write_text("\n".join([*lines[:-1], json.dumps(summary)]) + "\n", encoding="utf-8")
+
+    loaded = load_ablation_run(path)
+
+    assert loaded.run.summary.grades["faithfulness"] == GradeSummary(
+        mean=None, ok=0, grader_error=0, not_applicable=0
+    )
 
 
 def test_a_version_1_file_loads_as_a_retrieval_run(tmp_path):
