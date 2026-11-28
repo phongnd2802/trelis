@@ -51,6 +51,13 @@ type traceStep struct {
 	Model      string                `json:"model"`
 	Candidates int                   `json:"candidates"`
 	Expanded   []parentExpansionView `json:"expanded"`
+	// RewrittenQuery and Usage are on the rewrite_query step.
+	RewrittenQuery string `json:"rewritten_query"`
+	Usage          *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage"`
 }
 
 // retrievalAnswer is the envelope POST /retrieve answers with.

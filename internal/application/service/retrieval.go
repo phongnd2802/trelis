@@ -6,7 +6,9 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
@@ -35,6 +37,10 @@ type retrievalService struct {
 	// reranker is nil when models.rerank is not configured, which makes a
 	// request naming rerank unavailable rather than silently skipping it.
 	reranker interfaces.Reranker
+	// rewriter is nil when models.chat is not configured, which makes a
+	// request naming query_rewrite unavailable rather than searching with the
+	// raw follow-up.
+	rewriter interfaces.Generator
 	// runners maps every candidate Retrieval Technique this build implements
 	// to the function that runs it. It is built once, so no request has to map
 	// names to implementations again. Rerank has no runner: it reorders the
@@ -46,11 +52,14 @@ type retrievalService struct {
 // when no embedding model is configured; dense retrieval then answers a
 // service-unavailable error, while BM25 still runs. reranker may be nil when
 // no rerank model is configured; a request naming rerank then answers a
+// service-unavailable error. rewriter may be nil when no chat model is
+// configured; a request naming query_rewrite then answers a
 // service-unavailable error.
 func NewRetrievalService(documents interfaces.DocumentRepository, chunks interfaces.ChunkSearcher,
-	embedder interfaces.Embedder, reranker interfaces.Reranker,
+	embedder interfaces.Embedder, reranker interfaces.Reranker, rewriter interfaces.Generator,
 ) interfaces.RetrievalService {
-	s := &retrievalService{documents: documents, chunks: chunks, embedder: embedder, reranker: reranker}
+	s := &retrievalService{documents: documents, chunks: chunks, embedder: embedder, reranker: reranker,
+		rewriter: rewriter}
 	s.runners = map[types.RetrievalTechnique]techniqueRunner{
 		types.RetrievalTechniqueDense: s.runDense,
 		types.RetrievalTechniqueBM25:  s.runBM25,
@@ -84,8 +93,13 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 			"dense retrieval needs models.embedding to be configured")
 	}
 	candidateTechniques := req.RetrievalConfig.CandidateTechniques()
+	rewriteOn := req.RetrievalConfig.RewritesQuery()
 	rerankOn := req.RetrievalConfig.Reranks()
 	parentChildOn := req.RetrievalConfig.ExpandsParents()
+	if rewriteOn && s.rewriter == nil {
+		return nil, apperrors.NewServiceUnavailableError(
+			"query rewrite needs models.chat to be configured")
+	}
 	if rerankOn && s.reranker == nil {
 		return nil, apperrors.NewServiceUnavailableError(
 			"rerank needs models.rerank to be configured")
@@ -93,8 +107,27 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 	// Non-nil slices keep an empty answer as "results": [] rather than null.
 	result := &types.RetrievalResult{
 		Results: []types.RetrievedChunk{},
-		Trace:   make([]types.TraceStep, 0, len(candidateTechniques)*2+3),
+		Trace:   make([]types.TraceStep, 0, len(candidateTechniques)*2+4),
 	}
+
+	// A follow-up with history and query_rewrite calls the chat role once,
+	// before any technique runs, and every technique then searches with the
+	// standalone query. Without history there is nothing to resolve, so no
+	// call and no step: the raw question is already standalone.
+	query := req.Query
+	if rewriteOn && len(req.History) > 0 {
+		rewritten, step, err := s.rewriteQuery(ctx, req.Query, req.History)
+		if err != nil {
+			return nil, err
+		}
+		result.Trace = append(result.Trace, step)
+		result.RewrittenQuery = &rewritten
+		if step.Usage != nil {
+			result.RewriteUsage = *step.Usage
+		}
+		query = rewritten
+	}
+	result.Query = query
 
 	documentIDs, err := s.documents.ListReadableDocumentIDs(ctx, principal.ID)
 	if err != nil {
@@ -118,7 +151,7 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 		poolSize = *req.RetrievalConfig.RerankCandidates
 		depth = max(depth, poolSize)
 	}
-	runs, err := s.runTechniques(ctx, candidateTechniques, documentIDs, req.Query, depth)
+	runs, err := s.runTechniques(ctx, candidateTechniques, documentIDs, query, depth)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +182,7 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 		})
 	}
 	if rerankOn {
-		reranked, step, err := s.rerank(ctx, req.Query, pool)
+		reranked, step, err := s.rerank(ctx, query, pool)
 		if err != nil {
 			return nil, err
 		}
@@ -173,6 +206,43 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 	result.Trace = append(result.Trace, step)
 	result.Results = expandedResults(expanded)
 	return result, nil
+}
+
+// rewriteQuery turns the latest question into one standalone query with the
+// chat role, using history oldest first, and returns the query to search with
+// and the trace step that records the call. The reply is trimmed; a blank or
+// over-long reply falls back to the raw question, so a bad rewrite can never
+// send an arbitrary string to a paid search. A provider failure keeps its own
+// error, which the handler maps to 502 for a rejection and 500 otherwise, the
+// same as the other model calls.
+func (s *retrievalService) rewriteQuery(ctx context.Context, query string,
+	history []types.ConversationTurn,
+) (string, types.TraceStep, error) {
+	model := s.rewriter.GetModelName()
+	start := time.Now()
+	reply, err := s.rewriter.Generate(ctx, rewriteTurns(history, query))
+	if err != nil {
+		return "", types.TraceStep{}, fmt.Errorf("rewrite query: %w", err)
+	}
+	rewritten := query
+	if reply != nil {
+		if trimmed := strings.TrimSpace(reply.Content); trimmed != "" &&
+			utf8.RuneCountInString(trimmed) <= types.RetrievalQueryMaxRunes {
+			rewritten = trimmed
+		}
+	}
+	step := types.TraceStep{
+		Step:           types.TraceStepRewriteQuery,
+		Technique:      types.RetrievalTechniqueQueryRewrite,
+		DurationMS:     time.Since(start).Milliseconds(),
+		Model:          model,
+		RewrittenQuery: rewritten,
+	}
+	if reply != nil {
+		usage := reply.Usage
+		step.Usage = &usage
+	}
+	return rewritten, step, nil
 }
 
 // techniqueRun is one technique's matches and trace steps, kept in request

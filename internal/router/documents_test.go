@@ -181,7 +181,8 @@ func newServerWith(t *testing.T, docOpts []handler.DocumentHandlerOption, princi
 		c.files, c.ingest, c.ingest)
 	c.docs = handler.NewDocumentHandler(docs, testMaxFileSize, docOpts...)
 	c.h = New(Readiness{}, authn, handler.NewPrincipalHandler(principalSvc),
-		c.docs, nil, nil, nil, false)
+		c.docs, nil, nil, nil,
+		nil, false)
 	return c
 }
 

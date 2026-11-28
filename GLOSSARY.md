@@ -94,6 +94,10 @@ _Avoid_: Home page, table of contents
 
 ### Conversations
 
+**Conversation**:
+An ordered set of question and answer turns owned by one Principal, whose earlier turns a follow-up question carries into retrieval.
+_Avoid_: Chat, session, thread
+
 **Conversation History**:
 The turns of the current conversation, carried forward (and compacted) so follow-up questions make sense.
 _Avoid_: Short-term memory, context

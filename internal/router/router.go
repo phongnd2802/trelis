@@ -20,8 +20,8 @@ import (
 // when swagger is true. Everything else, unknown paths and methods included,
 // needs an API key that authn accepts, so a caller without one cannot map
 // the routes. principals serves /me, docs /documents, retrieval /retrieve,
-// answers /answer and chunks /chunks; any may be nil only where its routes
-// are never called.
+// answers /answer and /answers, conversations /conversations, chunks
+// /chunks; any may be nil only where its routes are never called.
 //
 //	@title						Trelis API
 //	@version					0.1.0
@@ -35,7 +35,8 @@ import (
 func New(ready Readiness, authn interfaces.AuthService,
 	principals *handler.PrincipalHandler, docs *handler.DocumentHandler,
 	retrieval *handler.RetrievalHandler, answers *handler.AnswerHandler,
-	chunks *handler.ChunkHandler, swagger bool,
+	conversations *handler.ConversationHandler, chunks *handler.ChunkHandler,
+	swagger bool,
 ) http.Handler {
 	r := chi.NewRouter()
 	// Outermost first: every response gets an ID and a log line, and a panic
@@ -68,6 +69,8 @@ func New(ready Readiness, authn interfaces.AuthService,
 		r.Post("/retrieve", retrieval.Retrieve)
 		r.Post("/answer", answers.Answer)
 		r.Get("/answers/{answer_id}/events", answers.StreamAnswerEvents)
+		r.Post("/conversations", conversations.CreateConversation)
+		r.Get("/conversations/{id}", conversations.GetConversation)
 		r.Get("/chunks/{id}", chunks.GetChunk)
 	})
 	return r

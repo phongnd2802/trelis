@@ -5,15 +5,86 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/phongnd2802/trelis/internal/application/repository"
 	apperrors "github.com/phongnd2802/trelis/internal/errors"
 	"github.com/phongnd2802/trelis/internal/types"
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
+
+// fakeConversations stands in for the Conversation repository: one owned
+// Conversation, fixed recent turns and a record of every call.
+type fakeConversations struct {
+	interfaces.ConversationRepository
+	owned      bool
+	getErr     error
+	listErr    error
+	insertErr  error
+	turns      []types.ConversationTurn
+	getCalls   int
+	listCalls  int
+	inserts    int
+	gotOwner   uuid.UUID
+	gotID      uuid.UUID
+	gotLimit   int
+	inserted   []*types.ConversationTurn
+	insertedAs []uuid.UUID
+	createdAs  uuid.UUID
+	created    *types.Conversation
+}
+
+func (f *fakeConversations) CreateConversation(_ context.Context, principalID uuid.UUID) (*types.Conversation, error) {
+	f.createdAs = principalID
+	return f.created, f.getErr
+}
+
+func (f *fakeConversations) ListConversationTurns(_ context.Context,
+	_ uuid.UUID,
+) ([]types.ConversationTurn, error) {
+	f.listCalls++
+	return f.turns, f.listErr
+}
+
+func (f *fakeConversations) GetConversation(_ context.Context, principalID, id uuid.UUID) (*types.Conversation, error) {
+	f.getCalls++
+	f.gotOwner, f.gotID = principalID, id
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	if !f.owned {
+		return nil, repository.ErrConversationNotFound
+	}
+	return &types.Conversation{ID: id, CreatedAt: time.Now()}, nil
+}
+
+func (f *fakeConversations) ListRecentConversationTurns(_ context.Context, _ uuid.UUID,
+	limit int,
+) ([]types.ConversationTurn, error) {
+	f.listCalls++
+	f.gotLimit = limit
+	return f.turns, f.listErr
+}
+
+func (f *fakeConversations) InsertConversationTurn(_ context.Context, principalID uuid.UUID,
+	turn *types.ConversationTurn,
+) (*types.ConversationTurn, error) {
+	f.inserts++
+	f.inserted = append(f.inserted, turn)
+	f.insertedAs = append(f.insertedAs, principalID)
+	if f.insertErr != nil {
+		return nil, f.insertErr
+	}
+	stored := *turn
+	stored.Seq = int64(f.inserts)
+	stored.CreatedAt = time.Now()
+	return &stored, nil
+}
 
 // stubAnswerRetrieval records the retrieval request and answers a fixed
 // result, so the answer tests can check what the service asked retrieval for
@@ -28,6 +99,11 @@ type stubAnswerRetrieval struct {
 func (s *stubAnswerRetrieval) Retrieve(_ context.Context, req *types.RetrievalRequest) (*types.RetrievalResult, error) {
 	s.calls++
 	s.got = req
+	// The real service always answers the query it ran with; the stub stands
+	// in for it, so a result that left Query out ran with the request's.
+	if s.result != nil && s.result.Query == "" {
+		s.result.Query = req.Query
+	}
 	return s.result, s.err
 }
 
@@ -143,7 +219,7 @@ func answerRequest(query string, debug bool) *types.AnswerRequest {
 // answerWith runs one answer against results and a generator reply.
 func answerWith(t *testing.T, results []types.RetrievedChunk, reply *types.ChatResponse, debug bool) *types.AnswerResult {
 	t.Helper()
-	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: results}}, &fakeGenerator{reply: reply})
+	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: results}}, &fakeGenerator{reply: reply}, nil, &fakeReadableDocuments{})
 	got, err := svc.Answer(callerContext(uuid.New()), answerRequest("who won?", debug))
 	if err != nil {
 		t.Fatalf("Answer: %v", err)
@@ -254,8 +330,8 @@ func TestTheNoSourceAnswerFollowsTheQuestionsLanguage(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			svc := NewAnswerService(
 				&stubAnswerRetrieval{result: &types.RetrievalResult{Results: []types.RetrievedChunk{}}},
-				&forbiddenAnswerGenerator{t},
-			)
+				&forbiddenAnswerGenerator{t}, nil, &fakeReadableDocuments{})
+
 			got, err := svc.Answer(callerContext(uuid.New()), &types.AnswerRequest{
 				RetrievalRequest: types.RetrievalRequest{Query: tc.query},
 			})
@@ -273,7 +349,7 @@ func TestTheChatRoleReceivesTheSourcesInRetrievalOrder(t *testing.T) {
 	results := answerResults()
 	gen := &fakeGenerator{reply: &types.ChatResponse{Content: "Answer [1].", FinishReason: "stop"}}
 	retrieval := &stubAnswerRetrieval{result: &types.RetrievalResult{Results: results}}
-	svc := NewAnswerService(retrieval, gen)
+	svc := NewAnswerService(retrieval, gen, nil, &fakeReadableDocuments{})
 
 	if _, err := svc.Answer(callerContext(uuid.New()), answerRequest("who won?", false)); err != nil {
 		t.Fatalf("Answer: %v", err)
@@ -313,7 +389,7 @@ func TestTheChatRoleReceivesTheSourcesInRetrievalOrder(t *testing.T) {
 
 func TestNoRetrievedChunkAnswersWithoutCallingTheChatRole(t *testing.T) {
 	retrieval := &stubAnswerRetrieval{result: &types.RetrievalResult{Results: []types.RetrievedChunk{}}}
-	svc := NewAnswerService(retrieval, &forbiddenAnswerGenerator{t})
+	svc := NewAnswerService(retrieval, &forbiddenAnswerGenerator{t}, nil, &fakeReadableDocuments{})
 
 	got, err := svc.Answer(callerContext(uuid.New()), answerRequest("who won?", true))
 	if err != nil {
@@ -344,7 +420,7 @@ func TestDebugCarriesTheResultsTraceAndUsage(t *testing.T) {
 	usage := types.TokenUsage{PromptTokens: 11, CompletionTokens: 7, TotalTokens: 18}
 	retrieval := &stubAnswerRetrieval{result: &types.RetrievalResult{Results: results, Trace: trace}}
 	gen := &fakeGenerator{model: "test-chat", reply: &types.ChatResponse{Content: "Answer [1].", FinishReason: "stop", Usage: usage}}
-	svc := NewAnswerService(retrieval, gen)
+	svc := NewAnswerService(retrieval, gen, nil, &fakeReadableDocuments{})
 
 	got, err := svc.Answer(callerContext(uuid.New()), answerRequest("who won?", true))
 	if err != nil {
@@ -383,7 +459,7 @@ func TestDebugCarriesTheResultsTraceAndUsage(t *testing.T) {
 func TestTheAnswerSendsTheRetrievalConfigUnchangedToTheRetrievalService(t *testing.T) {
 	results := answerResults()
 	retrieval := &stubAnswerRetrieval{result: &types.RetrievalResult{Results: results}}
-	svc := NewAnswerService(retrieval, &fakeGenerator{reply: &types.ChatResponse{Content: "Answer [1]."}})
+	svc := NewAnswerService(retrieval, &fakeGenerator{reply: &types.ChatResponse{Content: "Answer [1]."}}, nil, &fakeReadableDocuments{})
 
 	req := answerRequest("thue tncn", false)
 	if _, err := svc.Answer(callerContext(uuid.New()), req); err != nil {
@@ -413,7 +489,7 @@ func TestTheAnswerSendsTheRetrievalConfigUnchangedToTheRetrievalService(t *testi
 }
 
 func TestAnAnswerWithoutAChatModelIs503BeforeRetrieval(t *testing.T) {
-	svc := NewAnswerService(&forbiddenAnswerRetrieval{t}, nil)
+	svc := NewAnswerService(&forbiddenAnswerRetrieval{t}, nil, nil, &fakeReadableDocuments{})
 
 	_, err := svc.Answer(callerContext(uuid.New()), answerRequest("who won?", false))
 	appErr, ok := apperrors.IsAppError(err)
@@ -423,7 +499,7 @@ func TestAnAnswerWithoutAChatModelIs503BeforeRetrieval(t *testing.T) {
 }
 
 func TestAnInvalidAnswerRequestIsValidation(t *testing.T) {
-	svc := NewAnswerService(&forbiddenAnswerRetrieval{t}, &forbiddenAnswerGenerator{t})
+	svc := NewAnswerService(&forbiddenAnswerRetrieval{t}, &forbiddenAnswerGenerator{t}, nil, &fakeReadableDocuments{})
 
 	_, err := svc.Answer(callerContext(uuid.New()), &types.AnswerRequest{})
 	appErr, ok := apperrors.IsAppError(err)
@@ -434,7 +510,7 @@ func TestAnInvalidAnswerRequestIsValidation(t *testing.T) {
 
 func TestRetrievalErrorsPassThroughUnchanged(t *testing.T) {
 	want := apperrors.NewServiceUnavailableError("dense retrieval needs models.embedding to be configured")
-	svc := NewAnswerService(&stubAnswerRetrieval{err: want}, &fakeGenerator{})
+	svc := NewAnswerService(&stubAnswerRetrieval{err: want}, &fakeGenerator{}, nil, &fakeReadableDocuments{})
 
 	_, err := svc.Answer(callerContext(uuid.New()), answerRequest("who won?", false))
 	if err != want {
@@ -446,8 +522,7 @@ func TestAChatFailureFailsTheAnswer(t *testing.T) {
 	cause := errors.New("provider refused")
 	svc := NewAnswerService(
 		&stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}},
-		&fakeGenerator{err: cause},
-	)
+		&fakeGenerator{err: cause}, nil, &fakeReadableDocuments{})
 
 	got, err := svc.Answer(callerContext(uuid.New()), answerRequest("who won?", false))
 	if !errors.Is(err, cause) {
@@ -461,7 +536,7 @@ func TestAChatFailureFailsTheAnswer(t *testing.T) {
 // TestTheAnswerNeedsACaller guards the assumption every route behind the
 // authentication middleware relies on.
 func TestTheAnswerNeedsACaller(t *testing.T) {
-	svc := NewAnswerService(&forbiddenAnswerRetrieval{t}, &forbiddenAnswerGenerator{t})
+	svc := NewAnswerService(&forbiddenAnswerRetrieval{t}, &forbiddenAnswerGenerator{t}, nil, &fakeReadableDocuments{})
 
 	if _, err := svc.Answer(context.Background(), answerRequest("who won?", false)); err == nil {
 		t.Error("Answer without a Principal = nil, want an error")
@@ -470,6 +545,318 @@ func TestTheAnswerNeedsACaller(t *testing.T) {
 
 // The fakes satisfy the contracts they stand in for.
 var (
-	_ interfaces.RetrievalService = (*stubAnswerRetrieval)(nil)
-	_ interfaces.Generator        = (*fakeGenerator)(nil)
+	_ interfaces.RetrievalService       = (*stubAnswerRetrieval)(nil)
+	_ interfaces.Generator              = (*fakeGenerator)(nil)
+	_ interfaces.ConversationRepository = (*fakeConversations)(nil)
 )
+
+// conversationAnswerRequest is an answer request carrying conversationID.
+func conversationAnswerRequest(query string, conversationID uuid.UUID, debug bool) *types.AnswerRequest {
+	req := answerRequest(query, debug)
+	req.ConversationID = &conversationID
+	return req
+}
+
+func TestAForeignConversationIsNotFoundBeforeRetrieving(t *testing.T) {
+	conversationID := uuid.New()
+	conversations := &fakeConversations{owned: false}
+	svc := NewAnswerService(&forbiddenAnswerRetrieval{t}, &fakeGenerator{}, conversations, &fakeReadableDocuments{})
+
+	got, err := svc.Answer(callerContext(uuid.New()), conversationAnswerRequest("who won?", conversationID, false))
+	if got != nil {
+		t.Errorf("result = %+v, want nil for a foreign Conversation", got)
+	}
+	appErr, ok := apperrors.IsAppError(err)
+	if !ok {
+		t.Fatalf("Answer = %v, want an AppError", err)
+	}
+	if appErr.Code != apperrors.ErrNotFound || appErr.HTTPCode != 404 || appErr.Message != "Conversation not found" {
+		t.Errorf("error = %+v, want the shared Conversation 404", appErr)
+	}
+	if conversations.getCalls != 1 || conversations.gotID != conversationID {
+		t.Errorf("GetConversation calls/id = %d/%s, want one for %s", conversations.getCalls, conversations.gotID, conversationID)
+	}
+}
+
+func TestTheAnswerLoadsTheLastFiveTurnsAsHistory(t *testing.T) {
+	conversationID := uuid.New()
+	turns := make([]types.ConversationTurn, 5)
+	for i := range turns {
+		turns[i] = types.ConversationTurn{
+			Seq:            int64(i + 1),
+			ConversationID: conversationID,
+			Question:       fmt.Sprintf("question %d", i+1),
+			Answer:         fmt.Sprintf("answer %d", i+1),
+		}
+	}
+	conversations := &fakeConversations{owned: true, turns: turns}
+	retrieval := &stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}
+	svc := NewAnswerService(retrieval, &fakeGenerator{reply: &types.ChatResponse{Content: "Answer [1]."}}, conversations, &fakeReadableDocuments{})
+
+	if _, err := svc.Answer(callerContext(uuid.New()), conversationAnswerRequest("follow-up", conversationID, false)); err != nil {
+		t.Fatalf("Answer: %v", err)
+	}
+	if conversations.listCalls != 1 || conversations.gotLimit != conversationHistoryTurns {
+		t.Errorf("ListRecentConversationTurns calls/limit = %d/%d, want one for %d",
+			conversations.listCalls, conversations.gotLimit, conversationHistoryTurns)
+	}
+	got := retrieval.got.History
+	if len(got) != len(turns) {
+		t.Fatalf("retrieval history = %+v, want the %d loaded turns", got, len(turns))
+	}
+	for i, turn := range got {
+		if turn.Seq != turns[i].Seq || turn.Question != turns[i].Question || turn.Answer != turns[i].Answer {
+			t.Errorf("history turn %d = %+v, want %+v", i, turn, turns[i])
+		}
+	}
+}
+
+func TestTheAnswerGeneratesWithTheRewrittenQuery(t *testing.T) {
+	conversationID := uuid.New()
+	conversations := &fakeConversations{owned: true, turns: []types.ConversationTurn{{
+		Seq: 1, ConversationID: conversationID, Question: "Thuế TNCN là gì?", Answer: "Một loại thuế.",
+	}}}
+	retrieval := &stubAnswerRetrieval{result: &types.RetrievalResult{
+		Results: answerResults(),
+		Query:   "Thuế TNCN năm 2024",
+	}}
+	gen := &fakeGenerator{reply: &types.ChatResponse{Content: "Answer [1]."}}
+	svc := NewAnswerService(retrieval, gen, conversations, &fakeReadableDocuments{})
+
+	if _, err := svc.Answer(callerContext(uuid.New()),
+		conversationAnswerRequest("và năm 2024 thì sao?", conversationID, false)); err != nil {
+		t.Fatalf("Answer: %v", err)
+	}
+	user := gen.gotTurns[1].Content
+	if !strings.Contains(user, "Question: Thuế TNCN năm 2024") {
+		t.Errorf("generate prompt %q does not ask the rewritten query", user)
+	}
+	if strings.Contains(user, "Question: và năm 2024 thì sao?") {
+		t.Errorf("generate prompt %q asks the raw follow-up", user)
+	}
+}
+
+func TestTheTurnIsRecordedWithTheRawQuestionRewrittenQueryAndCleanedAnswer(t *testing.T) {
+	conversationID := uuid.New()
+	principalID := uuid.New()
+	conversations := &fakeConversations{owned: true}
+	rewritten := "Thuế TNCN năm 2024"
+	retrieval := &stubAnswerRetrieval{result: &types.RetrievalResult{
+		Results:        answerResults(),
+		Query:          rewritten,
+		RewrittenQuery: &rewritten,
+		Trace: []types.TraceStep{{
+			Step: types.TraceStepRewriteQuery, Technique: types.RetrievalTechniqueQueryRewrite,
+			RewrittenQuery: rewritten,
+		}},
+	}}
+	svc := NewAnswerService(retrieval, &fakeGenerator{reply: &types.ChatResponse{Content: "Alpha [1], nowhere [9]."}}, conversations, &fakeReadableDocuments{})
+
+	if _, err := svc.Answer(callerContext(principalID),
+		conversationAnswerRequest("và năm 2024 thì sao?", conversationID, false)); err != nil {
+		t.Fatalf("Answer: %v", err)
+	}
+	if conversations.inserts != 1 {
+		t.Fatalf("recorded %d turns, want exactly one", conversations.inserts)
+	}
+	turn := conversations.inserted[0]
+	if turn.ConversationID != conversationID {
+		t.Errorf("turn conversation = %s, want %s", turn.ConversationID, conversationID)
+	}
+	if turn.Question != "và năm 2024 thì sao?" {
+		t.Errorf("turn question = %q, want the raw question", turn.Question)
+	}
+	if turn.RewrittenQuery == nil || *turn.RewrittenQuery != "Thuế TNCN năm 2024" {
+		t.Errorf("turn rewritten query = %v, want the rewritten query", turn.RewrittenQuery)
+	}
+	if turn.Answer != "Alpha [1], nowhere." {
+		t.Errorf("turn answer = %q, want the cleaned answer", turn.Answer)
+	}
+	if want := sourceDocumentIDs(answerResults()); !slices.Equal(turn.SourceDocumentIDs, want) {
+		t.Errorf("turn source Documents = %v, want every retrieved Document %v", turn.SourceDocumentIDs, want)
+	}
+	if conversations.insertedAs[0] != principalID {
+		t.Errorf("turn recorded as %s, want the caller %s", conversations.insertedAs[0], principalID)
+	}
+}
+
+func TestATurnInheritsHistorySourcesOnlyWhenARewriteRan(t *testing.T) {
+	resultDocuments := sourceDocumentIDs(answerResults())
+	historyDocument := uuid.New()
+	history := []types.ConversationTurn{{
+		Seq: 1, Question: "earlier question", Answer: "earlier answer",
+		SourceDocumentIDs: []uuid.UUID{historyDocument, resultDocuments[0]},
+	}}
+	for name, tc := range map[string]struct {
+		rewrite bool
+		want    []uuid.UUID
+	}{
+		"rewrite on":  {rewrite: true, want: append(slices.Clone(resultDocuments), historyDocument)},
+		"rewrite off": {rewrite: false, want: resultDocuments},
+	} {
+		t.Run(name, func(t *testing.T) {
+			conversations := &fakeConversations{owned: true, turns: history}
+			retrieved := &types.RetrievalResult{Results: answerResults()}
+			if tc.rewrite {
+				rewritten := "rewritten query"
+				retrieved.Query = rewritten
+				retrieved.RewrittenQuery = &rewritten
+			}
+			documents := &fakeReadableDocuments{readable: []uuid.UUID{historyDocument, resultDocuments[0]}}
+			svc := NewAnswerService(&stubAnswerRetrieval{result: retrieved},
+				&fakeGenerator{reply: &types.ChatResponse{Content: "Answer [1]."}}, conversations, documents)
+
+			if _, err := svc.Answer(callerContext(uuid.New()),
+				conversationAnswerRequest("follow-up", uuid.New(), false)); err != nil {
+				t.Fatalf("Answer: %v", err)
+			}
+			if conversations.inserts != 1 {
+				t.Fatalf("recorded %d turns, want exactly one", conversations.inserts)
+			}
+			if got := conversations.inserted[0].SourceDocumentIDs; !slices.Equal(got, tc.want) {
+				t.Errorf("turn source Documents = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAnAnswerWithoutAConversationLoadsAndRecordsNothing(t *testing.T) {
+	conversations := &fakeConversations{owned: true}
+	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}, &fakeGenerator{reply: &types.ChatResponse{Content: "Answer [1]."}}, conversations, &fakeReadableDocuments{})
+
+	if _, err := svc.Answer(callerContext(uuid.New()), answerRequest("who won?", false)); err != nil {
+		t.Fatalf("Answer: %v", err)
+	}
+	if conversations.getCalls+conversations.listCalls+conversations.inserts != 0 {
+		t.Errorf("conversation repository called %d/%d/%d times without a conversation_id, want none",
+			conversations.getCalls, conversations.listCalls, conversations.inserts)
+	}
+}
+
+func TestDebugUsageSumsTheRewriteAndGenerateCalls(t *testing.T) {
+	conversationID := uuid.New()
+	rewriteUsage := types.TokenUsage{PromptTokens: 10, CompletionTokens: 4, TotalTokens: 14}
+	generateUsage := types.TokenUsage{PromptTokens: 11, CompletionTokens: 7, TotalTokens: 18}
+	conversations := &fakeConversations{owned: true}
+	rewritten := "standalone"
+	retrieval := &stubAnswerRetrieval{result: &types.RetrievalResult{
+		Results:        answerResults(),
+		Query:          rewritten,
+		RewrittenQuery: &rewritten,
+		RewriteUsage:   rewriteUsage,
+		Trace: []types.TraceStep{{
+			Step: types.TraceStepRewriteQuery, Technique: types.RetrievalTechniqueQueryRewrite,
+			RewrittenQuery: rewritten, Usage: &rewriteUsage,
+		}},
+	}}
+	svc := NewAnswerService(retrieval, &fakeGenerator{reply: &types.ChatResponse{Content: "Answer [1].", Usage: generateUsage}}, conversations, &fakeReadableDocuments{})
+
+	got, err := svc.Answer(callerContext(uuid.New()), conversationAnswerRequest("follow-up", conversationID, true))
+	if err != nil {
+		t.Fatalf("Answer: %v", err)
+	}
+	if got.Debug == nil {
+		t.Fatal("debug = nil, want the summed usage")
+	}
+	want := types.TokenUsage{PromptTokens: 21, CompletionTokens: 11, TotalTokens: 32}
+	if got.Debug.Usage != want {
+		t.Errorf("debug usage = %+v, want the rewrite and generate calls summed to %+v", got.Debug.Usage, want)
+	}
+
+	// The no-source answer makes no generate call but still carries the
+	// rewrite call's usage.
+	noSources := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{
+		Results:        []types.RetrievedChunk{},
+		RewrittenQuery: &rewritten,
+		RewriteUsage:   rewriteUsage,
+		Trace: []types.TraceStep{{
+			Step: types.TraceStepRewriteQuery, Technique: types.RetrievalTechniqueQueryRewrite,
+			Usage: &rewriteUsage,
+		}},
+	}}, &forbiddenAnswerGenerator{t}, conversations, &fakeReadableDocuments{})
+
+	got, err = noSources.Answer(callerContext(uuid.New()), answerRequest("who won?", true))
+	if err != nil {
+		t.Fatalf("Answer without sources: %v", err)
+	}
+	if got.Debug == nil || got.Debug.Usage != rewriteUsage {
+		t.Errorf("no-source debug = %+v, want the rewrite call's usage %+v", got.Debug, rewriteUsage)
+	}
+}
+
+func TestAFailedTurnRecordFailsTheAnswer(t *testing.T) {
+	cause := errors.New("postgres down")
+	conversations := &fakeConversations{owned: true, insertErr: cause}
+	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}, &fakeGenerator{reply: &types.ChatResponse{Content: "Answer [1]."}}, conversations, &fakeReadableDocuments{})
+
+	got, err := svc.Answer(callerContext(uuid.New()),
+		conversationAnswerRequest("who won?", uuid.New(), false))
+	if !errors.Is(err, cause) {
+		t.Errorf("Answer = %v, want the record failure wrapped", err)
+	}
+	if got != nil {
+		t.Errorf("result = %+v, want nil when the turn cannot be recorded", got)
+	}
+}
+
+func TestAWithheldTurnIsLeftOutOfTheHistory(t *testing.T) {
+	conversationID, principalID := uuid.New(), uuid.New()
+	readableDocument, restrictedDocument := uuid.New(), uuid.New()
+	rewritten := "restricted vocabulary"
+	conversations := &fakeConversations{owned: true, turns: []types.ConversationTurn{
+		{
+			Seq: 1, ConversationID: conversationID, Question: "readable question",
+			Answer: "readable answer", SourceDocumentIDs: []uuid.UUID{readableDocument},
+		},
+		{
+			Seq: 2, ConversationID: conversationID, Question: "restricted question",
+			RewrittenQuery: &rewritten, Answer: "restricted answer",
+			SourceDocumentIDs: []uuid.UUID{restrictedDocument},
+		},
+		{
+			Seq: 3, ConversationID: conversationID, Question: "no-sources question",
+			Answer: "fixed answer",
+		},
+	}}
+	documents := &fakeReadableDocuments{readable: []uuid.UUID{readableDocument}}
+	retrieval := &stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}
+	svc := NewAnswerService(retrieval,
+		&fakeGenerator{reply: &types.ChatResponse{Content: "Answer [1]."}}, conversations, documents)
+
+	if _, err := svc.Answer(callerContext(principalID),
+		conversationAnswerRequest("follow-up", conversationID, false)); err != nil {
+		t.Fatalf("Answer: %v", err)
+	}
+	if documents.calls != 1 || documents.gotPrincipal != principalID {
+		t.Errorf("readable Documents resolved %d times for %s, want once for the caller %s",
+			documents.calls, documents.gotPrincipal, principalID)
+	}
+	got := retrieval.got.History
+	if len(got) != 2 {
+		t.Fatalf("history = %+v, want only the readable and no-sources turns", got)
+	}
+	if got[0].Question != "readable question" || got[1].Question != "no-sources question" {
+		t.Errorf("history questions = %q, %q; want the readable and no-sources question", got[0].Question, got[1].Question)
+	}
+	for _, turn := range got {
+		if turn.Question == "restricted question" {
+			t.Errorf("history = %+v, want the withheld turn left out", got)
+		}
+	}
+}
+
+func TestSourceDocumentIDsAreDistinctInFirstAppearanceOrder(t *testing.T) {
+	first, second := uuid.New(), uuid.New()
+	results := []types.RetrievedChunk{
+		{DocumentID: first},
+		{DocumentID: second},
+		{DocumentID: first},
+	}
+	got := sourceDocumentIDs(results)
+	if want := []uuid.UUID{first, second}; !slices.Equal(got, want) {
+		t.Errorf("sourceDocumentIDs = %v, want %v", got, want)
+	}
+	if empty := sourceDocumentIDs(nil); empty == nil || len(empty) != 0 {
+		t.Errorf("sourceDocumentIDs(nil) = %#v, want an empty non-nil list", empty)
+	}
+}

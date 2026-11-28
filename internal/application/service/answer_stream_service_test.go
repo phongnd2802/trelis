@@ -78,7 +78,7 @@ func TestStreamedAnswerEmitsTokensThenCitationsThenDone(t *testing.T) {
 		answerToken("gamma [3]. Beta [1][3]."),
 		answerClose(&usage, "stop"),
 	}}
-	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: results}}, gen)
+	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: results}}, gen, nil, &fakeReadableDocuments{})
 	ctx := callerContext(uuid.New())
 
 	answerID, err := svc.StartAnswerStream(ctx, answerRequest("who won?", true))
@@ -154,7 +154,7 @@ func TestStreamedAnswerCitesExactlyLikeTheJSONAnswer(t *testing.T) {
 		reply:  &types.ChatResponse{Content: raw, FinishReason: "stop", Usage: usage},
 		chunks: []types.StreamResponse{answerToken(raw), answerClose(&usage, "stop")},
 	}
-	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: results}}, gen)
+	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: results}}, gen, nil, &fakeReadableDocuments{})
 	ctx := callerContext(uuid.New())
 
 	jsonAnswer, err := svc.Answer(ctx, answerRequest("who won?", false))
@@ -202,7 +202,7 @@ func TestAStreamErrorChunkEndsWithAGenericError(t *testing.T) {
 		answerToken("Partial "),
 		answerErrorChunk("the provider said secret document text"),
 	}}
-	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}, gen)
+	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}, gen, nil, &fakeReadableDocuments{})
 	ctx := callerContext(uuid.New())
 
 	answerID, err := svc.StartAnswerStream(ctx, answerRequest("who won?", false))
@@ -234,7 +234,7 @@ func TestAStreamErrorChunkLogsNoProviderText(t *testing.T) {
 	ctx := logger.WithContext(callerContext(uuid.New()), zap.New(core))
 	const providerText = "the provider said secret document text"
 	gen := &fakeGenerator{chunks: []types.StreamResponse{answerErrorChunk(providerText)}}
-	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}, gen)
+	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}, gen, nil, &fakeReadableDocuments{})
 
 	answerID, err := svc.StartAnswerStream(ctx, answerRequest("who won?", false))
 	if err != nil {
@@ -272,8 +272,8 @@ func TestAStreamWithoutSourcesAnswersWithoutCallingTheChatRole(t *testing.T) {
 	gen := &forbiddenAnswerGenerator{t}
 	svc := NewAnswerService(
 		&stubAnswerRetrieval{result: &types.RetrievalResult{Results: []types.RetrievedChunk{}}},
-		gen,
-	)
+		gen, nil, &fakeReadableDocuments{})
+
 	ctx := callerContext(uuid.New())
 
 	answerID, err := svc.StartAnswerStream(ctx, &types.AnswerRequest{
@@ -324,7 +324,7 @@ func TestAStreamKeepsGeneratingAfterTheRequestIsCancelled(t *testing.T) {
 		}()
 		return ch, nil
 	}}
-	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}, gen)
+	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}, gen, nil, &fakeReadableDocuments{})
 	principalID := uuid.New()
 	requestCtx, cancel := context.WithCancel(callerContext(principalID))
 
@@ -383,7 +383,7 @@ func TestShutdownCancelsTheGeneration(t *testing.T) {
 		}()
 		return ch, nil
 	}}
-	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}, gen)
+	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}, gen, nil, &fakeReadableDocuments{})
 	principalID := uuid.New()
 	ctx := shutdown.WithSignal(callerContext(principalID), signal)
 
@@ -405,7 +405,7 @@ func TestShutdownCancelsAGenerationWaitingForHeaders(t *testing.T) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}}
-	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}, gen)
+	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}, gen, nil, &fakeReadableDocuments{})
 	principalID := uuid.New()
 	ctx := shutdown.WithSignal(callerContext(principalID), signal)
 
@@ -462,7 +462,7 @@ func TestCloseWaitsForGeneration(t *testing.T) {
 		}()
 		return ch, nil
 	}}
-	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}, gen)
+	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}, gen, nil, &fakeReadableDocuments{})
 	ctx := callerContext(uuid.New())
 	if _, err := svc.StartAnswerStream(ctx, answerRequest("who won?", false)); err != nil {
 		t.Fatalf("StartAnswerStream: %v", err)
@@ -496,7 +496,7 @@ func TestDoneCarriesDebugOnlyWhenAsked(t *testing.T) {
 				model:  "test-chat",
 				chunks: []types.StreamResponse{answerToken("Alpha [1]."), answerClose(&usage, "stop")},
 			}
-			svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: results}}, gen)
+			svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: results}}, gen, nil, &fakeReadableDocuments{})
 			ctx := callerContext(uuid.New())
 			answerID, err := svc.StartAnswerStream(ctx, answerRequest("who won?", tc.debug))
 			if err != nil {
@@ -523,12 +523,162 @@ func TestDoneCarriesDebugOnlyWhenAsked(t *testing.T) {
 
 func TestStartAnswerStreamReturnsPreGenerationErrors(t *testing.T) {
 	retrieval := &stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}
-	svc := NewAnswerService(retrieval, nil)
+	svc := NewAnswerService(retrieval, nil, nil, &fakeReadableDocuments{})
 
 	if _, err := svc.StartAnswerStream(callerContext(uuid.New()), answerRequest("who won?", false)); err == nil {
 		t.Error("StartAnswerStream without models.chat = nil, want a 503")
 	}
 	if retrieval.calls != 0 {
 		t.Errorf("retrieval called %d times without a chat model, want 0", retrieval.calls)
+	}
+}
+
+func TestAStreamedAnswerRecordsTheTurnAndSumsTheRewriteUsage(t *testing.T) {
+	conversationID, principalID := uuid.New(), uuid.New()
+	rewriteUsage := types.TokenUsage{PromptTokens: 10, CompletionTokens: 4, TotalTokens: 14}
+	generateUsage := types.TokenUsage{PromptTokens: 3, CompletionTokens: 2, TotalTokens: 5}
+	conversations := &fakeConversations{owned: true}
+	rewritten := "standalone"
+	retrieval := &stubAnswerRetrieval{result: &types.RetrievalResult{
+		Results:        answerResults(),
+		Query:          rewritten,
+		RewrittenQuery: &rewritten,
+		RewriteUsage:   rewriteUsage,
+		Trace: []types.TraceStep{{
+			Step: types.TraceStepRewriteQuery, Technique: types.RetrievalTechniqueQueryRewrite,
+			RewrittenQuery: rewritten, Usage: &rewriteUsage,
+		}},
+	}}
+	gen := &fakeGenerator{chunks: []types.StreamResponse{
+		answerToken("Alpha [1]."),
+		answerClose(&generateUsage, "stop"),
+	}}
+	svc := NewAnswerService(retrieval, gen, conversations, &fakeReadableDocuments{})
+	ctx := callerContext(principalID)
+
+	answerID, err := svc.StartAnswerStream(ctx, conversationAnswerRequest("follow-up", conversationID, true))
+	if err != nil {
+		t.Fatalf("StartAnswerStream: %v", err)
+	}
+	events := collectAnswerEvents(t, ctx, svc, answerID)
+
+	last := events[len(events)-1]
+	done, ok := last.Data.(types.AnswerDoneEvent)
+	if !ok || last.Type != types.AnswerEventDone {
+		t.Fatalf("last event = %+v, want done", last)
+	}
+	wantUsage := types.TokenUsage{PromptTokens: 13, CompletionTokens: 6, TotalTokens: 19}
+	if done.Debug == nil || done.Debug.Usage != wantUsage {
+		t.Errorf("done debug = %+v, want the rewrite and generate usage summed to %+v", done.Debug, wantUsage)
+	}
+	if conversations.inserts != 1 {
+		t.Fatalf("recorded %d turns, want exactly one", conversations.inserts)
+	}
+	turn := conversations.inserted[0]
+	if turn.ConversationID != conversationID || turn.Question != "follow-up" || turn.Answer != "Alpha [1]." {
+		t.Errorf("recorded turn = %+v, want the raw question and cleaned answer", turn)
+	}
+	if turn.RewrittenQuery == nil || *turn.RewrittenQuery != "standalone" {
+		t.Errorf("recorded rewritten query = %v, want standalone", turn.RewrittenQuery)
+	}
+	if conversations.insertedAs[0] != principalID {
+		t.Errorf("turn recorded as %s, want the caller %s", conversations.insertedAs[0], principalID)
+	}
+}
+
+func TestAStreamedRecordFailureEndsWithTheErrorEvent(t *testing.T) {
+	cause := errors.New("postgres down")
+	conversations := &fakeConversations{owned: true, insertErr: cause}
+	gen := &fakeGenerator{chunks: []types.StreamResponse{
+		answerToken("Alpha [1]."),
+		answerClose(nil, "stop"),
+	}}
+	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}, gen, conversations, &fakeReadableDocuments{})
+
+	ctx := callerContext(uuid.New())
+
+	answerID, err := svc.StartAnswerStream(ctx, conversationAnswerRequest("who won?", uuid.New(), false))
+	if err != nil {
+		t.Fatalf("StartAnswerStream: %v", err)
+	}
+	events := collectAnswerEvents(t, ctx, svc, answerID)
+
+	last := events[len(events)-1]
+	failure, ok := last.Data.(types.AnswerErrorEvent)
+	if !ok || last.Type != types.AnswerEventError {
+		t.Fatalf("last event = %+v, want the error event when the turn cannot be recorded", last)
+	}
+	if failure.Message != answerStreamErrorMessage || strings.Contains(failure.Message, "postgres") {
+		t.Errorf("error message = %q, want the generic client message", failure.Message)
+	}
+	for _, event := range events {
+		if event.Type == types.AnswerEventDone {
+			t.Error("a failed record also emitted done, want only the error")
+		}
+	}
+	if conversations.inserts != 1 {
+		t.Errorf("record attempts = %d, want the one that failed", conversations.inserts)
+	}
+}
+
+func TestAFailedStreamedGenerationRecordsNoTurn(t *testing.T) {
+	conversations := &fakeConversations{owned: true}
+	gen := &fakeGenerator{chunks: []types.StreamResponse{
+		answerToken("Partial "),
+		answerErrorChunk("the provider said secret"),
+	}}
+	svc := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{Results: answerResults()}}, gen, conversations, &fakeReadableDocuments{})
+
+	ctx := callerContext(uuid.New())
+
+	answerID, err := svc.StartAnswerStream(ctx, conversationAnswerRequest("who won?", uuid.New(), false))
+	if err != nil {
+		t.Fatalf("StartAnswerStream: %v", err)
+	}
+	collectAnswerEvents(t, ctx, svc, answerID)
+
+	if conversations.inserts != 0 || conversations.getCalls != 1 {
+		t.Errorf("conversation calls = %d gets, %d records; want the ownership check and no record",
+			conversations.getCalls, conversations.inserts)
+	}
+}
+
+func TestANoSourcesStreamRecordsTheTurn(t *testing.T) {
+	conversationID := uuid.New()
+	rewriteUsage := types.TokenUsage{PromptTokens: 6, CompletionTokens: 2, TotalTokens: 8}
+	conversations := &fakeConversations{owned: true}
+	rewritten := "standalone"
+	retrieval := &stubAnswerRetrieval{result: &types.RetrievalResult{
+		Results:        []types.RetrievedChunk{},
+		Query:          rewritten,
+		RewrittenQuery: &rewritten,
+		RewriteUsage:   rewriteUsage,
+		Trace: []types.TraceStep{{
+			Step: types.TraceStepRewriteQuery, Technique: types.RetrievalTechniqueQueryRewrite,
+			RewrittenQuery: rewritten, Usage: &rewriteUsage,
+		}},
+	}}
+	svc := NewAnswerService(retrieval, &forbiddenAnswerGenerator{t}, conversations, &fakeReadableDocuments{})
+	ctx := callerContext(uuid.New())
+
+	answerID, err := svc.StartAnswerStream(ctx, conversationAnswerRequest("follow-up", conversationID, true))
+	if err != nil {
+		t.Fatalf("StartAnswerStream: %v", err)
+	}
+	events := collectAnswerEvents(t, ctx, svc, answerID)
+	done := events[len(events)-1].Data.(types.AnswerDoneEvent)
+	if done.Answer != noSourcesAnswer {
+		t.Errorf("done answer = %q, want the fixed no-source sentence", done.Answer)
+	}
+	if done.Debug == nil || done.Debug.Usage != rewriteUsage {
+		t.Errorf("done debug = %+v, want the rewrite call's usage", done.Debug)
+	}
+	if conversations.inserts != 1 {
+		t.Fatalf("recorded %d turns, want one even for a no-source answer", conversations.inserts)
+	}
+	turn := conversations.inserted[0]
+	if turn.Question != "follow-up" || turn.Answer != noSourcesAnswer ||
+		turn.RewrittenQuery == nil || *turn.RewrittenQuery != "standalone" {
+		t.Errorf("recorded turn = %+v, want the raw question, fixed answer and rewritten query", turn)
 	}
 }

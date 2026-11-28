@@ -33,6 +33,9 @@ type stubRetrieval struct {
 
 func (s *stubRetrieval) Retrieve(_ context.Context, req *types.RetrievalRequest) (*types.RetrievalResult, error) {
 	s.got = req
+	if s.result != nil && s.result.Query == "" {
+		s.result.Query = req.Query
+	}
 	return s.result, s.err
 }
 
@@ -84,7 +87,8 @@ func (f *fixedEmbedder) GetModelName() string { return f.model }
 func newRetrieveRouter(retrieval interfaces.RetrievalService) http.Handler {
 	me := handler.NewPrincipalHandler(service.NewPrincipalService(nil, nil, nil))
 	return New(Readiness{}, keyring{"trelis_alice": alice}, me, nil,
-		handler.NewRetrievalHandler(retrieval), nil, nil, false)
+		handler.NewRetrievalHandler(retrieval), nil, nil,
+		nil, false)
 }
 
 // postJSON sends body as the named bearer token (none when empty).
@@ -156,7 +160,7 @@ func TestAnUnknownFieldOrWrongTypeIsValidation(t *testing.T) {
 func TestAnInvalidRequestIsValidation(t *testing.T) {
 	// Validation runs before any repository or model call, so the service
 	// needs neither here.
-	h := newRetrieveRouter(service.NewRetrievalService(nil, nil, nil, nil))
+	h := newRetrieveRouter(service.NewRetrievalService(nil, nil, nil, nil, nil))
 	for name, tc := range map[string]struct {
 		body    string
 		wantMsg []string
@@ -184,6 +188,10 @@ func TestAnInvalidRequestIsValidation(t *testing.T) {
 		"rerank alone": {
 			body:    `{"query":"who won?","retrieval_config":{"techniques":["rerank"]}}`,
 			wantMsg: []string{"rerank", "at least one"},
+		},
+		"query_rewrite alone": {
+			body:    `{"query":"who won?","retrieval_config":{"techniques":["query_rewrite"]}}`,
+			wantMsg: []string{"query_rewrite", "rewrites the query another technique searches with", "at least one", "dense"},
 		},
 		"parent_child alone": {
 			body:    `{"query":"who won?","retrieval_config":{"techniques":["parent_child"]}}`,
@@ -399,7 +407,7 @@ func TestRetrieveSendsRerankCandidatesToTheService(t *testing.T) {
 func TestRetrieveWithoutARerankModelIs503(t *testing.T) {
 	// Dense is available, so the request reaches the rerank check; the rerank
 	// role is not configured.
-	h := newRetrieveRouter(service.NewRetrievalService(nil, nil, &fixedEmbedder{model: "test-embedding"}, nil))
+	h := newRetrieveRouter(service.NewRetrievalService(nil, nil, &fixedEmbedder{model: "test-embedding"}, nil, nil))
 
 	rec := postJSON(t, h, "/retrieve",
 		`{"query":"who won?","retrieval_config":{"techniques":["dense","rerank"]}}`, "Bearer trelis_alice")
@@ -412,8 +420,27 @@ func TestRetrieveWithoutARerankModelIs503(t *testing.T) {
 	}
 }
 
+func TestRetrieveWithoutAChatModelCannotRewrite(t *testing.T) {
+	// The check runs before any repository or model call, so no dependency is
+	// needed behind it.
+	h := newRetrieveRouter(service.NewRetrievalService(nil, nil, nil, nil, nil))
+
+	rec := postJSON(t, h, "/retrieve",
+		`{"query":"who won?","retrieval_config":{"techniques":["bm25","query_rewrite"]}}`,
+		"Bearer trelis_alice")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("POST /retrieve = %d %s, want 503", rec.Code, rec.Body)
+	}
+	e := decode(t, rec)
+	if e.Success || e.Error == nil || e.Error.Code != 1008 ||
+		!strings.Contains(e.Error.Message, "models.chat") ||
+		!strings.Contains(e.Error.Message, "query rewrite") {
+		t.Errorf("body = %s, want a 1008 error naming query rewrite and models.chat", rec.Body)
+	}
+}
+
 func TestRetrieveWithoutAnEmbeddingModelIs503(t *testing.T) {
-	h := newRetrieveRouter(service.NewRetrievalService(nil, nil, nil, nil))
+	h := newRetrieveRouter(service.NewRetrievalService(nil, nil, nil, nil, nil))
 
 	rec := postJSON(t, h, "/retrieve", `{"query":"who won?"}`, "Bearer trelis_alice")
 	if rec.Code != http.StatusServiceUnavailable {
@@ -468,8 +495,8 @@ func newProviderRetrieveRouter(t *testing.T, p *modeltest.FakeProvider) http.Han
 			Chunk: &types.Chunk{ID: chunkID, DocumentID: documentID, Content: "Alice's readable Chunk"},
 			Score: 1,
 		}}},
-		embedder, reranker,
-	)
+		embedder, reranker, nil)
+
 	return newRetrieveRouter(svc)
 }
 
@@ -557,11 +584,12 @@ func TestAnotherPrincipalNeverReceivesAChunkAtTheRouterSeam(t *testing.T) {
 			bob.ID:   {bobDoc},
 		}},
 		&readableChunkSearch{matches: []*types.ChunkMatch{aliceChunk, bobChunk}},
-		&fixedEmbedder{model: "test-embedding"}, nil,
-	)
+		&fixedEmbedder{model: "test-embedding"}, nil, nil)
+
 	me := handler.NewPrincipalHandler(service.NewPrincipalService(nil, nil, nil))
 	h := New(Readiness{}, keyring{"trelis_alice": alice, "trelis_bob": bob}, me, nil,
-		handler.NewRetrievalHandler(svc), nil, nil, false)
+		handler.NewRetrievalHandler(svc), nil, nil,
+		nil, false)
 
 	bobRec := postJSON(t, h, "/retrieve", `{"query":"who won?"}`, "Bearer trelis_bob")
 	if bobRec.Code != http.StatusOK {

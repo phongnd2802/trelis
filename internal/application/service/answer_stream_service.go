@@ -42,13 +42,13 @@ func (s *answerService) StartAnswerStream(ctx context.Context, req *types.Answer
 		return uuid.Nil, err
 	}
 	if len(retrieved.Results) == 0 {
-		return s.startNoSourcesStream(principal.ID, req, retrieved), nil
+		return s.startNoSourcesStream(ctx, principal.ID, req, retrieved), nil
 	}
 
 	genCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.generationTimeout)
 	stopWatching := watchShutdown(genCtx, cancel)
 	start := time.Now()
-	stream, err := s.generator.GenerateStream(genCtx, answerTurns(req.Query, retrieved.Results))
+	stream, err := s.generator.GenerateStream(genCtx, answerTurns(retrieved.Query, retrieved.Results))
 	if err != nil {
 		stopWatching()
 		cancel()
@@ -61,19 +61,25 @@ func (s *answerService) StartAnswerStream(ctx context.Context, req *types.Answer
 		defer s.generations.Done()
 		defer cancel()
 		defer stopWatching()
-		s.generate(genCtx, id, retrieved, stream, start, req.Debug)
+		s.generate(genCtx, id, principal.ID, retrieved, stream, start, req)
 	}()
 	return id, nil
 }
 
 // startNoSourcesStream buffers the fixed no-source answer without calling the
 // chat role, so the handler finds started, one token and done already there.
-func (s *answerService) startNoSourcesStream(owner uuid.UUID, req *types.AnswerRequest,
+// It records the turn before done, and ends with the error event instead when
+// the record fails.
+func (s *answerService) startNoSourcesStream(ctx context.Context, owner uuid.UUID, req *types.AnswerRequest,
 	retrieved *types.RetrievalResult,
 ) uuid.UUID {
 	id := s.streams.start(owner)
 	answer := noSourcesReply(req.Query)
 	s.streams.append(id, types.AnswerEventToken, types.AnswerTokenEvent{Text: answer})
+	if err := s.recordTurn(ctx, owner, req, retrieved, answer); err != nil {
+		s.failRecordTurn(ctx, id, req, err)
+		return id
+	}
 	s.streams.append(id, types.AnswerEventDone, types.AnswerDoneEvent{
 		Answer: answer,
 		Debug:  answerDebug(retrieved, types.TraceStep{}, types.TokenUsage{}, req.Debug),
@@ -114,15 +120,15 @@ type answerReply struct {
 	finishReason string
 	usage        types.TokenUsage
 	duration     time.Duration
-	debug        bool
 }
 
 // generate drains one open chat stream into the hub. It emits token events as
 // the chat role produces text, one citation event per cited source after the
 // text, and one terminal done or error event. Failure is logged here, once,
 // where it becomes the error event; content never reaches the log.
-func (s *answerService) generate(ctx context.Context, id uuid.UUID, retrieved *types.RetrievalResult,
-	stream <-chan types.StreamResponse, start time.Time, debug bool,
+func (s *answerService) generate(ctx context.Context, id uuid.UUID, principalID uuid.UUID,
+	retrieved *types.RetrievalResult, stream <-chan types.StreamResponse, start time.Time,
+	req *types.AnswerRequest,
 ) {
 	defer s.streams.finish(id)
 
@@ -162,23 +168,30 @@ func (s *answerService) generate(ctx context.Context, id uuid.UUID, retrieved *t
 					usage = *chunk.Usage
 				}
 				finishReason = chunk.FinishReason
-				s.finishAnswer(id, retrieved, answerReply{
+				s.finishAnswer(ctx, id, principalID, retrieved, answerReply{
 					text:         text.String(),
 					finishReason: finishReason,
 					usage:        usage,
 					duration:     time.Since(start),
-					debug:        debug,
-				})
+				}, req)
 				return
 			}
 		}
 	}
 }
 
-// finishAnswer parses the full reply, emits one citation event per cited
-// source and the terminal done event.
-func (s *answerService) finishAnswer(id uuid.UUID, retrieved *types.RetrievalResult, reply answerReply) {
+// finishAnswer parses the full reply, records the Conversation turn, emits one
+// citation event per cited source and the terminal done event. The turn is
+// recorded before done; a failed record is logged here, where it becomes the
+// error event, and no done follows.
+func (s *answerService) finishAnswer(ctx context.Context, id, principalID uuid.UUID,
+	retrieved *types.RetrievalResult, reply answerReply, req *types.AnswerRequest,
+) {
 	answer, markers := parseCitations(reply.text, len(retrieved.Results))
+	if err := s.recordTurn(ctx, principalID, req, retrieved, answer); err != nil {
+		s.failRecordTurn(ctx, id, req, err)
+		return
+	}
 	for _, citation := range citationList(markers, retrieved.Results) {
 		if !s.streams.append(id, types.AnswerEventCitation, types.AnswerCitationEvent(citation)) {
 			return
@@ -191,8 +204,17 @@ func (s *answerService) finishAnswer(id uuid.UUID, retrieved *types.RetrievalRes
 			Step:       types.TraceStepGenerate,
 			DurationMS: reply.duration.Milliseconds(),
 			Model:      s.generator.GetModelName(),
-		}, reply.usage, reply.debug),
+		}, reply.usage, req.Debug),
 	})
+}
+
+// failRecordTurn logs a failed Conversation turn record and ends the stream
+// with the generic error event instead of done. The cause goes to the log,
+// never into the event.
+func (s *answerService) failRecordTurn(ctx context.Context, id uuid.UUID, req *types.AnswerRequest, cause error) {
+	logger.Ctx(ctx).Error("record conversation turn failed",
+		zap.Stringer("answer", id), zap.Stringer("conversation", *req.ConversationID), zap.Error(cause))
+	s.streams.append(id, types.AnswerEventError, types.AnswerErrorEvent{Message: answerStreamErrorMessage})
 }
 
 // failOrStop logs and ends a failed generation, at info when the server is
@@ -222,7 +244,8 @@ func (s *answerService) stopAtShutdown(ctx context.Context, id uuid.UUID) {
 
 // answerDebug is the debug object of a done event, mirroring AnswerDebug: the
 // retrieved Chunks, the retrieval trace plus generate when the chat role ran,
-// and the call's usage. It is nil when the request did not ask for debug.
+// and the usage of every model call the answer made. It is nil when the
+// request did not ask for debug.
 func answerDebug(retrieved *types.RetrievalResult, generate types.TraceStep,
 	usage types.TokenUsage, debug bool,
 ) *types.AnswerDebug {
@@ -233,7 +256,7 @@ func answerDebug(retrieved *types.RetrievalResult, generate types.TraceStep,
 	if generate.Step != "" {
 		trace = append(trace[:len(trace):len(trace)], generate)
 	}
-	return &types.AnswerDebug{Results: retrieved.Results, Trace: trace, Usage: usage}
+	return &types.AnswerDebug{Results: retrieved.Results, Trace: trace, Usage: usageWithRewrite(usage, retrieved.RewriteUsage)}
 }
 
 // watchShutdown cancels a generation when the server begins shutting down,
