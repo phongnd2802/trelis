@@ -39,6 +39,29 @@ type Chunk struct {
 	ParentID pgtype.UUID
 }
 
+// Question and answer conversations, one owner each
+type Conversation struct {
+	ID          uuid.UUID
+	PrincipalID uuid.UUID
+	// Last Conversation turn seq allocated; advanced under the row lock so turns take distinct seqs
+	TurnSeq   int64
+	CreatedAt time.Time
+}
+
+// Turns of each Conversation, in seq order
+type ConversationTurn struct {
+	ConversationID uuid.UUID
+	// Per-Conversation sequence number, starting at 1
+	Seq      int64
+	Question string
+	// Standalone query a query rewrite produced; NULL when no rewrite ran
+	RewrittenQuery pgtype.Text
+	// Distinct Documents the answer depends on: every retrieved result plus the history sources a rewrite used; empty when no rewrite ran and nothing was retrieved
+	SourceDocumentIds []uuid.UUID
+	Answer            string
+	CreatedAt         time.Time
+}
+
 type Document struct {
 	ID       uuid.UUID
 	OwnerID  uuid.UUID

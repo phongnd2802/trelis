@@ -22,6 +22,12 @@ const (
 	// text at Vietnamese syllable level, plus a diacritics-free copy so a
 	// query typed without diacritics still matches.
 	RetrievalTechniqueBM25 RetrievalTechnique = "bm25"
+	// RetrievalTechniqueQueryRewrite rewrites the latest question into one
+	// standalone query using the Conversation History, so a follow-up such as
+	// "and what about 2024?" searches for what it refers to. It is a first
+	// stage, not a candidate source, so a request must name at least one other
+	// technique.
+	RetrievalTechniqueQueryRewrite RetrievalTechnique = "query_rewrite"
 	// RetrievalTechniqueRerank reorders the Chunks another technique found
 	// with the rerank model's relevance score. It is a second stage, not a
 	// candidate source, so a request must name at least one other technique.
@@ -75,6 +81,7 @@ func KnownRetrievalTechniques() []RetrievalTechnique {
 	return []RetrievalTechnique{
 		RetrievalTechniqueDense,
 		RetrievalTechniqueBM25,
+		RetrievalTechniqueQueryRewrite,
 		RetrievalTechniqueRerank,
 		RetrievalTechniqueParentChild,
 	}
@@ -94,7 +101,7 @@ func (t RetrievalTechnique) Known() bool {
 // IsStage reports whether the technique only transforms another technique's
 // candidates, rather than finding candidates of its own.
 func (t RetrievalTechnique) IsStage() bool {
-	return t == RetrievalTechniqueRerank || t == RetrievalTechniqueParentChild
+	return t == RetrievalTechniqueQueryRewrite || t == RetrievalTechniqueRerank || t == RetrievalTechniqueParentChild
 }
 
 // quotedTechniqueList names techniques as an error message lists them.
@@ -130,6 +137,9 @@ func knownCandidateTechniqueList() string {
 func stageOnlyMessage(techniques []RetrievalTechnique) string {
 	if len(techniques) == 1 {
 		switch techniques[0] {
+		case RetrievalTechniqueQueryRewrite:
+			return fmt.Sprintf("retrieval technique %q rewrites the query another technique searches with",
+				RetrievalTechniqueQueryRewrite)
 		case RetrievalTechniqueRerank:
 			return fmt.Sprintf("retrieval technique %q reorders the Chunks another technique finds",
 				RetrievalTechniqueRerank)
@@ -138,7 +148,7 @@ func stageOnlyMessage(techniques []RetrievalTechnique) string {
 				RetrievalTechniqueParentChild)
 		}
 	}
-	return fmt.Sprintf("retrieval techniques %s only reorder or expand the Chunks another technique finds",
+	return fmt.Sprintf("retrieval techniques %s only rewrite the query, reorder or expand the Chunks another technique finds",
 		quotedTechniqueList(techniques))
 }
 
@@ -148,9 +158,10 @@ type RetrievalConfig struct {
 	// Techniques is the set of Retrieval Techniques to run, without
 	// duplicates. More than one candidate technique makes the request a
 	// fusion: each runs over the readable Documents and their lists are
-	// combined with Reciprocal Rank Fusion. Rerank reorders whatever the
-	// candidate techniques found; parent_child then replaces the ordered
-	// Chunks with their Parent Chunks.
+	// combined with Reciprocal Rank Fusion. query_rewrite rewrites the
+	// question first when the request carries Conversation History; rerank
+	// reorders whatever the candidate techniques found; parent_child then
+	// replaces the ordered Chunks with their Parent Chunks.
 	Techniques []RetrievalTechnique `json:"techniques"`
 	// RRFK is the Reciprocal Rank Fusion constant k; nil means the default.
 	// It only affects a request that runs more than one technique, so it is
@@ -163,9 +174,9 @@ type RetrievalConfig struct {
 }
 
 // CandidateTechniques returns the techniques that find candidates: every
-// requested technique except the stage techniques, rerank and parent_child.
-// Validation rejects a config that names only stage techniques, so a valid
-// config's result is never empty.
+// requested technique except the stage techniques, query_rewrite, rerank and
+// parent_child. Validation rejects a config that names only stage techniques,
+// so a valid config's result is never empty.
 func (c *RetrievalConfig) CandidateTechniques() []RetrievalTechnique {
 	out := make([]RetrievalTechnique, 0, len(c.Techniques))
 	for _, technique := range c.Techniques {
@@ -174,6 +185,11 @@ func (c *RetrievalConfig) CandidateTechniques() []RetrievalTechnique {
 		}
 	}
 	return out
+}
+
+// RewritesQuery reports whether the config names the query_rewrite technique.
+func (c *RetrievalConfig) RewritesQuery() bool {
+	return slices.Contains(c.Techniques, RetrievalTechniqueQueryRewrite)
 }
 
 // Reranks reports whether the config names the rerank technique.
@@ -200,10 +216,11 @@ func DefaultRetrievalConfig() *RetrievalConfig {
 
 // Validate rejects an empty list, a technique this build does not implement,
 // a technique listed twice, a config whose only techniques are stage
-// techniques (rerank, parent_child), an rrf_k outside 1..RetrievalRRFKMax and
-// a rerank_candidates outside 1..RetrievalRerankCandidatesMax. It fills an
-// omitted rrf_k with RetrievalRRFKDefault and an omitted rerank_candidates
-// with RetrievalRerankCandidatesDefault. The messages are fit for the client.
+// techniques (query_rewrite, rerank, parent_child), an rrf_k outside
+// 1..RetrievalRRFKMax and a rerank_candidates outside
+// 1..RetrievalRerankCandidatesMax. It fills an omitted rrf_k with
+// RetrievalRRFKDefault and an omitted rerank_candidates with
+// RetrievalRerankCandidatesDefault. The messages are fit for the client.
 func (c *RetrievalConfig) Validate() error {
 	if c == nil || len(c.Techniques) == 0 {
 		return fmt.Errorf("retrieval_config.techniques must name at least one technique (known techniques: %s)",
@@ -253,6 +270,11 @@ type RetrievalRequest struct {
 	// RetrievalConfig is the combination of techniques to run; nil means
 	// dense alone.
 	RetrievalConfig *RetrievalConfig `json:"retrieval_config,omitempty"`
+	// History is the Conversation History a query rewrite resolves the
+	// question against, oldest turn first. The answer service fills it; it is
+	// never part of a request body, so POST /retrieve has none and a
+	// query_rewrite request there runs no model call.
+	History []ConversationTurn `json:"-"`
 }
 
 // Validate checks the request and fills its defaults: the query is trimmed,
@@ -323,6 +345,9 @@ type RetrievedChunk struct {
 
 // The steps a retrieval run records in its trace.
 const (
+	// TraceStepRewriteQuery rewrites the latest question into a standalone
+	// query with the chat role, using the Conversation History.
+	TraceStepRewriteQuery = "rewrite_query"
 	// TraceStepEmbedQuery embeds the query text with the embedding role.
 	TraceStepEmbedQuery = "embed_query"
 	// TraceStepSearch searches the Chunks of the readable Documents.
@@ -347,19 +372,28 @@ type TraceStep struct {
 	Technique RetrievalTechnique `json:"technique,omitempty"`
 	// DurationMS is how long the step took, in milliseconds.
 	DurationMS int64 `json:"duration_ms"`
-	// Model is the embedding or rerank model, on the step that called one.
+	// Model is the embedding, rerank or chat model, on the step that called
+	// one.
 	Model string `json:"model,omitempty"`
+	// Candidate count fields below keep their pointer shape so a step that
+	// has no count leaves the field out.
+	//
 	// Candidates is how many Chunks the step returned: the search step's own
 	// matches, the distinct Chunks a fuse step combined, the pool size sent
 	// to the reranker, or the results the expand_parents step produced before
-	// the cut. It is a pointer so a step with no candidate count leaves the
-	// field out.
+	// the cut.
 	Candidates *int `json:"candidates,omitempty"`
 	// Expanded says which Chunks collapsed into which result, one entry per
 	// returned result in result order, on the expand_parents step. It is a
 	// pointer so an expand step with no results still answers expanded: []
 	// while every other step leaves the field out.
 	Expanded *[]ParentExpansion `json:"expanded,omitempty"`
+	// RewrittenQuery is the query the techniques searched with, on the
+	// rewrite_query step: the model's reply, or the raw question when the
+	// reply was blank or too long.
+	RewrittenQuery string `json:"rewritten_query,omitempty"`
+	// Usage is the chat call's token accounting on the rewrite_query step.
+	Usage *TokenUsage `json:"usage,omitempty"`
 }
 
 // ParentExpansion records how one parent_child result was built: its
@@ -381,4 +415,17 @@ type ParentExpansion struct {
 type RetrievalResult struct {
 	Results []RetrievedChunk `json:"results"`
 	Trace   []TraceStep      `json:"trace"`
+	// Query is the query retrieval actually ran with: the rewritten query
+	// when query_rewrite ran, else the raw question. It is not part of the
+	// response, so a caller that rewrites (the answer service) generates with
+	// it while the wire shape stays what POST /retrieve always answered.
+	Query string `json:"-"`
+	// RewrittenQuery is the query a rewrite produced and retrieval searched
+	// with, nil when no rewrite ran. It is the query actually used, so a
+	// rewrite that fell back to the raw question still sets it. The
+	// rewrite_query trace step records it on the wire.
+	RewrittenQuery *string `json:"-"`
+	// RewriteUsage is the chat call's token usage when a rewrite ran, and the
+	// zero value when none did, so a caller can account for every model call.
+	RewriteUsage TokenUsage `json:"-"`
 }

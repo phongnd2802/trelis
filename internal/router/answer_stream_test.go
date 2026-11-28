@@ -230,8 +230,8 @@ func TestAnotherPrincipalGetsTheSameAnswerStreamNotFound(t *testing.T) {
 		&stubRetrieval{result: &types.RetrievalResult{Results: []types.RetrievedChunk{{Content: "Alpha."}}}},
 		&stubStreamGenerator{chunks: []types.StreamResponse{
 			{ResponseType: types.ResponseTypeAnswer, Content: "Alpha.", Done: true, FinishReason: "stop"},
-		}},
-	)
+		}}, nil, nil)
+
 	aliceCtx := types.WithPrincipal(context.Background(), alice)
 	answerID, err := svc.StartAnswerStream(aliceCtx, &types.AnswerRequest{
 		RetrievalRequest: types.RetrievalRequest{Query: "who won?"},

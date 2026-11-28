@@ -6,6 +6,7 @@ Access is granted per Document, but Entities, Relations and Wiki Pages are built
 2. **Wiki.** A Wiki Page is shown only to a Principal who can read every Document it was written from. Otherwise it is hidden, and the agent falls back to Chunks and the graph.
 3. **Memory.** A Memory holds only what the Principal said themselves, never content taken from a Document, so losing access to a Document cannot leave its content behind in Memory.
 4. **External Tools.** Once an agent turn has read a Restricted Document, External Tools are blocked for the rest of that turn. Every other External Tool call needs a Tool Approval.
+5. **Conversations.** A Conversation turn's answer and rewritten query are derived from every Document its retrieval returned. When a rewrite ran, the rewritten query is also derived from the answers in its Conversation History, so the turn inherits those turns' source Documents too. The turn is shown only while every one of those Documents is readable. Otherwise it keeps its seq, question and created_at, withholds the answer and rewritten query, and Conversation History skips it entirely. A no-sources answer that did not rewrite has no source Document and is always shown.
 
 Leakage rate on an adversarial question set is a column of the Ablation Matrix, so a change that breaks these rules shows up as a number.
 

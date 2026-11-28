@@ -35,7 +35,7 @@ func (f *readableChunkReader) GetReadableChunk(_ context.Context, principalID, i
 func newChunkRouter(reader interfaces.ChunkReader) http.Handler {
 	bob := types.Principal{ID: uuid.MustParse("0190d2a8-0000-7000-8000-000000000002"), Name: "bob"}
 	me := handler.NewPrincipalHandler(service.NewPrincipalService(nil, nil, nil))
-	return New(Readiness{}, keyring{"trelis_alice": alice, "trelis_bob": bob}, me, nil, nil, nil,
+	return New(Readiness{}, keyring{"trelis_alice": alice, "trelis_bob": bob}, me, nil, nil, nil, nil,
 		handler.NewChunkHandler(service.NewChunkService(reader)), false)
 }
 

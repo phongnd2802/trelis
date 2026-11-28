@@ -277,6 +277,7 @@ func run(configPath string, args []string) (err error) {
 	}
 	docRepo := repository.NewDocumentRepository(dbStore)
 	eventRepo := repository.NewIngestEventRepository(dbStore)
+	conversationRepo := repository.NewConversationRepository(dbStore)
 	// The embedder is optional: without a configured embedding role, ingest
 	// still parses and chunks, and the embed step fails the Document with a
 	// reason an operator can act on.
@@ -333,10 +334,11 @@ func run(configPath string, args []string) (err error) {
 		service.NewReconcileService(docRepo, files, starter), cfg.Reconciler.Interval)
 	defer stopReconciler()
 	docs := handler.NewDocumentHandler(documentService, cfg.Storage.MaxFileSize())
-	retrievalService := service.NewRetrievalService(docRepo, repository.NewChunkSearcher(dbStore), embedder, reranker)
+	retrievalService := service.NewRetrievalService(docRepo, repository.NewChunkSearcher(dbStore), embedder, reranker, answerGenerator)
 	retrieval := handler.NewRetrievalHandler(retrievalService)
-	answerService := service.NewAnswerService(retrievalService, answerGenerator)
+	answerService := service.NewAnswerService(retrievalService, answerGenerator, conversationRepo, docRepo)
 	answers := handler.NewAnswerHandler(answerService)
+	conversations := handler.NewConversationHandler(service.NewConversationService(conversationRepo, docRepo))
 	chunks := handler.NewChunkHandler(service.NewChunkService(repository.NewChunkReader(dbStore)))
 
 	ready := router.Readiness{Timeout: readyTimeout, Checks: []router.Check{
@@ -358,7 +360,7 @@ func run(configPath string, args []string) (err error) {
 	logger.Ctx(ctx).Info("trelis listening", zap.String("addr", ln.Addr().String()), zap.String("config", configPath))
 
 	serveErr := router.Serve(ctx, ln, router.New(ready, service.NewAuthService(principalRepo, keyRepo),
-		handler.NewPrincipalHandler(principals), docs, retrieval, answers, chunks,
+		handler.NewPrincipalHandler(principals), docs, retrieval, answers, conversations, chunks,
 		cfg.Server.Swagger), cfg.Server.ShutdownTimeout)
 	closeCtx, cancelClose := context.WithTimeout(context.WithoutCancel(ctx), cfg.Server.ShutdownTimeout)
 	defer cancelClose()

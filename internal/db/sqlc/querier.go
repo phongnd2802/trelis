@@ -15,6 +15,7 @@ type Querier interface {
 	CountChunksWithoutEmbedding(ctx context.Context, documentID uuid.UUID) (int64, error)
 	CountReadableDocuments(ctx context.Context, principalID uuid.UUID) (int64, error)
 	CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (CreateAPIKeyRow, error)
+	CreateConversation(ctx context.Context, principalID uuid.UUID) (Conversation, error)
 	CreateDocument(ctx context.Context, arg CreateDocumentParams) (Document, error)
 	CreateGroup(ctx context.Context, name string) (CreateGroupRow, error)
 	CreatePrincipal(ctx context.Context, name string) (CreatePrincipalRow, error)
@@ -25,6 +26,9 @@ type Querier interface {
 	// won the race with the caller's read. Zero rows means it was already deleted.
 	DeleteDocument(ctx context.Context, id uuid.UUID) (uuid.UUID, error)
 	DeleteParentChunksByDocument(ctx context.Context, documentID uuid.UUID) error
+	// A Conversation is visible only to the Principal who owns it, so a foreign
+	// id matches no row and is the repository's not-found error.
+	GetConversation(ctx context.Context, arg GetConversationParams) (Conversation, error)
 	// The system view of one Document, with no access check: the ingest
 	// activities run with no Principal.
 	GetDocumentByID(ctx context.Context, id uuid.UUID) (Document, error)
@@ -50,6 +54,18 @@ type Querier interface {
 	// mode, or before it was enabled, and the ID of the Parent Chunk the Chunk
 	// belongs to otherwise. A NULL means a reader falls back to the Chunk itself.
 	InsertChunk(ctx context.Context, arg InsertChunkParams) error
+	// Appends one turn to its Conversation and returns it with the next seq and
+	// created_at Postgres assigned. The UPDATE advances the Conversation's
+	// turn_seq under its row lock and only matches the owner, so zero rows means
+	// the Conversation is gone or belongs to another Principal; the repository
+	// maps that to ErrConversationNotFound. rewritten_query is NULL when no
+	// rewrite ran; when one ran the repository passes the query actually used,
+	// including a fallback equal to the raw question.
+	// source_document_ids holds the distinct Documents the answer depends on:
+	// every retrieved result, plus, when a rewrite ran, the sources of the
+	// history answers it was rewritten from. It is empty for a no-sources answer
+	// that did not rewrite.
+	InsertConversationTurn(ctx context.Context, arg InsertConversationTurnParams) (ConversationTurn, error)
 	// Appends one Ingest Event to its Document's stream and returns it with the
 	// per-Document seq and created_at Postgres assigned, and the upload the
 	// event belongs to. The UPDATE advances the Document's counter under its row
@@ -66,6 +82,8 @@ type Querier interface {
 	InsertIngestEvent(ctx context.Context, arg InsertIngestEventParams) (IngestEvent, error)
 	InsertParentChunk(ctx context.Context, arg InsertParentChunkParams) (uuid.UUID, error)
 	ListAPIKeys(ctx context.Context, principalID uuid.UUID) ([]ListAPIKeysRow, error)
+	// The turns of one Conversation in seq order.
+	ListConversationTurns(ctx context.Context, conversationID uuid.UUID) ([]ConversationTurn, error)
 	ListDocumentGroups(ctx context.Context, documentID uuid.UUID) ([]string, error)
 	ListDocumentPrincipals(ctx context.Context, documentID uuid.UUID) ([]string, error)
 	// The current upload and parse status of each of the given Documents. The
@@ -95,6 +113,9 @@ type Querier interface {
 	ListReadableDocumentIDs(ctx context.Context, principalID uuid.UUID) ([]uuid.UUID, error)
 	// A page of the Documents a Principal can read, newest first.
 	ListReadableDocuments(ctx context.Context, arg ListReadableDocumentsParams) ([]Document, error)
+	// The last turn_limit turns of one Conversation, in ascending seq order, so
+	// the caller gets Conversation History oldest first.
+	ListRecentConversationTurns(ctx context.Context, arg ListRecentConversationTurnsParams) ([]ConversationTurn, error)
 	// One batch of embedding work: the Chunks of a seq range that the embed
 	// activity has not written a vector for yet. Re-running a range, as a retry
 	// does, skips the Chunks already done.

@@ -8,6 +8,12 @@ import "github.com/google/uuid"
 // flag that asks for the retrieved Chunks, the trace and the token usage.
 type AnswerRequest struct {
 	RetrievalRequest
+	// ConversationID asks the answer to carry the Conversation's last turns
+	// into retrieval and to record this question and answer as its next turn;
+	// nil answers without history and records nothing. The Conversation must
+	// belong to the caller, and an unknown or foreign one is a 404 before any
+	// retrieval or model call.
+	ConversationID *uuid.UUID `json:"conversation_id,omitempty"`
 	// Debug asks the answer to carry the retrieved Chunks, the trace and the
 	// chat call's token usage; false leaves the debug object out entirely.
 	Debug bool `json:"debug"`

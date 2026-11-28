@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"reflect"
 	"slices"
 	"strings"
@@ -167,7 +168,7 @@ func hybridRequest(query string) *types.RetrievalRequest {
 // TestEveryKnownCandidateTechniqueHasARunner guards the runner map from drifting away
 // from the techniques validation admits.
 func TestEveryKnownCandidateTechniqueHasARunner(t *testing.T) {
-	retrieval, ok := NewRetrievalService(nil, nil, nil, nil).(*retrievalService)
+	retrieval, ok := NewRetrievalService(nil, nil, nil, nil, nil).(*retrievalService)
 	if !ok {
 		t.Fatal("NewRetrievalService did not return a *retrievalService")
 	}
@@ -196,7 +197,7 @@ func TestRetrieveSearchesOnlyTheCallersReadableDocuments(t *testing.T) {
 		{Chunk: &types.Chunk{ID: chunkLow, DocumentID: docA, Seq: 2, Content: "far"}, Score: 0.25},
 	}}
 	embedder := &fakeEmbedder{vectors: [][]float32{{0.1, 0.2}}, model: "fake-embedding"}
-	retrieval := NewRetrievalService(docs, chunks, embedder, nil)
+	retrieval := NewRetrievalService(docs, chunks, embedder, nil, nil)
 
 	req := &types.RetrievalRequest{Query: "  who won?  ", TopK: intPointer(5)}
 	got, err := retrieval.Retrieve(callerContext(principalID), req)
@@ -263,7 +264,7 @@ func TestRetrieveWithoutReadableDocumentsStillEmbedsAndSearches(t *testing.T) {
 	docs := &fakeReadableDocuments{readable: []uuid.UUID{}}
 	chunks := &fakeChunkSearch{}
 	embedder := &fakeEmbedder{vectors: [][]float32{{1, 0}}, model: "fake-embedding"}
-	retrieval := NewRetrievalService(docs, chunks, embedder, nil)
+	retrieval := NewRetrievalService(docs, chunks, embedder, nil, nil)
 
 	got, err := retrieval.Retrieve(callerContext(uuid.New()), &types.RetrievalRequest{Query: "who won?"})
 	if err != nil {
@@ -301,7 +302,7 @@ func TestRetrieveBM25RunsWithoutAnEmbeddingModel(t *testing.T) {
 		{Chunk: &types.Chunk{ID: chunkLow, DocumentID: docB, Seq: 0, Content: "thuế giá trị gia tăng"}, Score: 1.25},
 	}}
 	// nil embedder: a bm25-only request must not need models.embedding.
-	retrieval := NewRetrievalService(docs, chunks, nil, nil)
+	retrieval := NewRetrievalService(docs, chunks, nil, nil, nil)
 
 	req := &types.RetrievalRequest{
 		Query:           "  thue tncn  ",
@@ -361,7 +362,7 @@ func TestRetrieveBM25RunsWithoutAnEmbeddingModel(t *testing.T) {
 func TestRetrieveBM25WrapsASearchFailure(t *testing.T) {
 	searchErr := errors.New("postgres down")
 	chunks := &fakeChunkSearch{bm25Err: searchErr}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{uuid.New()}}, chunks, nil, nil)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{uuid.New()}}, chunks, nil, nil, nil)
 
 	_, err := retrieval.Retrieve(callerContext(uuid.New()), &types.RetrievalRequest{
 		Query:           "thue tncn",
@@ -375,7 +376,7 @@ func TestRetrieveBM25WrapsASearchFailure(t *testing.T) {
 func TestRetrieveWithoutAnEmbeddingModelIsServiceUnavailable(t *testing.T) {
 	docs := &fakeReadableDocuments{err: errors.New("must not be reached")}
 	var embedder interfaces.Embedder // nil: no embedding role configured
-	retrieval := NewRetrievalService(docs, &fakeChunkSearch{}, embedder, nil)
+	retrieval := NewRetrievalService(docs, &fakeChunkSearch{}, embedder, nil, nil)
 
 	_, err := retrieval.Retrieve(callerContext(uuid.New()), &types.RetrievalRequest{Query: "who won?"})
 	appErr, ok := apperrors.IsAppError(err)
@@ -396,7 +397,7 @@ func TestRetrieveWithoutAnEmbeddingModelIsServiceUnavailable(t *testing.T) {
 func TestRetrieveWrapsAnEmbeddingFailure(t *testing.T) {
 	embedErr := errors.New("provider down")
 	embedder := &fakeEmbedder{err: embedErr}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{uuid.New()}}, &fakeChunkSearch{}, embedder, nil)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{uuid.New()}}, &fakeChunkSearch{}, embedder, nil, nil)
 
 	_, err := retrieval.Retrieve(callerContext(uuid.New()), &types.RetrievalRequest{Query: "who won?"})
 	if !errors.Is(err, embedErr) || !strings.Contains(err.Error(), "embed query") {
@@ -410,8 +411,7 @@ func TestRetrieveWrapsAnEmbeddingFailure(t *testing.T) {
 func TestRetrieveWrapsASearchFailure(t *testing.T) {
 	searchErr := errors.New("postgres down")
 	chunks := &fakeChunkSearch{denseErr: searchErr}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{uuid.New()}},
-		chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{uuid.New()}}, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil, nil)
 
 	_, err := retrieval.Retrieve(callerContext(uuid.New()), &types.RetrievalRequest{Query: "who won?"})
 	if !errors.Is(err, searchErr) || !strings.Contains(err.Error(), "search") {
@@ -442,7 +442,7 @@ func TestRetrieveRejectsAnInvalidRequestBeforeTouchingItsDependencies(t *testing
 			docs := &fakeReadableDocuments{err: errors.New("must not be reached")}
 			chunks := &fakeChunkSearch{}
 			embedder := &fakeEmbedder{}
-			retrieval := NewRetrievalService(docs, chunks, embedder, nil)
+			retrieval := NewRetrievalService(docs, chunks, embedder, nil, nil)
 
 			_, err := retrieval.Retrieve(callerContext(uuid.New()), req)
 			appErr, ok := apperrors.IsAppError(err)
@@ -591,7 +591,7 @@ func TestRetrieveHybridRunsBothOverTheReadableSetAndFuses(t *testing.T) {
 		},
 	}
 	embedder := &fakeEmbedder{vectors: [][]float32{{0.1, 0.2}}, model: "fake-embedding"}
-	retrieval := NewRetrievalService(docs, chunks, embedder, nil)
+	retrieval := NewRetrievalService(docs, chunks, embedder, nil, nil)
 
 	req := hybridRequest("  who won?  ")
 	req.TopK = intPointer(2)
@@ -673,8 +673,7 @@ func TestRetrieveHybridRunsBothOverTheReadableSetAndFuses(t *testing.T) {
 
 func TestRetrieveHybridFetchesTopKWhenItExceedsTheFusionDepth(t *testing.T) {
 	chunks := &fakeChunkSearch{}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{}, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil, nil)
 
 	req := hybridRequest("who won?")
 	req.TopK = intPointer(80)
@@ -690,7 +689,7 @@ func TestRetrieveHybridFetchesTopKWhenItExceedsTheFusionDepth(t *testing.T) {
 
 func TestRetrieveHybridWithoutAnEmbeddingModelIsServiceUnavailable(t *testing.T) {
 	docs := &fakeReadableDocuments{err: errors.New("must not be reached")}
-	retrieval := NewRetrievalService(docs, &fakeChunkSearch{}, nil, nil)
+	retrieval := NewRetrievalService(docs, &fakeChunkSearch{}, nil, nil, nil)
 
 	_, err := retrieval.Retrieve(callerContext(uuid.New()), hybridRequest("who won?"))
 	appErr, ok := apperrors.IsAppError(err)
@@ -708,8 +707,7 @@ func TestRetrieveHybridWithoutAnEmbeddingModelIsServiceUnavailable(t *testing.T)
 func TestRetrieveHybridFailsWhenOneTechniqueFails(t *testing.T) {
 	searchErr := errors.New("postgres down")
 	chunks := &fakeChunkSearch{bm25Err: searchErr}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{uuid.New()}}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{uuid.New()}}, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil, nil)
 
 	_, err := retrieval.Retrieve(callerContext(uuid.New()), hybridRequest("who won?"))
 	if !errors.Is(err, searchErr) || !strings.Contains(err.Error(), "bm25") {
@@ -752,8 +750,7 @@ func TestRetrieveSingleTechniqueReranksByTheRerankScores(t *testing.T) {
 		{Chunk: &types.Chunk{ID: chunkB, DocumentID: docB, Seq: 0, Content: "near B"}, Score: 0.8},
 	}}
 	reranker := &fakeReranker{scores: []float64{0.1, 0.95}, model: "fake-rerank"}
-	retrieval := NewRetrievalService(docs, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker)
+	retrieval := NewRetrievalService(docs, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker, nil)
 
 	req := rerankRequest("  who won?  ", types.RetrievalTechniqueDense)
 	req.TopK = intPointer(5)
@@ -825,8 +822,7 @@ func TestRetrieveHybridReranksTheFusedPool(t *testing.T) {
 		},
 	}
 	reranker := &fakeReranker{scores: []float64{0.2, 0.7}, model: "fake-rerank"}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docA, docB}}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docA, docB}}, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker, nil)
 
 	req := rerankRequest("who won?", types.RetrievalTechniqueBM25, types.RetrievalTechniqueDense)
 	req.TopK = intPointer(1)
@@ -879,8 +875,7 @@ func TestRetrieveRerankCandidatesCapsThePoolAndDeepensTheSearch(t *testing.T) {
 	}
 	chunks := &fakeChunkSearch{denseMatches: matches}
 	reranker := &fakeReranker{scores: []float64{0.1, 0.2, 0.9}, model: "fake-rerank"}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker, nil)
 
 	req := rerankRequest("who won?", types.RetrievalTechniqueDense)
 	req.TopK = intPointer(1)
@@ -917,8 +912,7 @@ func TestRetrieveRerankOrdersScoreTiesByChunkID(t *testing.T) {
 		{Chunk: &types.Chunk{ID: chunkA, DocumentID: docID, Content: "near A"}, Score: 0.8},
 	}}
 	reranker := &fakeReranker{scores: []float64{0.5, 0.5}, model: "fake-rerank"}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker, nil)
 
 	got, err := retrieval.Retrieve(callerContext(uuid.New()), rerankRequest("who won?", types.RetrievalTechniqueDense))
 	if err != nil {
@@ -942,8 +936,7 @@ func TestRetrieveWithRerankOffNeverCallsTheRerankModel(t *testing.T) {
 		{Chunk: &types.Chunk{ID: chunkA, DocumentID: docA, Content: "near A"}, Score: 0.9},
 		{Chunk: &types.Chunk{ID: chunkB, DocumentID: docA, Content: "near B"}, Score: 0.8},
 	}}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docA}}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, &forbiddenReranker{t: t})
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docA}}, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, &forbiddenReranker{t: t}, nil)
 
 	req := &types.RetrievalRequest{Query: "who won?", TopK: intPointer(5)}
 	got, err := retrieval.Retrieve(callerContext(uuid.New()), req)
@@ -979,8 +972,7 @@ func TestRetrieveHybridWithRerankOffIgnoresRerankCandidates(t *testing.T) {
 			{Chunk: &types.Chunk{ID: chunkB, DocumentID: docB, Content: "near B"}, Score: 0.9},
 		},
 	}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docA, docB}}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, &forbiddenReranker{t: t})
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docA, docB}}, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, &forbiddenReranker{t: t}, nil)
 
 	without := hybridRequest("who won?")
 	without.TopK = intPointer(2)
@@ -1025,8 +1017,7 @@ func TestRetrieveHybridWithRerankOffIgnoresRerankCandidates(t *testing.T) {
 
 func TestRetrieveWithRerankWithoutARerankModelIsServiceUnavailable(t *testing.T) {
 	docs := &fakeReadableDocuments{err: errors.New("must not be reached")}
-	retrieval := NewRetrievalService(docs, &fakeChunkSearch{},
-		&fakeEmbedder{model: "fake-embedding"}, nil)
+	retrieval := NewRetrievalService(docs, &fakeChunkSearch{}, &fakeEmbedder{model: "fake-embedding"}, nil, nil)
 
 	req := rerankRequest("who won?", types.RetrievalTechniqueDense)
 	_, err := retrieval.Retrieve(callerContext(uuid.New()), req)
@@ -1053,8 +1044,7 @@ func TestRetrieveWrapsARerankFailure(t *testing.T) {
 		Score: 0.9,
 	}}}
 	reranker := &fakeReranker{err: rerankErr}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker, nil)
 
 	_, err := retrieval.Retrieve(callerContext(uuid.New()), rerankRequest("who won?", types.RetrievalTechniqueDense))
 	if !errors.Is(err, rerankErr) || !strings.Contains(err.Error(), "rerank") {
@@ -1072,8 +1062,7 @@ func TestRetrieveRejectsARerankScoreCountMismatch(t *testing.T) {
 		{Chunk: &types.Chunk{ID: uuid.MustParse("0190d2a8-0000-7000-8000-000000000002"), DocumentID: docID, Content: "two"}, Score: 0.8},
 	}}
 	reranker := &fakeReranker{scores: []float64{1}}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker, nil)
 
 	_, err := retrieval.Retrieve(callerContext(uuid.New()), rerankRequest("who won?", types.RetrievalTechniqueDense))
 	if err == nil || !strings.Contains(err.Error(), "1 scores") || !strings.Contains(err.Error(), "2 candidates") {
@@ -1086,8 +1075,7 @@ func TestRetrieveRejectsARerankScoreCountMismatch(t *testing.T) {
 
 func TestRetrieveWithRerankAndAnEmptyPoolSkipsTheCall(t *testing.T) {
 	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, &fakeChunkSearch{},
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, &forbiddenReranker{t: t})
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, &fakeChunkSearch{}, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, &forbiddenReranker{t: t}, nil)
 
 	got, err := retrieval.Retrieve(callerContext(uuid.New()), rerankRequest("who won?", types.RetrievalTechniqueDense))
 	if err != nil {
@@ -1128,8 +1116,7 @@ func TestRetrieveParentChildCollapsesChunksOfOneParentChunk(t *testing.T) {
 			Content: "Điều 1. Phạm vi\nĐiều 3. Thu nhập", ContextHeader: "Chương I",
 		}},
 	}
-	retrieval := NewRetrievalService(docs, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
+	retrieval := NewRetrievalService(docs, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil, nil)
 
 	req := parentChildRequest("who won?", types.RetrievalTechniqueDense)
 	req.TopK = intPointer(5)
@@ -1225,8 +1212,7 @@ func TestRetrieveParentChildStillFillsTopKAfterCollapse(t *testing.T) {
 			ID: parentID, DocumentID: docID, Seq: 0, Content: "the three first Chunks",
 		}},
 	}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil, nil)
 
 	req := parentChildRequest("who won?", types.RetrievalTechniqueDense)
 	req.TopK = intPointer(2)
@@ -1259,8 +1245,7 @@ func TestRetrieveParentChildFallsBackWhenAParentIsMissing(t *testing.T) {
 			Score:    0.9,
 		}},
 	}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil, nil)
 
 	req := parentChildRequest("who won?", types.RetrievalTechniqueDense)
 	req.TopK = intPointer(5)
@@ -1300,8 +1285,7 @@ func TestRetrieveParentChildCollapsesOnTheRerankedOrderBeforeTheCut(t *testing.T
 		}},
 	}
 	reranker := &fakeReranker{scores: []float64{0.8, 0.9, 0.7}, model: "fake-rerank"}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker, nil)
 
 	req := parentChildRequest("who won?", types.RetrievalTechniqueDense, types.RetrievalTechniqueRerank)
 	req.TopK = intPointer(1)
@@ -1356,8 +1340,7 @@ func TestRetrieveParentChildCollapsesOnTheRerankedOrderBeforeTheCut(t *testing.T
 
 func TestRetrieveParentChildSearchesAtLeastTheFusionDepth(t *testing.T) {
 	chunks := &fakeChunkSearch{}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{}, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil, nil)
 
 	req := parentChildRequest("who won?", types.RetrievalTechniqueDense)
 	req.TopK = intPointer(3)
@@ -1390,8 +1373,7 @@ func TestRetrieveParentChildWrapsAListParentsFailure(t *testing.T) {
 		}},
 		parentErr: listErr,
 	}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil, nil)
 
 	req := parentChildRequest("who won?", types.RetrievalTechniqueDense)
 	req.TopK = intPointer(5)
@@ -1417,8 +1399,7 @@ func TestRetrieveWithParentChildOffNeverListsParents(t *testing.T) {
 		// A caller here would fail the request, so the assertion is strict.
 		parentErr: errors.New("must not be reached"),
 	}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil, nil)
 
 	got, err := retrieval.Retrieve(callerContext(uuid.New()), &types.RetrievalRequest{
 		Query: "who won?", TopK: intPointer(5),
@@ -1442,8 +1423,7 @@ func TestRetrieveWithParentChildOffNeverListsParents(t *testing.T) {
 
 func TestRetrieveParentChildWithNothingReadableKeepsTheEmptyExpandedList(t *testing.T) {
 	chunks := &fakeChunkSearch{parentErr: errors.New("must not be reached")}
-	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{}}, chunks,
-		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{}}, chunks, &fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil, nil)
 
 	req := parentChildRequest("who won?", types.RetrievalTechniqueDense)
 	req.TopK = intPointer(5)
@@ -1476,10 +1456,318 @@ func TestRetrieveParentChildWithNothingReadableKeepsTheEmptyExpandedList(t *test
 }
 
 func TestRetrieveNeedsTheAuthenticatedPrincipal(t *testing.T) {
-	retrieval := NewRetrievalService(&fakeReadableDocuments{}, &fakeChunkSearch{}, &fakeEmbedder{}, nil)
+	retrieval := NewRetrievalService(&fakeReadableDocuments{}, &fakeChunkSearch{}, &fakeEmbedder{}, nil, nil)
 
 	_, err := retrieval.Retrieve(context.Background(), &types.RetrievalRequest{Query: "who won?"})
 	if err == nil || !strings.Contains(err.Error(), "principal") {
 		t.Errorf("Retrieve without a Principal = %v, want an error naming the missing Principal", err)
+	}
+}
+
+// rewriteRequest runs bm25 with query_rewrite over history, the shape every
+// query rewrite test needs.
+func rewriteRequest(query string, history []types.ConversationTurn) *types.RetrievalRequest {
+	return &types.RetrievalRequest{
+		Query: query,
+		TopK:  intPointer(5),
+		RetrievalConfig: &types.RetrievalConfig{Techniques: []types.RetrievalTechnique{
+			types.RetrievalTechniqueBM25, types.RetrievalTechniqueQueryRewrite,
+		}},
+		History: history,
+	}
+}
+
+// oneRewriteHistory is one earlier turn, enough to make a follow-up a
+// follow-up.
+func oneRewriteHistory() []types.ConversationTurn {
+	return []types.ConversationTurn{{
+		Seq:      1,
+		Question: "Thuế TNCN là gì?",
+		Answer:   "Thuế TNCN là thuế thu nhập cá nhân.",
+	}}
+}
+
+func TestRetrieveRewritesAFollowUpBeforeSearchingWithIt(t *testing.T) {
+	principalID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000a1")
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	chunkID := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+
+	docs := &fakeReadableDocuments{readable: []uuid.UUID{docID}}
+	chunks := &fakeChunkSearch{bm25Matches: []*types.ChunkMatch{
+		{Chunk: &types.Chunk{ID: chunkID, DocumentID: docID, Seq: 0, Content: "Thuế TNCN năm 2024 giảm."}, Score: 2},
+	}}
+	usage := types.TokenUsage{PromptTokens: 21, CompletionTokens: 5, TotalTokens: 26}
+	rewriter := &fakeGenerator{
+		model: "test-chat",
+		reply: &types.ChatResponse{Content: "  Thuế TNCN năm 2024  ", Usage: usage},
+	}
+	retrieval := NewRetrievalService(docs, chunks, nil, nil, rewriter)
+
+	got, err := retrieval.Retrieve(callerContext(principalID), rewriteRequest("và năm 2024 thì sao?", oneRewriteHistory()))
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+
+	if rewriter.calls != 1 {
+		t.Fatalf("rewriter called %d times, want once", rewriter.calls)
+	}
+	if len(rewriter.gotTurns) != 2 || rewriter.gotTurns[0].Role != types.ChatRoleSystem {
+		t.Fatalf("rewriter turns = %+v, want a system and a user turn", rewriter.gotTurns)
+	}
+	user := rewriter.gotTurns[1].Content
+	for _, want := range []string{
+		"Q: Thuế TNCN là gì?",
+		"A: Thuế TNCN là thuế thu nhập cá nhân.",
+		"Latest question: và năm 2024 thì sao?",
+	} {
+		if !strings.Contains(user, want) {
+			t.Errorf("rewrite user message %q does not carry %q", user, want)
+		}
+	}
+	if strings.Index(user, "Q: Thuế") > strings.Index(user, "Latest question:") {
+		t.Errorf("rewrite user message %q puts the history after the latest question", user)
+	}
+
+	if chunks.bm25Query != "Thuế TNCN năm 2024" {
+		t.Errorf("bm25 searched %q, want the trimmed rewritten query", chunks.bm25Query)
+	}
+	if got.Query != "Thuế TNCN năm 2024" {
+		t.Errorf("result query = %q, want the query retrieval ran with", got.Query)
+	}
+	if got.RewrittenQuery == nil || *got.RewrittenQuery != "Thuế TNCN năm 2024" {
+		t.Errorf("result rewritten query = %v, want the trimmed rewritten query", got.RewrittenQuery)
+	}
+	if got.RewriteUsage != usage {
+		t.Errorf("result rewrite usage = %+v, want %+v", got.RewriteUsage, usage)
+	}
+	if len(got.Trace) != 2 {
+		t.Fatalf("trace = %+v, want the rewrite step then the bm25 search step", got.Trace)
+	}
+	step := got.Trace[0]
+	if step.Step != types.TraceStepRewriteQuery || step.Technique != types.RetrievalTechniqueQueryRewrite ||
+		step.Model != "test-chat" || step.RewrittenQuery != "Thuế TNCN năm 2024" ||
+		step.Usage == nil || *step.Usage != usage || step.DurationMS < 0 {
+		t.Errorf("trace[0] = %+v, want the rewrite_query step with the model, query and usage", step)
+	}
+	if step.Candidates != nil {
+		t.Errorf("rewrite step candidates = %v, want none", *step.Candidates)
+	}
+	if got.Trace[1].Step != types.TraceStepSearch || got.Trace[1].Technique != types.RetrievalTechniqueBM25 {
+		t.Errorf("trace[1] = %+v, want the bm25 search step after the rewrite", got.Trace[1])
+	}
+}
+
+func TestRetrieveRewritesTheQueryForDenseToo(t *testing.T) {
+	principalID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000a1")
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	chunkID := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+
+	docs := &fakeReadableDocuments{readable: []uuid.UUID{docID}}
+	chunks := &fakeChunkSearch{denseMatches: []*types.ChunkMatch{
+		{Chunk: &types.Chunk{ID: chunkID, DocumentID: docID, Seq: 0, Content: "Thuế TNCN năm 2024 giảm."}, Score: 0.9},
+	}}
+	embedder := &fakeEmbedder{vectors: [][]float32{{1, 0}}, model: "test-embedding"}
+	rewriter := &fakeGenerator{reply: &types.ChatResponse{Content: "Thuế TNCN năm 2024"}}
+	retrieval := NewRetrievalService(docs, chunks, embedder, nil, rewriter)
+
+	req := rewriteRequest("và năm 2024 thì sao?", oneRewriteHistory())
+	req.RetrievalConfig.Techniques = []types.RetrievalTechnique{
+		types.RetrievalTechniqueDense, types.RetrievalTechniqueQueryRewrite,
+	}
+	if _, err := retrieval.Retrieve(callerContext(principalID), req); err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if !slices.Equal(embedder.got, []string{"Thuế TNCN năm 2024"}) {
+		t.Errorf("dense embedded %v, want the rewritten query", embedder.got)
+	}
+}
+
+func TestRetrieveRewritesTheQueryForRerankToo(t *testing.T) {
+	principalID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000a1")
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	chunkID := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+
+	docs := &fakeReadableDocuments{readable: []uuid.UUID{docID}}
+	chunks := &fakeChunkSearch{bm25Matches: []*types.ChunkMatch{
+		{Chunk: &types.Chunk{ID: chunkID, DocumentID: docID, Seq: 0, Content: "Thuế TNCN năm 2024 giảm."}, Score: 2},
+	}}
+	reranker := &fakeReranker{scores: []float64{0.9}, model: "test-rerank"}
+	rewriter := &fakeGenerator{reply: &types.ChatResponse{Content: "Thuế TNCN năm 2024"}}
+	retrieval := NewRetrievalService(docs, chunks, nil, reranker, rewriter)
+
+	req := rewriteRequest("và năm 2024 thì sao?", oneRewriteHistory())
+	req.RetrievalConfig.Techniques = []types.RetrievalTechnique{
+		types.RetrievalTechniqueBM25, types.RetrievalTechniqueRerank, types.RetrievalTechniqueQueryRewrite,
+	}
+	if _, err := retrieval.Retrieve(callerContext(principalID), req); err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if reranker.gotQuery != "Thuế TNCN năm 2024" {
+		t.Errorf("rerank scored against %q, want the rewritten query", reranker.gotQuery)
+	}
+}
+
+func TestRetrieveWithoutQueryRewriteSearchesTheRawQuestion(t *testing.T) {
+	history := oneRewriteHistory()
+	rewriter := &fakeGenerator{reply: &types.ChatResponse{Content: "must not be used"}}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{}, &fakeChunkSearch{}, nil, nil, rewriter)
+
+	req := rewriteRequest("và năm 2024 thì sao?", history)
+	req.RetrievalConfig.Techniques = []types.RetrievalTechnique{types.RetrievalTechniqueBM25}
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), req)
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+
+	if rewriter.calls != 0 {
+		t.Errorf("rewriter called %d times without query_rewrite, want none", rewriter.calls)
+	}
+	if got.Query != "và năm 2024 thì sao?" {
+		t.Errorf("result query = %q, want the raw question", got.Query)
+	}
+	if got.RewrittenQuery != nil || got.RewriteUsage != (types.TokenUsage{}) {
+		t.Errorf("result rewrite = %v, %+v; want none without query_rewrite", got.RewrittenQuery, got.RewriteUsage)
+	}
+	if len(got.Trace) != 1 || got.Trace[0].Step != types.TraceStepSearch {
+		t.Errorf("trace = %+v, want only the search step", got.Trace)
+	}
+}
+
+func TestRetrieveWithoutHistoryMakesNoRewriteCall(t *testing.T) {
+	rewriter := &fakeGenerator{reply: &types.ChatResponse{Content: "must not be used"}}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{}, &fakeChunkSearch{}, nil, nil, rewriter)
+
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), rewriteRequest("Thuế TNCN là gì?", nil))
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if rewriter.calls != 0 {
+		t.Errorf("rewriter called %d times without history, want none", rewriter.calls)
+	}
+	if got.Query != "Thuế TNCN là gì?" {
+		t.Errorf("result query = %q, want the raw question", got.Query)
+	}
+	if got.RewrittenQuery != nil || got.RewriteUsage != (types.TokenUsage{}) {
+		t.Errorf("result rewrite = %v, %+v; want none without history", got.RewrittenQuery, got.RewriteUsage)
+	}
+	if len(got.Trace) != 1 || got.Trace[0].Step != types.TraceStepSearch {
+		t.Errorf("trace = %+v, want only the search step, no rewrite_query step", got.Trace)
+	}
+}
+
+func TestRetrieveWithoutAChatModelCannotRewrite(t *testing.T) {
+	docs := &fakeReadableDocuments{err: errors.New("must not be reached")}
+	retrieval := NewRetrievalService(docs, &fakeChunkSearch{}, nil, nil, nil)
+
+	_, err := retrieval.Retrieve(callerContext(uuid.New()), rewriteRequest("và năm 2024 thì sao?", oneRewriteHistory()))
+	appErr, ok := apperrors.IsAppError(err)
+	if !ok {
+		t.Fatalf("Retrieve = %v, want an AppError", err)
+	}
+	if appErr.Code != apperrors.ErrServiceUnavailable || appErr.HTTPCode != http.StatusServiceUnavailable {
+		t.Errorf("error code/status = %d/%d, want %d/503",
+			appErr.Code, appErr.HTTPCode, apperrors.ErrServiceUnavailable)
+	}
+	if !strings.Contains(appErr.Message, "query rewrite") || !strings.Contains(appErr.Message, "models.chat") {
+		t.Errorf("message %q does not name query rewrite and models.chat", appErr.Message)
+	}
+	if docs.calls != 0 {
+		t.Errorf("readable Documents asked %d times without a chat model, want none", docs.calls)
+	}
+}
+
+func TestRetrieveFallsBackToTheRawQuestionForABlankRewrite(t *testing.T) {
+	usage := types.TokenUsage{PromptTokens: 4, CompletionTokens: 0, TotalTokens: 4}
+	rewriter := &fakeGenerator{reply: &types.ChatResponse{Content: "   ", Usage: usage}}
+	chunks := &fakeChunkSearch{}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{}, chunks, nil, nil, rewriter)
+
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), rewriteRequest("và năm 2024 thì sao?", oneRewriteHistory()))
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if chunks.bm25Query != "và năm 2024 thì sao?" {
+		t.Errorf("bm25 searched %q, want the raw question after a blank reply", chunks.bm25Query)
+	}
+	if got.Query != "và năm 2024 thì sao?" {
+		t.Errorf("result query = %q, want the raw question", got.Query)
+	}
+	if got.RewrittenQuery == nil || *got.RewrittenQuery != "và năm 2024 thì sao?" {
+		t.Errorf("result rewritten query = %v, want the raw question after a blank reply", got.RewrittenQuery)
+	}
+	if got.RewriteUsage != usage {
+		t.Errorf("result rewrite usage = %+v, want the call's usage %+v even when it fell back", got.RewriteUsage, usage)
+	}
+	step := got.Trace[0]
+	if step.RewrittenQuery != "và năm 2024 thì sao?" {
+		t.Errorf("rewritten_query = %q, want the query actually used", step.RewrittenQuery)
+	}
+	if step.Usage == nil || *step.Usage != usage {
+		t.Errorf("usage = %v, want the call's usage even when it fell back", step.Usage)
+	}
+}
+
+func TestRetrieveFallsBackToTheRawQuestionForAnOverlongRewrite(t *testing.T) {
+	rewriter := &fakeGenerator{reply: &types.ChatResponse{
+		Content: strings.Repeat("a", types.RetrievalQueryMaxRunes+1),
+	}}
+	chunks := &fakeChunkSearch{}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{}, chunks, nil, nil, rewriter)
+
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), rewriteRequest("và năm 2024 thì sao?", oneRewriteHistory()))
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if chunks.bm25Query != "và năm 2024 thì sao?" {
+		t.Errorf("bm25 searched %q, want the raw question after an over-long reply", chunks.bm25Query)
+	}
+	if got.Trace[0].RewrittenQuery != "và năm 2024 thì sao?" {
+		t.Errorf("rewritten_query = %q, want the query actually used", got.Trace[0].RewrittenQuery)
+	}
+	if got.RewrittenQuery == nil || *got.RewrittenQuery != "và năm 2024 thì sao?" {
+		t.Errorf("result rewritten query = %v, want the raw question after an over-long reply", got.RewrittenQuery)
+	}
+}
+
+func TestRewritePromptCutsALongHistoryAnswer(t *testing.T) {
+	answer := strings.Repeat("x", rewriteAnswerMaxRunes+200)
+	rewriter := &fakeGenerator{reply: &types.ChatResponse{Content: "rewritten"}}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{}, &fakeChunkSearch{}, nil, nil, rewriter)
+
+	history := []types.ConversationTurn{{Seq: 1, Question: "q", Answer: answer}}
+	if _, err := retrieval.Retrieve(callerContext(uuid.New()), rewriteRequest("follow-up", history)); err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if len(rewriter.gotTurns) != 2 {
+		t.Fatalf("rewriter turns = %+v, want a system and a user turn", rewriter.gotTurns)
+	}
+	prompt := rewriter.gotTurns[1].Content
+	if !strings.Contains(prompt, strings.Repeat("x", rewriteAnswerMaxRunes)+"…") {
+		t.Errorf("rewrite prompt does not carry the answer cut to %d runes with an ellipsis", rewriteAnswerMaxRunes)
+	}
+	if strings.Contains(prompt, strings.Repeat("x", rewriteAnswerMaxRunes+1)) {
+		t.Errorf("rewrite prompt carries more than %d runes of the answer", rewriteAnswerMaxRunes)
+	}
+}
+
+func TestRetrieveKeepsAProviderRejectionOfARewrite(t *testing.T) {
+	cause := errors.New("the provider said secret")
+	rewriter := &fakeGenerator{err: apperrors.NewModelProviderError("chat", http.StatusTooManyRequests, cause)}
+	docs := &fakeReadableDocuments{err: errors.New("must not be reached")}
+	retrieval := NewRetrievalService(docs, &fakeChunkSearch{}, nil, nil, rewriter)
+
+	_, err := retrieval.Retrieve(callerContext(uuid.New()), rewriteRequest("và năm 2024 thì sao?", oneRewriteHistory()))
+	appErr, ok := apperrors.IsAppError(err)
+	if !ok || appErr.Code != apperrors.ErrModelProvider || appErr.HTTPCode != http.StatusBadGateway {
+		t.Fatalf("Retrieve = %v, want the provider-rejection 502", err)
+	}
+	if !strings.Contains(appErr.Message, "chat") {
+		t.Errorf("message = %q, want it to name the chat role", appErr.Message)
+	}
+	if strings.Contains(appErr.Message, "secret") {
+		t.Errorf("message = %q, want the provider's body left out", appErr.Message)
+	}
+	if docs.calls != 0 {
+		t.Errorf("readable Documents asked %d times after a failed rewrite, want none", docs.calls)
 	}
 }

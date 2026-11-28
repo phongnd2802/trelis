@@ -84,7 +84,8 @@ func newAnswerRouter(answer interfaces.AnswerService) http.Handler {
 func newAnswerRouterWith(keys keyring, answer interfaces.AnswerService, opts ...handler.AnswerHandlerOption) http.Handler {
 	me := handler.NewPrincipalHandler(service.NewPrincipalService(nil, nil, nil))
 	return New(Readiness{}, keys, me, nil, nil,
-		handler.NewAnswerHandler(answer, opts...), nil, false)
+		handler.NewAnswerHandler(answer, opts...), nil,
+		nil, false)
 }
 
 func TestAnswerNeedsAKey(t *testing.T) {
@@ -139,7 +140,7 @@ func TestAnAnswerUnknownFieldOrWrongTypeIsValidation(t *testing.T) {
 func TestAnInvalidAnswerRequestIsValidation(t *testing.T) {
 	// Validation runs before the chat-role check, so no service is needed
 	// behind it.
-	h := newAnswerRouter(service.NewAnswerService(nil, nil))
+	h := newAnswerRouter(service.NewAnswerService(nil, nil, nil, nil))
 	for name, body := range map[string]string{
 		"blank query":       `{"query":"   "}`,
 		"top_k zero":        `{"query":"who won?","top_k":0}`,
@@ -172,7 +173,7 @@ func TestAnAnswerBodyOverTheLimitIs413(t *testing.T) {
 }
 
 func TestAnswerWithoutAChatModelIs503(t *testing.T) {
-	h := newAnswerRouter(service.NewAnswerService(nil, nil))
+	h := newAnswerRouter(service.NewAnswerService(nil, nil, nil, nil))
 
 	rec := postJSON(t, h, "/answer", `{"query":"who won?"}`, "Bearer trelis_alice")
 	if rec.Code != http.StatusServiceUnavailable {
@@ -187,9 +188,11 @@ func TestAnswerWithoutAChatModelIs503(t *testing.T) {
 func TestAnswerSendsTheRequestToTheService(t *testing.T) {
 	svc := &stubAnswer{result: &types.AnswerResult{Answer: "yes", Citations: []types.Citation{}}}
 	h := newAnswerRouter(svc)
+	conversationID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000c1")
 
 	rec := postJSON(t, h, "/answer",
-		`{"query":"thue tncn","top_k":4,"retrieval_config":{"techniques":["bm25"],"rrf_k":10},"debug":true}`,
+		`{"query":"thue tncn","top_k":4,"retrieval_config":{"techniques":["bm25"],"rrf_k":10},`+
+			`"conversation_id":"`+conversationID.String()+`","debug":true}`,
 		"Bearer trelis_alice")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST /answer = %d %s, want 200", rec.Code, rec.Body)
@@ -197,6 +200,9 @@ func TestAnswerSendsTheRequestToTheService(t *testing.T) {
 	got := svc.got
 	if got == nil || got.Query != "thue tncn" || got.TopK == nil || *got.TopK != 4 || !got.Debug {
 		t.Fatalf("service got %+v, want the decoded answer request with debug", got)
+	}
+	if got.ConversationID == nil || *got.ConversationID != conversationID {
+		t.Errorf("conversation_id = %v, want %s", got.ConversationID, conversationID)
 	}
 	if got.RetrievalConfig == nil || len(got.RetrievalConfig.Techniques) != 1 ||
 		got.RetrievalConfig.Techniques[0] != types.RetrievalTechniqueBM25 ||
@@ -294,7 +300,7 @@ func TestAChatProviderRejectionOnAStreamedAnswerIsJSON502(t *testing.T) {
 		Results: []types.RetrievedChunk{{Content: "The election was in 2024."}},
 		Trace:   []types.TraceStep{},
 	}}
-	h := newAnswerRouter(service.NewAnswerService(retrieval, chat.Generator(c)))
+	h := newAnswerRouter(service.NewAnswerService(retrieval, chat.Generator(c), nil, nil))
 
 	rec := postAnswerWithAccept(t, h, `{"query":"who won?"}`,
 		"text/event-stream", "Bearer trelis_alice")
@@ -334,7 +340,7 @@ func TestAChatProviderRejectionIs502WithoutTheVendorBody(t *testing.T) {
 		Results: []types.RetrievedChunk{{Content: "The election was in 2024."}},
 		Trace:   []types.TraceStep{},
 	}}
-	h := newAnswerRouter(service.NewAnswerService(retrieval, chat.Generator(c)))
+	h := newAnswerRouter(service.NewAnswerService(retrieval, chat.Generator(c), nil, nil))
 
 	rec := postJSON(t, h, "/answer", `{"query":"who won?"}`, "Bearer trelis_alice")
 

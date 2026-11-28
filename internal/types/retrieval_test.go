@@ -46,12 +46,22 @@ func TestParentChildIsAKnownRetrievalTechnique(t *testing.T) {
 	}
 }
 
+func TestQueryRewriteIsAKnownStageTechnique(t *testing.T) {
+	if !RetrievalTechniqueQueryRewrite.Known() {
+		t.Errorf("%q is not known, want query_rewrite registered as a technique", RetrievalTechniqueQueryRewrite)
+	}
+	if !RetrievalTechniqueQueryRewrite.IsStage() {
+		t.Errorf("%q IsStage() = false, want it treated as a stage", RetrievalTechniqueQueryRewrite)
+	}
+}
+
 func TestOnlyTheStageTechniquesAreStages(t *testing.T) {
 	for technique, want := range map[RetrievalTechnique]bool{
-		RetrievalTechniqueDense:       false,
-		RetrievalTechniqueBM25:        false,
-		RetrievalTechniqueRerank:      true,
-		RetrievalTechniqueParentChild: true,
+		RetrievalTechniqueDense:        false,
+		RetrievalTechniqueBM25:         false,
+		RetrievalTechniqueQueryRewrite: true,
+		RetrievalTechniqueRerank:       true,
+		RetrievalTechniqueParentChild:  true,
 	} {
 		if got := technique.IsStage(); got != want {
 			t.Errorf("%q IsStage() = %t, want %t", technique, got, want)
@@ -202,11 +212,38 @@ func TestRetrievalConfigValidateRejectsOnlyStageTechniques(t *testing.T) {
 	}
 }
 
+func TestRetrievalConfigValidateRejectsQueryRewriteAlone(t *testing.T) {
+	config := RetrievalConfig{Techniques: []RetrievalTechnique{RetrievalTechniqueQueryRewrite}}
+	err := config.Validate()
+	if err == nil {
+		t.Fatalf("Validate(%v) = nil, want query_rewrite alone rejected", config.Techniques)
+	}
+	for _, want := range []string{"query_rewrite", "rewrites the query another technique searches with", "at least one", `"dense"`, `"bm25"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+}
+
+func TestRetrievalConfigValidateAcceptsQueryRewriteNextToACandidateTechnique(t *testing.T) {
+	for _, techniques := range [][]RetrievalTechnique{
+		{RetrievalTechniqueQueryRewrite, RetrievalTechniqueBM25},
+		{RetrievalTechniqueDense, RetrievalTechniqueQueryRewrite},
+		{RetrievalTechniqueQueryRewrite, RetrievalTechniqueBM25, RetrievalTechniqueRerank},
+	} {
+		config := RetrievalConfig{Techniques: techniques}
+		if err := config.Validate(); err != nil {
+			t.Errorf("Validate(%v) = %v, want query_rewrite accepted as a stage", techniques, err)
+		}
+	}
+}
+
 func TestCandidateTechniquesLeavesOutStageTechniques(t *testing.T) {
 	config := RetrievalConfig{Techniques: []RetrievalTechnique{
 		RetrievalTechniqueDense,
 		RetrievalTechniqueRerank,
 		RetrievalTechniqueParentChild,
+		RetrievalTechniqueQueryRewrite,
 		RetrievalTechniqueBM25,
 	}}
 	got := config.CandidateTechniques()
