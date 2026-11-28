@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 	"unicode"
 
@@ -71,13 +72,52 @@ type answerService struct {
 	// answer service unavailable rather than a fixed sentence pretending a
 	// model answered.
 	generator interfaces.Generator
+	// streams buffers the events of answers being generated or retained for
+	// resume (ADR-0010).
+	streams *answerStreamHub
+	// generationTimeout bounds one streamed answer's generation.
+	generationTimeout time.Duration
+	// generations tracks the streamed answers still draining, so Close can
+	// wait for them at shutdown.
+	generations sync.WaitGroup
 }
 
 // NewAnswerService returns the Pipeline Answer use case. generator may be nil
 // when no chat model is configured; an answer then fails with a
 // service-unavailable error before any retrieval.
 func NewAnswerService(retrieval interfaces.RetrievalService, generator interfaces.Generator) interfaces.AnswerService {
-	return &answerService{retrieval: retrieval, generator: generator}
+	return &answerService{
+		retrieval:         retrieval,
+		generator:         generator,
+		streams:           newAnswerStreamHub(answerStreamRetention, answerStreamMaxEvents),
+		generationTimeout: answerGenerationTimeout,
+	}
+}
+
+// prepare runs the steps both answers share before generation: identify the
+// caller, validate the request, require a configured chat role and retrieve
+// the readable Chunks. Its errors are the ones the JSON answer returns
+// unchanged, so the streamed path fails before any event for the same
+// reasons.
+func (s *answerService) prepare(ctx context.Context, req *types.AnswerRequest) (
+	types.Principal, *types.RetrievalResult, error,
+) {
+	principal, err := caller(ctx)
+	if err != nil {
+		return types.Principal{}, nil, err
+	}
+	if err := req.Validate(); err != nil {
+		return types.Principal{}, nil, apperrors.NewValidationError(err.Error())
+	}
+	if s.generator == nil {
+		return types.Principal{}, nil, apperrors.NewServiceUnavailableError(
+			"pipeline answers need models.chat to be configured")
+	}
+	retrieved, err := s.retrieval.Retrieve(ctx, &req.RetrievalRequest)
+	if err != nil {
+		return types.Principal{}, nil, err
+	}
+	return principal, retrieved, nil
 }
 
 // Answer validates req, retrieves through the retrieval service (whose errors
@@ -89,17 +129,7 @@ func NewAnswerService(retrieval interfaces.RetrievalService, generator interface
 // result also carries the retrieved Chunks, the trace ending with the
 // generate step, and the chat call's token usage.
 func (s *answerService) Answer(ctx context.Context, req *types.AnswerRequest) (*types.AnswerResult, error) {
-	if _, err := caller(ctx); err != nil {
-		return nil, err
-	}
-	if err := req.Validate(); err != nil {
-		return nil, apperrors.NewValidationError(err.Error())
-	}
-	if s.generator == nil {
-		return nil, apperrors.NewServiceUnavailableError(
-			"pipeline answers need models.chat to be configured")
-	}
-	retrieved, err := s.retrieval.Retrieve(ctx, &req.RetrievalRequest)
+	_, retrieved, err := s.prepare(ctx, req)
 	if err != nil {
 		return nil, err
 	}

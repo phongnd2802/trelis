@@ -22,12 +22,23 @@ import (
 )
 
 // stubAnswer answers with a fixed result and records the request, so the
-// router tests can check the HTTP shape without a chat model.
+// router tests can check the HTTP shape without a chat model. For a streamed
+// answer it records the start request and replays a fixed event list.
 type stubAnswer struct {
 	result *types.AnswerResult
 	err    error
 	calls  int
 	got    *types.AnswerRequest
+
+	streamID    uuid.UUID
+	startErr    error
+	startCalls  int
+	gotStream   *types.AnswerRequest
+	events      []types.AnswerEvent
+	eventsErr   error
+	streamDone  bool
+	afterSeqs   []int64
+	eventsCalls int
 }
 
 func (s *stubAnswer) Answer(_ context.Context, req *types.AnswerRequest) (*types.AnswerResult, error) {
@@ -36,12 +47,44 @@ func (s *stubAnswer) Answer(_ context.Context, req *types.AnswerRequest) (*types
 	return s.result, s.err
 }
 
+func (s *stubAnswer) StartAnswerStream(_ context.Context, req *types.AnswerRequest) (uuid.UUID, error) {
+	s.startCalls++
+	s.gotStream = req
+	if s.streamID == uuid.Nil {
+		s.streamID = uuid.New()
+	}
+	return s.streamID, s.startErr
+}
+
+func (s *stubAnswer) AnswerEvents(_ context.Context, _ uuid.UUID, afterSeq int64) (types.AnswerSubscription, error) {
+	s.eventsCalls++
+	s.afterSeqs = append(s.afterSeqs, afterSeq)
+	if s.eventsErr != nil {
+		return types.AnswerSubscription{}, s.eventsErr
+	}
+	var events []types.AnswerEvent
+	for _, event := range s.events {
+		if event.Seq > afterSeq {
+			events = append(events, event)
+		}
+	}
+	return types.AnswerSubscription{Events: events, Done: s.streamDone}, nil
+}
+
+func (s *stubAnswer) Close(context.Context) error { return nil }
+
 // newAnswerRouter is the router on one AnswerService, with the other routes
 // unmounted because these tests never call them.
 func newAnswerRouter(answer interfaces.AnswerService) http.Handler {
+	return newAnswerRouterWith(keyring{"trelis_alice": alice}, answer)
+}
+
+// newAnswerRouterWith is newAnswerRouter over the given keys and answer
+// handler options.
+func newAnswerRouterWith(keys keyring, answer interfaces.AnswerService, opts ...handler.AnswerHandlerOption) http.Handler {
 	me := handler.NewPrincipalHandler(service.NewPrincipalService(nil, nil, nil))
-	return New(Readiness{}, keyring{"trelis_alice": alice}, me, nil, nil,
-		handler.NewAnswerHandler(answer), nil, false)
+	return New(Readiness{}, keys, me, nil, nil,
+		handler.NewAnswerHandler(answer, opts...), nil, false)
 }
 
 func TestAnswerNeedsAKey(t *testing.T) {
@@ -234,6 +277,46 @@ func TestAnInternalAnswerFailureIs500(t *testing.T) {
 	e := decode(t, rec)
 	if e.Success || e.Error == nil || e.Error.Code != 1007 || e.Error.Message != "Internal server error" {
 		t.Errorf("body = %s, want the generic internal error envelope", rec.Body)
+	}
+}
+
+func TestAChatProviderRejectionOnAStreamedAnswerIsJSON502(t *testing.T) {
+	p := modeltest.NewFakeProvider(t)
+	p.FailNext(modeltest.ChatCompletions, http.StatusUnauthorized, 1)
+	c, err := chat.NewChat("chat", config.ChatRole{
+		Protocol: api.APIOpenAICompletions,
+		Endpoint: config.Endpoint{BaseURL: p.URL(), Model: "test-chat"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retrieval := &stubRetrieval{result: &types.RetrievalResult{
+		Results: []types.RetrievedChunk{{Content: "The election was in 2024."}},
+		Trace:   []types.TraceStep{},
+	}}
+	h := newAnswerRouter(service.NewAnswerService(retrieval, chat.Generator(c)))
+
+	rec := postAnswerWithAccept(t, h, `{"query":"who won?"}`,
+		"text/event-stream", "Bearer trelis_alice")
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("POST /answer with Accept: text/event-stream = %d %s, want 502", rec.Code, rec.Body)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want the JSON error, not an SSE stream", ct)
+	}
+	if rec.Header().Get("X-Accel-Buffering") != "" {
+		t.Error("the rejection carries SSE headers, want none")
+	}
+	e := decode(t, rec)
+	if e.Success || e.Error == nil || e.Error.Code != int(apperrors.ErrModelProvider) {
+		t.Fatalf("body = %s, want the provider-rejection error envelope", rec.Body)
+	}
+	if want := "the chat model provider rejected the call (HTTP 401)"; e.Error.Message != want {
+		t.Errorf("message = %q, want %q", e.Error.Message, want)
+	}
+	if strings.Contains(rec.Body.String(), "modeltest") {
+		t.Errorf("body = %s, want no provider error body", rec.Body)
 	}
 }
 

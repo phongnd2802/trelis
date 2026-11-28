@@ -181,13 +181,20 @@ func (p *FakeProvider) chatCompletions(w http.ResponseWriter, body []byte) (int,
 // pieces, the finish reason, and usage when the request asked for it.
 func (p *FakeProvider) streamChat(w http.ResponseWriter, req chatRequest, id string, reply Reply) {
 	s := newSSE(w)
+	p.beginStreamedChat()
 	chunk := func(c chatChoice) chatCompletion {
 		return chatCompletion{ID: id, Object: "chat.completion.chunk", Created: created, Model: req.Model, Choices: []chatChoice{c}}
 	}
 	empty := ""
 	s.data(chunk(chatChoice{Delta: &chatDelta{Role: "assistant", Content: &empty}}))
-	for _, piece := range pieces(reply.Text) {
+	for i, piece := range pieces(reply.Text) {
+		p.recordStreamedTextChunk()
 		s.data(chunk(chatChoice{Delta: &chatDelta{Content: &piece}}))
+		if i == 0 {
+			if release := p.streamRelease(); release != nil {
+				<-release
+			}
+		}
 	}
 	for i, c := range reply.ToolCalls {
 		s.data(chunk(chatChoice{Delta: &chatDelta{ToolCalls: []chatToolCall{{

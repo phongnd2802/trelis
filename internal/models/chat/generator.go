@@ -21,11 +21,22 @@ func Generator(c Chat) interfaces.Generator {
 
 // Generate sends one non-streaming chat call with the turns in order.
 func (g *generator) Generate(ctx context.Context, turns []types.ChatTurn) (*types.ChatResponse, error) {
+	return g.chat.Chat(ctx, generatorMessages(turns), nil)
+}
+
+// GenerateStream sends one streaming chat call with the turns in order. The
+// caller drains the channel until it closes, as ChatStream documents.
+func (g *generator) GenerateStream(ctx context.Context, turns []types.ChatTurn) (<-chan types.StreamResponse, error) {
+	return g.chat.ChatStream(ctx, generatorMessages(turns), nil)
+}
+
+// generatorMessages maps the application layer's turns to chat messages.
+func generatorMessages(turns []types.ChatTurn) []Message {
 	messages := make([]Message, len(turns))
 	for i, turn := range turns {
 		messages[i] = Message{Role: turn.Role, Content: turn.Content}
 	}
-	return g.chat.Chat(ctx, messages, nil)
+	return messages
 }
 
 // GetModelName returns the model name sent on the wire.

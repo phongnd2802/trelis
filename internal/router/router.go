@@ -67,6 +67,7 @@ func New(ready Readiness, authn interfaces.AuthService,
 		r.Put("/documents/{id}/file", docs.ReplaceDocumentFile)
 		r.Post("/retrieve", retrieval.Retrieve)
 		r.Post("/answer", answers.Answer)
+		r.Get("/answers/{answer_id}/events", answers.StreamAnswerEvents)
 		r.Get("/chunks/{id}", chunks.GetChunk)
 	})
 	return r

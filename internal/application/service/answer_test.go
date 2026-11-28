@@ -39,19 +39,42 @@ func (f *forbiddenAnswerRetrieval) Retrieve(context.Context, *types.RetrievalReq
 	return nil, nil
 }
 
-// fakeGenerator records the turns it was sent and answers a fixed reply.
+// fakeGenerator records the turns it was sent and answers a fixed reply,
+// streamed when the answer service asks for chunks.
 type fakeGenerator struct {
 	reply    *types.ChatResponse
 	err      error
 	model    string
 	calls    int
 	gotTurns []types.ChatTurn
+
+	streamErr   error
+	stream      func(context.Context) (<-chan types.StreamResponse, error)
+	chunks      []types.StreamResponse
+	streamCalls int
 }
 
 func (f *fakeGenerator) Generate(_ context.Context, turns []types.ChatTurn) (*types.ChatResponse, error) {
 	f.calls++
 	f.gotTurns = append([]types.ChatTurn(nil), turns...)
 	return f.reply, f.err
+}
+
+func (f *fakeGenerator) GenerateStream(ctx context.Context, turns []types.ChatTurn) (<-chan types.StreamResponse, error) {
+	f.streamCalls++
+	f.gotTurns = append([]types.ChatTurn(nil), turns...)
+	if f.streamErr != nil {
+		return nil, f.streamErr
+	}
+	if f.stream != nil {
+		return f.stream(ctx)
+	}
+	ch := make(chan types.StreamResponse, len(f.chunks))
+	for _, chunk := range f.chunks {
+		ch <- chunk
+	}
+	close(ch)
+	return ch, nil
 }
 
 func (f *fakeGenerator) GetModelName() string { return f.model }
@@ -62,6 +85,11 @@ type forbiddenAnswerGenerator struct{ t *testing.T }
 
 func (f *forbiddenAnswerGenerator) Generate(context.Context, []types.ChatTurn) (*types.ChatResponse, error) {
 	f.t.Error("chat role called when the answer must not call it")
+	return nil, nil
+}
+
+func (f *forbiddenAnswerGenerator) GenerateStream(context.Context, []types.ChatTurn) (<-chan types.StreamResponse, error) {
+	f.t.Error("chat role streamed when the answer must not call it")
 	return nil, nil
 }
 
