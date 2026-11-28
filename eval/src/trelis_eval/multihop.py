@@ -14,7 +14,7 @@ from typing import Any
 
 import httpx
 
-from .golden import Evidence, GoldenQuestion
+from .golden import Evidence, GoldenQuestion, hop_count, hops_slice
 
 DATA_BASE_URL = "https://huggingface.co/datasets/yixuantt/MultiHopRAG/resolve/main"
 """Where the published MultiHop-RAG Benchmark Corpus lives."""
@@ -141,7 +141,7 @@ def to_golden_set(questions: list[MultiHopQuestion]) -> list[GoldenQuestion]:
         slices: list[str] = []
         if question.question_type is not None:
             slices.append(question.question_type)
-        slices.append(f"hops-{len(distinct_urls)}")
+        slices.append(hops_slice(len(distinct_urls)))
         golden.append(
             GoldenQuestion(
                 id=f"mhr-{index:04d}",
@@ -238,7 +238,7 @@ def _slices_by_question_type(
     """Group questions by the one Slice that names their question type."""
     slices_by_type: dict[str, list[GoldenQuestion]] = {}
     for question in golden:
-        names = [name for name in question.slices if not name.startswith("hops-")]
+        names = [name for name in question.slices if hop_count(name) is None]
         if len(names) != 1:
             raise ValueError(
                 f"Golden question {question.id!r} must have exactly one non-hops-* "

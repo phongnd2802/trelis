@@ -257,9 +257,12 @@ uv run --project eval trelis-eval report eval/baselines
 writes `eval/reports/ablation-matrix.md` and `ablation-matrix.html`, and prints
 both paths. `--seed` (default 1) and `--resamples` (default 10,000) control the
 bootstrap; `--out-dir` chooses another directory. It needs no running Trelis.
-`eval/reports/` is meant to be published, not gitignored. The interval,
-comparability and determinism rules are in
-[docs/metrics.md](docs/metrics.md#confidence-intervals).
+The report also has one table per Slice and, for answer runs, a Failure
+Attribution table. `eval/reports/` is meant to be published, not gitignored.
+The interval, comparability and determinism rules are in
+[docs/metrics.md](docs/metrics.md#confidence-intervals), and the two new
+sections are defined in [Slices in the report](docs/metrics.md#slices-in-the-report)
+and [Failure Attribution](docs/metrics.md#failure-attribution).
 
 ## Record and replay model calls
 

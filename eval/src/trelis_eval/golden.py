@@ -7,6 +7,7 @@ a typo in a hand-edited Golden Set fails before an Ablation Run spends money.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +50,18 @@ _REQUIRED_FIELDS = ("id", "question", "expected_answer", "evidence", "slices")
 _OPTIONAL_FIELDS = ("principal",)
 _ALLOWED_FIELDS = _REQUIRED_FIELDS + _OPTIONAL_FIELDS
 _EVIDENCE_FIELDS = ("source_id", "fact")
+_HOPS_SLICE = re.compile(r"hops-(\d+)")
+
+
+def hops_slice(n: int) -> str:
+    """Return the Slice name a question with ``n`` evidence Documents carries."""
+    return f"hops-{n}"
+
+
+def hop_count(slice_name: str) -> int | None:
+    """Return the hop count of a ``hops-N`` Slice, or None for another Slice."""
+    match = _HOPS_SLICE.fullmatch(slice_name)
+    return int(match.group(1)) if match is not None else None
 
 
 def load_golden_set(path: str | Path) -> list[GoldenQuestion]:

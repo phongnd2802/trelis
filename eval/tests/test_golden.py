@@ -8,6 +8,8 @@ from trelis_eval.golden import (
     Evidence,
     GoldenQuestion,
     GoldenSetError,
+    hop_count,
+    hops_slice,
     load_golden_set,
     write_golden_set,
 )
@@ -219,3 +221,13 @@ def test_write_then_load_is_lossless(tmp_path):
     lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     assert "principal" not in lines[1]
     assert lines[0]["question"] == "Ai là người sáng lập?"
+
+
+def test_hops_slice_names_and_hop_count_reads_the_hop_suffix():
+    assert hops_slice(0) == "hops-0"
+    assert hops_slice(10) == "hops-10"
+    assert hop_count("hops-0") == 0
+    assert hop_count("hops-10") == 10
+    assert hop_count("comparison_query") is None
+    assert hop_count("hops-") is None
+    assert hop_count("hops-two") is None
