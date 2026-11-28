@@ -218,15 +218,21 @@ class QuestionResult:
 
 @dataclass(frozen=True)
 class GradeSummary:
-    """One Grader's mean over its ok grades and the two countable outcomes."""
+    """One Grader's mean over its ok grades and its three countable outcomes."""
 
     mean: float | None
     ok: int
     grader_error: int
+    not_applicable: int = 0
 
     def to_json(self) -> dict[str, Any]:
         """Return the fields written to the summary line."""
-        return {"mean": self.mean, "ok": self.ok, "grader_error": self.grader_error}
+        return {
+            "mean": self.mean,
+            "ok": self.ok,
+            "grader_error": self.grader_error,
+            "not_applicable": self.not_applicable,
+        }
 
 
 @dataclass(frozen=True)
@@ -429,14 +435,25 @@ def _summarize(results: tuple[QuestionResult, ...], grader_names: Sequence[str])
     )
 
 
-def grade_outcomes(results: Sequence[QuestionResult], name: str) -> tuple[list[float], int]:
-    """Return one Grader's ok scores and its grader_error count.
+@dataclass(frozen=True)
+class GradeOutcomes:
+    """One Grader's ok scores and its failure and not-applicable counts."""
+
+    scores: tuple[float, ...]
+    grader_error: int
+    not_applicable: int
+
+
+def grade_outcomes(results: Sequence[QuestionResult], name: str) -> GradeOutcomes:
+    """Return one Grader's ok scores, its grader_error count and its n/a count.
 
     Only scored questions count. A question that errored has no Grade, and a
-    Grader's own failure is counted, never turned into a score.
+    Grader's own failure is counted, never turned into a score; a Grade for an
+    answer with nothing to check is counted apart from a failure.
     """
     scores = []
     grader_error = 0
+    not_applicable = 0
     for result in results:
         if result.status is not QuestionStatus.SCORED:
             continue
@@ -445,15 +462,26 @@ def grade_outcomes(results: Sequence[QuestionResult], name: str) -> tuple[list[f
             continue
         if grade.status is GradeStatus.OK:
             scores.append(grade.score)
+        elif grade.status is GradeStatus.NOT_APPLICABLE:
+            not_applicable += 1
         else:
             grader_error += 1
-    return scores, grader_error
+    return GradeOutcomes(
+        scores=tuple(scores),
+        grader_error=grader_error,
+        not_applicable=not_applicable,
+    )
 
 
 def _grade_summary(name: str, scored: Sequence[QuestionResult]) -> GradeSummary:
-    """Average one Grader's ok scores, counting the two outcomes."""
-    scores, grader_error = grade_outcomes(scored, name)
-    return GradeSummary(mean=mean(scores), ok=len(scores), grader_error=grader_error)
+    """Average one Grader's ok scores, counting the three outcomes."""
+    outcomes = grade_outcomes(scored, name)
+    return GradeSummary(
+        mean=mean(outcomes.scores),
+        ok=len(outcomes.scores),
+        grader_error=outcomes.grader_error,
+        not_applicable=outcomes.not_applicable,
+    )
 
 
 def step_latencies(run: AblationRun) -> dict[str, tuple[int, int]]:
@@ -1481,14 +1509,24 @@ def _parse_grade_summaries(value: Any, where: str) -> dict[str, GradeSummary]:
             raise ValueError(f"{where}: a Grader name must not be empty")
         if not isinstance(item, dict):
             raise ValueError(f"{item_where}: expected a JSON object")
-        check_fields(item, {"mean", "ok", "grader_error"}, item_where)
+        check_fields(
+            item,
+            {"mean", "ok", "grader_error", "not_applicable"},
+            item_where,
+            required={"mean", "ok", "grader_error"},
+        )
         ok = int_field(item, "ok", item_where)
         grader_error = int_field(item, "grader_error", item_where)
-        if ok < 0 or grader_error < 0:
+        # Version-2 files written before the not_applicable status existed carry no count.
+        not_applicable = (
+            int_field(item, "not_applicable", item_where) if "not_applicable" in item else 0
+        )
+        if ok < 0 or grader_error < 0 or not_applicable < 0:
             raise ValueError(f"{item_where}: counts must not be negative")
         summaries[name] = GradeSummary(
             mean=optional_float_field(item, "mean", item_where),
             ok=ok,
             grader_error=grader_error,
+            not_applicable=not_applicable,
         )
     return summaries

@@ -83,9 +83,9 @@ mean and both latencies are `null`, not `0`, so "nothing measured" is not
 mistaken for a score of zero.
 
 An answer run's summary also records, per Grader, the mean over the `ok`
-grades and the counts of `ok` and `grader_error`. A Grader with no `ok` grade
-has a `null` mean and keeps its counts. The mean never includes a
-`grader_error` or a question that errored.
+grades and the counts of `ok`, `grader_error` and `not_applicable`. A Grader
+with no `ok` grade has a `null` mean and keeps its counts. The mean never
+includes a `grader_error`, a `not_applicable` or a question that errored.
 
 `scored` counts every answered question. In an answer run it includes a
 question with no evidence, whose `metrics` is `null` because there is nothing
@@ -133,7 +133,11 @@ with a score, a rationale and a status:
 - `ok` — the Grader scored the answer; `score` is a number.
 - `grader_error` — the Grader could not score it; `score` is `null`, and the
   rationale says why: a judge HTTP error, a timeout, a reply that is not the
-  expected JSON, or an answer with nothing to compare against.
+  expected JSON, or a cited Chunk that is not among the retrieved ones.
+- `not_applicable` — the answer or the Golden question gave the Grader nothing
+  to check; `score` is `null`, and the rationale says what was missing: an
+  empty answer, an answer that makes no factual claim, an answer that cites no
+  source, or an empty expected answer.
 
 A `grader_error` is excluded from the Grader's mean and counted. It is never
 recorded as `0.0`: a judge that could not answer must not look like a wrong
@@ -142,16 +146,28 @@ different. A Trelis error means the answer was never produced (`status:
 "error"`, with the request's message); a `grader_error` means an answer exists
 but one check could not score it.
 
+A `not_applicable` is not a failure and not a zero either. Nothing failed; the
+answer offered nothing to grade, so it is excluded from the mean and its
+confidence interval and counted apart from `grader_error`. That keeps a judge
+which keeps failing distinguishable from a run whose answers are all empty.
+
 The registry maps a name to a Grader. `trelis-eval answer run --graders` takes
-a comma list and defaults to every registered Grader; an unknown name fails
+a comma list and defaults to every registered Grader, in this order:
+`correctness`, `faithfulness` and `citation_precision`. An unknown name fails
 before any request and lists the known names. `eval/src/trelis_eval/graders.py`
-holds the registry and the first Grader.
+holds the registry and the Graders.
 
 A judge call is retried up to three attempts on a 429, a 5xx or a transport
 failure, with exponential backoff and jitter. A `Retry-After` of up to a
 minute is honoured, a longer one stops the retries, and any other 4xx or a
 2xx reply that cannot be read is not retried. A failure that outlasts the
 attempts is still a `grader_error`.
+
+Every judge-based Grader parses a reply the same way: a Markdown JSON code
+fence is stripped, the body must be one JSON object, extra keys are ignored,
+and the Grader validates the fields it needs. A reply that is not JSON, is not
+an object or has the wrong shape is a `grader_error`, with the reply cut to a
+short excerpt in the rationale.
 
 ### Correctness
 
@@ -167,8 +183,56 @@ wrapped in a Markdown JSON code fence is accepted; anything else is a
 `grader_error`, as is a JSON object with the wrong shape. `true` scores `1.0`
 and `false` scores `0.0`; the judge's rationale is kept.
 
-An empty expected answer (empty, or only whitespace) is a `grader_error` with
-rationale `no expected answer`, and the judge is not called.
+An empty expected answer (empty, or only whitespace) is `not_applicable` with
+rationale `no expected answer`, and the judge is not called: a gap in the
+Golden Set is not a judge failure.
+
+### The sources the citation Graders see
+
+`faithfulness` and `citation_precision` both read a citation's text from the
+retrieved Chunk with the same `chunk_id` in the answer's debug payload: the
+Chunk's `context_header`, a blank line, then its `content`, or the content
+alone when the header is empty. With parent-child retrieval the content is the
+Parent Chunk's, which is what the generator saw, so that is what the judge
+grades against. Each source is numbered by its citation `marker`, so the judge
+sees `[2] ...` exactly as the answer cites `[2]`. A citation whose `chunk_id`
+is not among the retrieved Chunks is a `grader_error` naming the marker, and
+the judge is not called.
+
+### Faithfulness
+
+`faithfulness` scores the share of the answer's factual claims that the sources
+it cites support.
+
+- An empty or whitespace-only answer is `not_applicable` with rationale
+  `empty answer`, and the judge is not called.
+- Otherwise the judge is asked once, with the question, the answer and the
+  cited sources numbered by marker. With no citations there is no source to
+  show, and the judge marks every claim unsupported. The reply is JSON only:
+  `{"claims": [{"claim": "...", "supported": true}], "rationale": "..."}`.
+- A reply with zero claims, such as a refusal ("Insufficient information"), is
+  `not_applicable` with rationale `answer makes no factual claim`.
+- Otherwise the score is the number of supported claims divided by the number
+  of claims. The rationale is derived: `3 of 4 claims supported;
+  unsupported: "<first unsupported claim, cut to about 100 characters>"`,
+  followed by the judge's rationale.
+
+### Citation precision
+
+`citation_precision` scores the share of cited markers whose source supports
+the statement the marker is attached to.
+
+- An answer with no citations is `not_applicable` with rationale `answer cites
+  no source`, and the judge is not called.
+- Otherwise the judge is asked once with the answer and the cited sources
+  numbered by marker. It decides, for each cited marker, whether that source
+  supports the statement the marker is attached to, and replies JSON only:
+  `{"citations": [{"marker": 1, "supported": true}], "rationale": "..."}`.
+- The reply must name each distinct cited marker exactly once. A missing
+  marker, an extra marker or a repeated marker is a `grader_error`. A marker
+  cited several times in the answer is judged once.
+- The score is the number of supported markers divided by the number of
+  distinct cited markers.
 
 The judge is configured separately from the answer generator. The harness reads
 `TRELIS_EVAL_JUDGE_BASE_URL`, `TRELIS_EVAL_JUDGE_MODEL` and
@@ -202,14 +266,16 @@ each as `point [low, high]`, then the scored, skipped and error counts and the
 run's `concurrency`. The Grader columns are the names in the report's answer
 runs, in registry order, with unknown names sorted after them; each column
 uses the Grader's label. A Grader cell is the mean over its `ok` scores with
-the same seeded bootstrap interval, followed by its `grader_error` count:
-`0.720 [0.660, 0.780] · 3 errors` (`1 error` singular). A row that lacks that
-Grader, and a retrieval row, shows `—`; an answer row with the Grader but no
-`ok` grade shows `n/a` plus the count. A report of retrieval runs alone has no
-Grader columns. Both kinds can appear in one report, and the header records
-the Golden Set path and SHA-256, its question count, `top_k`, the seed, the
-resample count and the confidence level; a second table records each row's
-`run_id` and harness version.
+the same seeded bootstrap interval, followed by its `grader_error` and
+`not_applicable` counts, each part only when it is non-zero:
+`0.720 [0.660, 0.780] · 3 errors · 5 n/a` (`1 error` singular). A row that
+lacks that Grader, and a retrieval row, shows `—`; an answer row with the
+Grader but no `ok` grade shows `—` for the estimate plus the non-zero counts,
+such as `— · 5 n/a`. A report of retrieval runs alone has no Grader columns.
+Both kinds can appear in one report, and the header records the Golden Set
+path and SHA-256, its question count, `top_k`, the seed, the resample count and
+the confidence level; a second table records each row's `run_id` and harness
+version.
 
 The files must share the Golden Set SHA-256 and `top_k`, and no two may name
 the same Retrieval Config; different `run_id`s are fine, because the baselines
@@ -336,7 +402,8 @@ give nDCG@10 = `(1/log2(2) + 1/log2(4)) / (1/log2(2) + 1/log2(3))`.
 ```
 
 A `grader_error` entry carries `"score": null`, the reason in `rationale` and
-`"status": "grader_error"`. A scored answer with no evidence has `"metrics":
+`"status": "grader_error"`; a `not_applicable` entry looks the same with
+`"status": "not_applicable"`. A scored answer with no evidence has `"metrics":
 null` and still carries its answer and grades.
 
 ### `question` — skipped and error
@@ -360,10 +427,14 @@ those five fields.
 ### `summary`
 
 ```json
-{"schema_version": 2, "type": "summary", "metrics": {"recall@5": 0.9975, "recall@10": 1.0, "mrr": 0.9932, "ndcg@10": 0.9411}, "counts": {"scored": 497, "skipped": 3, "error": 0}, "latency_ms": {"p50": 11.8, "p95": 34.2}, "grades": {"correctness": {"mean": 0.72, "ok": 8, "grader_error": 1}}, "finished_at": "2026-01-01T00:10:00+00:00"}
+{"schema_version": 2, "type": "summary", "metrics": {"recall@5": 0.9975, "recall@10": 1.0, "mrr": 0.9932, "ndcg@10": 0.9411}, "counts": {"scored": 497, "skipped": 3, "error": 0}, "latency_ms": {"p50": 11.8, "p95": 34.2}, "grades": {"correctness": {"mean": 0.72, "ok": 8, "grader_error": 1, "not_applicable": 0}}, "finished_at": "2026-01-01T00:10:00+00:00"}
 ```
 
 A retrieval run omits `grades` entirely; the reader rejects it there, just as
 it rejects answer-only fields in a retrieval header or question. An answer run
 writes one entry per Grader it ran: the mean over the `ok` scores (`null` when
-there is none) and the `ok` and `grader_error` counts.
+there is none) and the `ok`, `grader_error` and `not_applicable` counts.
+Version 2 was released together with the Grader fields, so no published version
+2 file should lack `not_applicable`; a file the #48 harness wrote still loads,
+with a count of 0. A harness older than this change rejects the
+`not_applicable` status, so a file written now does not load there.

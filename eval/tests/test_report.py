@@ -16,6 +16,7 @@ from trelis_eval.ablation_run import (
     AblationRun,
     AblationRunFile,
     GoldenSetRef,
+    GradeOutcomes,
     GradeSummary,
     ManifestRef,
     QuestionMetrics,
@@ -40,6 +41,7 @@ from trelis_eval.report import (
 
 SHA256 = "a" * 64
 GOLDEN_PATH = "eval/data/multihop-rag/strat500-golden.jsonl"
+NA = "n/a"
 PER_QUESTION = (
     (1.0, 1.0, 1.0, 1.0),
     (0.0, 1.0, 0.5, 0.7),
@@ -147,6 +149,12 @@ def grade_for_score(score):
             rationale="judge failed",
             status=GradeStatus.GRADER_ERROR,
         )
+    if score == NA:
+        return Grade(
+            score=None,
+            rationale="empty answer",
+            status=GradeStatus.NOT_APPLICABLE,
+        )
     return Grade(score=score, rationale="graded", status=GradeStatus.OK)
 
 
@@ -228,11 +236,12 @@ def multi_grader_answer_run_file(config, grades_by_name, *, run_id):
         questions.append(replace(answer_question(index, 1.0), grades=grades))
     summary_grades = {}
     for name, values in grades_by_name.items():
-        ok_scores = [value for value in values if value is not None]
+        ok_scores = [value for value in values if isinstance(value, (int, float))]
         summary_grades[name] = GradeSummary(
             mean=mean(ok_scores),
             ok=len(ok_scores),
             grader_error=sum(1 for value in values if value is None),
+            not_applicable=sum(1 for value in values if value == NA),
         )
     summary = RunSummary(
         recall_at_5=1.0,
@@ -277,7 +286,7 @@ def test_correctness_uses_only_ok_grades_and_shows_the_error_count():
 
     [row] = matrix.rows
     assert row.kind is RunKind.ANSWER
-    assert row.grader_errors["correctness"] == 1
+    assert row.grader_outcomes["correctness"].grader_error == 1
     estimate = row.estimates[CORRECTNESS]
     assert estimate is not None
     assert estimate.point == pytest.approx(2 / 3)
@@ -295,18 +304,124 @@ def test_correctness_uses_only_ok_grades_and_shows_the_error_count():
     assert f"0.667 [{expected[0]:.3f}, {expected[1]:.3f}] · 1 error" in table_row
 
 
-def test_an_answer_row_with_only_grader_errors_shows_n_a_and_the_count():
+def test_an_answer_row_with_only_grader_errors_shows_a_dash_and_the_count():
     run = answer_run_file("dense", [None, None, None])
 
     matrix = build_matrix([run], seed=1, resamples=50)
 
     [row] = matrix.rows
     assert row.estimates[CORRECTNESS] is None
-    assert row.grader_errors["correctness"] == 3
+    assert row.grader_outcomes["correctness"].grader_error == 3
     table_row = next(
         line for line in render_markdown(matrix).splitlines() if line.startswith("| dense |")
     )
-    assert "n/a · 3 errors" in table_row
+    assert "— · 3 errors" in table_row
+
+
+def test_an_answer_run_with_all_three_graders_gets_three_columns_in_registry_order():
+    run = multi_grader_answer_run_file(
+        "dense",
+        {
+            "correctness": [1.0, 0.0],
+            "faithfulness": [0.5, 0.5],
+            "citation_precision": [1.0, 0.5],
+        },
+        run_id="all-three",
+    )
+
+    matrix = build_matrix([run], seed=1, resamples=20)
+
+    assert matrix.graders == ("correctness", "faithfulness", "citation_precision")
+    header = next(
+        line
+        for line in render_markdown(matrix).splitlines()
+        if line.startswith("| Retrieval Config")
+    )
+    assert header.split(" | ")[5:8] == [
+        "Correctness",
+        "Faithfulness",
+        "Citation precision",
+    ]
+
+
+def test_a_grader_cell_shows_the_error_and_n_a_parts_only_when_non_zero():
+    run = multi_grader_answer_run_file(
+        "dense",
+        {"faithfulness": [1.0, 0.0, None, NA, NA]},
+        run_id="counts",
+    )
+
+    matrix = build_matrix([run], seed=1, resamples=20)
+    [row] = matrix.rows
+    table_row = next(
+        line for line in render_markdown(matrix).splitlines() if line.startswith("| dense |")
+    )
+
+    assert row.grader_outcomes["faithfulness"].grader_error == 1
+    assert row.grader_outcomes["faithfulness"].not_applicable == 2
+    assert "0.500 [" in table_row
+    assert "· 1 error · 2 n/a" in table_row
+
+
+def test_a_grader_cell_with_only_not_applicable_grades_shows_a_dash():
+    run = multi_grader_answer_run_file(
+        "dense",
+        {"faithfulness": [NA, NA, NA]},
+        run_id="only-n-a",
+    )
+
+    matrix = build_matrix([run], seed=1, resamples=20)
+    [row] = matrix.rows
+    table_row = next(
+        line for line in render_markdown(matrix).splitlines() if line.startswith("| dense |")
+    )
+
+    assert row.estimates["faithfulness"] is None
+    assert row.grader_outcomes["faithfulness"].not_applicable == 3
+    assert "— · 3 n/a" in table_row
+
+
+def test_a_grader_cell_with_no_failures_has_no_trailing_counts():
+    run = multi_grader_answer_run_file(
+        "dense",
+        {"faithfulness": [1.0, 1.0]},
+        run_id="no-counts",
+    )
+
+    table_row = next(
+        line
+        for line in render_markdown(build_matrix([run], seed=1, resamples=20)).splitlines()
+        if line.startswith("| dense |")
+    )
+
+    cell = table_row.split(" | ")[5]
+    assert "[" in cell
+    assert "·" not in cell
+
+
+def test_not_applicable_grades_are_outside_the_mean_and_the_interval():
+    run = multi_grader_answer_run_file(
+        "dense",
+        {"faithfulness": [1.0, 0.0, NA, NA]},
+        run_id="na-outside",
+    )
+
+    matrix = build_matrix([run], seed=3, resamples=200)
+
+    [row] = matrix.rows
+    estimate = row.estimates["faithfulness"]
+    assert estimate is not None
+    assert estimate.point == pytest.approx(0.5)
+    expected = bootstrap_ci(
+        [1.0, 0.0],
+        statistics_mean,
+        rng=random.Random("3:dense:faithfulness"),
+        resamples=200,
+    )
+    assert expected is not None
+    assert (estimate.low, estimate.high) == expected
+    assert row.grader_outcomes["faithfulness"].grader_error == 0
+    assert row.grader_outcomes["faithfulness"].not_applicable == 2
 
 
 def test_a_retrieval_row_shows_a_dash_in_the_correctness_column():
@@ -320,7 +435,7 @@ def test_a_retrieval_row_shows_a_dash_in_the_correctness_column():
     assert retrieval_row.kind is RunKind.RETRIEVAL
     assert retrieval_row.graders == frozenset()
     assert retrieval_row.estimates[CORRECTNESS] is None
-    assert retrieval_row.grader_errors == {}
+    assert retrieval_row.grader_outcomes == {}
     table_row = next(
         line for line in render_markdown(matrix).splitlines() if line.startswith("| bm25 |")
     )
@@ -369,12 +484,14 @@ def test_one_column_per_grader_in_registry_order_then_sorted_unknown_names():
     assert "0.500 [" in full_cells[7]
     assert partial_cells[6] == "—"
     assert partial_cells[7] == "—"
-    assert matrix.rows[0].grader_errors == {
-        "correctness": 0,
-        "alpha": 0,
-        "zeta": 0,
+    assert matrix.rows[0].grader_outcomes == {
+        "correctness": GradeOutcomes(scores=(1.0, 0.0), grader_error=0, not_applicable=0),
+        "alpha": GradeOutcomes(scores=(0.0, 1.0), grader_error=0, not_applicable=0),
+        "zeta": GradeOutcomes(scores=(0.5, 0.5), grader_error=0, not_applicable=0),
     }
-    assert matrix.rows[1].grader_errors == {"correctness": 0}
+    assert matrix.rows[1].grader_outcomes == {
+        "correctness": GradeOutcomes(scores=(1.0, 1.0), grader_error=0, not_applicable=0)
+    }
     assert matrix.rows[1].graders == frozenset({"correctness"})
 
 

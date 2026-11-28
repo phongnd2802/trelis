@@ -723,7 +723,8 @@ def _print_run_summary(run: AblationRun, path: Path) -> None:
             "  graders: "
             + ", ".join(
                 f"{name} mean={metric(grades.mean)} ok={grades.ok} "
-                f"grader_error={grades.grader_error}"
+                f"grader_error={grades.grader_error} "
+                f"not_applicable={grades.not_applicable}"
                 for name, grades in summary.grades.items()
             )
         )

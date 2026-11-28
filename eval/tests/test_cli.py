@@ -929,6 +929,8 @@ def test_answer_run_writes_grades_the_judge_model_and_the_summary(tmp_path, monk
     code = main(
         answer_arguments(
             tmp_path,
+            "--graders",
+            "correctness",
             "--judge-base-url",
             "http://flag-judge.test/v1",
             "--judge-model",
@@ -955,6 +957,7 @@ def test_answer_run_writes_grades_the_judge_model_and_the_summary(tmp_path, monk
         "mean": 1.0,
         "ok": 2,
         "grader_error": 0,
+        "not_applicable": 0,
     }
     output = capsys.readouterr().out
     assert "dense: scored=2 skipped=0 error=0" in output
@@ -963,6 +966,89 @@ def test_answer_run_writes_grades_the_judge_model_and_the_summary(tmp_path, monk
     assert "judge-key-never-logged" not in output
     raw = (tmp_path / "runs" / "20260101T000000Z" / "dense.jsonl").read_text(encoding="utf-8")
     assert "judge-key-never-logged" not in raw
+
+
+def test_answer_run_default_graders_writes_all_three_graders(tmp_path, monkeypatch, capsys):
+    import trelis_eval.cli as cli
+
+    monkeypatch.setenv("TRELIS_API_KEY", "test-key")
+    monkeypatch.setenv("TRELIS_BASE_URL", "http://trelis.test")
+    monkeypatch.setenv("TRELIS_EVAL_JUDGE_API_KEY", "judge-key-never-logged")
+    set_judge_env(monkeypatch)
+    answers = {
+        f"Question mhr-000{index}?": {
+            "answer": "An answer. [1]",
+            "results": [retrieval_chunk("doc-a", f"chunk-{index}")],
+            "citations": [{"marker": 1, "chunk_id": f"chunk-{index}", "document_id": "doc-a"}],
+        }
+        for index in range(2)
+    }
+    replies = [
+        '{"claims": [{"claim": "An answer.", "supported": true}], "rationale": "supported"}',
+        '{"citations": [{"marker": 1, "supported": true}], "rationale": "supported"}',
+    ] * 2
+
+    def judge_handler(_request):
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": replies.pop(0),
+                        }
+                    }
+                ]
+            },
+        )
+
+    real_judge = cli.JudgeClient
+
+    def judge_factory(base_url, api_key, model, **kwargs):
+        return real_judge(
+            base_url,
+            api_key,
+            model,
+            transport=httpx.MockTransport(judge_handler),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(cli, "JudgeClient", judge_factory)
+
+    code = main(
+        answer_arguments(tmp_path),
+        transport=httpx.MockTransport(AnswerServer(answers)),
+    )
+
+    assert code == 0
+    lines = [
+        json.loads(line)
+        for line in (tmp_path / "runs" / "20260101T000000Z" / "dense.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert lines[0]["graders"] == ["correctness", "faithfulness", "citation_precision"]
+    for question_line in lines[1:3]:
+        assert set(question_line["grades"]) == {
+            "correctness",
+            "faithfulness",
+            "citation_precision",
+        }
+        assert question_line["grades"]["correctness"]["score"] == 1.0
+        assert question_line["grades"]["faithfulness"]["score"] == 1.0
+        assert question_line["grades"]["citation_precision"]["score"] == 1.0
+    assert lines[-1]["grades"]["faithfulness"] == {
+        "mean": 1.0,
+        "ok": 2,
+        "grader_error": 0,
+        "not_applicable": 0,
+    }
+    assert replies == []
+    output = capsys.readouterr().out
+    assert "faithfulness mean=" in output
+    assert "citation_precision mean=" in output
+    assert "not_applicable=0" in output
 
 
 def test_proxy_record_requires_an_upstream(capsys):

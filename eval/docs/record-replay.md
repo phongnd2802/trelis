@@ -76,8 +76,10 @@ own key value is irrelevant.
 
 ### The judge
 
-`trelis-eval answer run` uses a judge model for the correctness Grader. Its
-configuration is separate from Trelis's `models.chat`: the harness reads
+`trelis-eval answer run` uses a judge model for its judge-based Graders:
+correctness when the answer does not match the expected answer, and
+faithfulness and citation precision. Its configuration is separate from
+Trelis's `models.chat`: the harness reads
 `TRELIS_EVAL_JUDGE_BASE_URL` (or `--judge-base-url`), `TRELIS_EVAL_JUDGE_MODEL`
 (or `--judge-model`) and `TRELIS_EVAL_JUDGE_API_KEY`. Route the judge through
 the same proxy as the embedding role:
