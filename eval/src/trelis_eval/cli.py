@@ -22,6 +22,7 @@ from .ablation_run import (
     GoldenSetRef,
     Manifest,
     ManifestRef,
+    ModelMode,
     QuestionStatus,
     RetrievalConfig,
     default_run_id,
@@ -59,10 +60,19 @@ from .multihop import (
     stratified_sample,
     to_golden_set,
 )
+from .prices import PriceTable, load_prices
 from .report import build_matrix, render_html, render_markdown
 
 DEFAULT_DATA_DIR = Path("eval/data/multihop-rag")
 DEFAULT_BASE_URL = "http://localhost:8080"
+DEFAULT_PRICES = Path(__file__).resolve().parents[2] / "prices.toml"
+"""The committed price table template, resolved from the eval project directory."""
+
+MODEL_MODE_ENV = "TRELIS_EVAL_MODEL_MODE"
+"""The environment variable a run reads its model mode from."""
+
+RUN_MODEL_MODES = tuple(mode for mode in ModelMode if mode is not ModelMode.UNKNOWN)
+"""The model modes a run may record; ``unknown`` only describes older results files."""
 
 DEFAULT_REQUEST_TIMEOUT = 120.0
 """Seconds one POST /retrieve may take. Trelis embeds the query with a hosted
@@ -237,6 +247,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="bootstrap resamples per metric and latency percentile (default: 10000)",
     )
     report_command.add_argument(
+        "--prices",
+        type=Path,
+        default=None,
+        help="price table TOML (default: eval/prices.toml when it exists)",
+    )
+    report_command.add_argument(
         "--out-dir",
         type=Path,
         default=Path("eval/reports"),
@@ -312,6 +328,12 @@ def _add_run_options(parser: argparse.ArgumentParser, *, request_help: str) -> N
         dest="configs",
         metavar="TECHNIQUES",
         help="Retrieval Techniques joined with '+' (repeatable; default: dense)",
+    )
+    parser.add_argument(
+        "--model-mode",
+        choices=[mode.value for mode in RUN_MODEL_MODES],
+        help="where model answers come from (default: $TRELIS_EVAL_MODEL_MODE); "
+        "latency is reported only for live and passthrough runs",
     )
     parser.add_argument(
         "--top-k",
@@ -425,6 +447,7 @@ JudgeContextFactory = Callable[[], AbstractContextManager[Judge | None]]
 
 def _run_retrieval(args: argparse.Namespace, transport: httpx.BaseTransport | None) -> int:
     """Run every Retrieval Config in turn and write one results file each."""
+    model_mode = _model_mode(args)
     configs = _run_configs(args)
 
     def make_run(_judge: Judge | None) -> PerConfigRun:
@@ -443,6 +466,7 @@ def _run_retrieval(args: argparse.Namespace, transport: httpx.BaseTransport | No
                 clock=time.monotonic,
                 concurrency=args.concurrency,
                 max_consecutive_errors=args.max_consecutive_errors,
+                model_mode=model_mode,
             )
 
         return run_one
@@ -458,6 +482,7 @@ def _run_retrieval(args: argparse.Namespace, transport: httpx.BaseTransport | No
 
 def _run_answer(args: argparse.Namespace, transport: httpx.BaseTransport | None) -> int:
     """Ask every question, grade the answers and write one results file each."""
+    model_mode = _model_mode(args)
     configs = _run_configs(args)
     selected = _grader_names(args.graders)
     judge_base_url, judge_model, judge_key = _judge_settings(args, selected)
@@ -487,6 +512,7 @@ def _run_answer(args: argparse.Namespace, transport: httpx.BaseTransport | None)
                 clock=time.monotonic,
                 concurrency=args.concurrency,
                 max_consecutive_errors=args.max_consecutive_errors,
+                model_mode=model_mode,
             )
 
         return run_one
@@ -552,6 +578,17 @@ def _execute_run(
             if run.summary.scored == 0:
                 exit_code = 1
     return exit_code
+
+
+def _model_mode(args: argparse.Namespace) -> ModelMode:
+    """Resolve a run's model mode from the flag or the environment."""
+    choices = ", ".join(mode.value for mode in RUN_MODEL_MODES)
+    value = args.model_mode or os.environ.get(MODEL_MODE_ENV)
+    if not value:
+        raise CliError(f"a run needs --model-mode or ${MODEL_MODE_ENV}: {choices}")
+    if value not in {mode.value for mode in RUN_MODEL_MODES}:
+        raise CliError(f"--model-mode or ${MODEL_MODE_ENV} must be one of {choices}, got {value!r}")
+    return ModelMode(value)
 
 
 def _run_configs(args: argparse.Namespace) -> list[RetrievalConfig]:
@@ -620,6 +657,7 @@ def _run_report(args: argparse.Namespace, transport: httpx.BaseTransport | None)
         [load_ablation_run(path) for path in paths],
         seed=args.seed,
         resamples=args.resamples,
+        prices=_prices(args.prices),
     )
     args.out_dir.mkdir(parents=True, exist_ok=True)
     markdown_path = args.out_dir / "ablation-matrix.md"
@@ -629,6 +667,13 @@ def _run_report(args: argparse.Namespace, transport: httpx.BaseTransport | None)
     print(markdown_path)
     print(html_path)
     return 0
+
+
+def _prices(path: Path | None) -> PriceTable | None:
+    """Load an explicit price table, or the committed default when it exists."""
+    if path is not None:
+        return load_prices(path)
+    return load_prices(DEFAULT_PRICES) if DEFAULT_PRICES.is_file() else None
 
 
 def _results_files(arguments: Sequence[Path]) -> list[Path]:

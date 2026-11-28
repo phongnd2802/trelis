@@ -73,6 +73,21 @@ class RunKind(StrEnum):
     ANSWER = "answer"
 
 
+class ModelMode(StrEnum):
+    """Where an Ablation Run's model answers came from.
+
+    ``live`` means Trelis called the providers directly; ``passthrough``,
+    ``record`` and ``replay`` are the record/replay proxy's modes. ``unknown``
+    is a results file written before the run recorded a mode.
+    """
+
+    LIVE = "live"
+    PASSTHROUGH = "passthrough"
+    RECORD = "record"
+    REPLAY = "replay"
+    UNKNOWN = "unknown"
+
+
 class AblationAborted(RuntimeError):
     """A run stopped because Trelis rejected the Retrieval Config or its
     questions kept failing.
@@ -284,6 +299,10 @@ class AblationRun:
     # runs' latencies compare only at the same concurrency.
     concurrency: int = 1
     kind: RunKind = RunKind.RETRIEVAL
+    # Where the model answers came from. Latency is the provider's only in a
+    # live or passthrough run: a record run mixes upstream calls with replayed
+    # ones, and a replay run replays every call.
+    model_mode: ModelMode = ModelMode.UNKNOWN
     # The judge model an answer run's judge-based Graders called; None when no
     # such Grader ran.
     judge_model: str | None = None
@@ -300,6 +319,7 @@ def run_ablation(
     clock: Callable[[], float] = time.monotonic,
     concurrency: int = 1,
     max_consecutive_errors: int = 10,
+    model_mode: ModelMode = ModelMode.UNKNOWN,
 ) -> AblationRun:
     """Score every Golden question under one Retrieval Config.
 
@@ -338,6 +358,7 @@ def run_ablation(
         questions=results,
         summary=_summarize(results, ()),
         concurrency=concurrency,
+        model_mode=model_mode,
     )
 
 
@@ -353,6 +374,7 @@ def run_answer_ablation(
     clock: Callable[[], float] = time.monotonic,
     concurrency: int = 1,
     max_consecutive_errors: int = 10,
+    model_mode: ModelMode = ModelMode.UNKNOWN,
 ) -> AblationRun:
     """Ask every Golden question, compute its retrieval metrics and grade it.
 
@@ -389,6 +411,7 @@ def run_answer_ablation(
         summary=_summarize(results, names),
         concurrency=concurrency,
         kind=RunKind.ANSWER,
+        model_mode=model_mode,
         judge_model=judge_model,
         graders=names,
     )
@@ -839,6 +862,7 @@ class _RunHeader:
     started_at: str
     concurrency: int
     kind: RunKind
+    model_mode: ModelMode
     judge_model: str | None
     graders: tuple[str, ...]
 
@@ -874,6 +898,7 @@ def _run_record(run_file: AblationRunFile) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "type": "run",
         "kind": run.kind.value,
+        "model_mode": run.model_mode.value,
         "run_id": run_file.run_id,
         "config": {
             "name": run.config.name,
@@ -1046,6 +1071,7 @@ def load_ablation_run(path: str | Path) -> AblationRunFile:
             questions=questions,
             summary=summary,
             kind=header.kind,
+            model_mode=header.model_mode,
             judge_model=header.judge_model,
             graders=header.graders,
         ),
@@ -1086,13 +1112,15 @@ def _parse_run_record(value: dict[str, Any], where: str) -> _RunHeader:
     }
     check_fields(
         value,
-        required | {"kind", "judge_model", "graders"},
+        required | {"kind", "model_mode", "judge_model", "graders"},
         where,
         required=required,
     )
     version = value.get("schema_version")
     if version == 1 and "kind" in value:
         raise ValueError(f"{where}: a version-1 run must not carry 'kind'")
+    if version == 1 and "model_mode" in value:
+        raise ValueError(f"{where}: a version-1 run must not carry 'model_mode'")
     if version == SCHEMA_VERSION and "kind" not in value:
         raise ValueError(f"{where}: a version-{SCHEMA_VERSION} run needs 'kind'")
     kind = _parse_run_kind(value, where)
@@ -1125,6 +1153,7 @@ def _parse_run_record(value: dict[str, Any], where: str) -> _RunHeader:
         started_at=string_field(value, "started_at", where),
         concurrency=_concurrency_field(value, where),
         kind=kind,
+        model_mode=_parse_model_mode(value, where),
         judge_model=judge_model,
         graders=graders,
     )
@@ -1138,6 +1167,20 @@ def _parse_run_kind(value: dict[str, Any], where: str) -> RunKind:
     except (TypeError, ValueError):
         choices = ", ".join(repr(item.value) for item in RunKind)
         raise ValueError(f"{where}: 'kind' must be one of {choices}, got {raw_kind!r}") from None
+
+
+def _parse_model_mode(value: dict[str, Any], where: str) -> ModelMode:
+    """Read the header's model mode; a file written before it loads as unknown."""
+    if "model_mode" not in value:
+        return ModelMode.UNKNOWN
+    raw_mode = value["model_mode"]
+    try:
+        return ModelMode(raw_mode)
+    except (TypeError, ValueError):
+        choices = ", ".join(repr(item.value) for item in ModelMode)
+        raise ValueError(
+            f"{where}: 'model_mode' must be one of {choices}, got {raw_mode!r}"
+        ) from None
 
 
 def _concurrency_field(value: dict[str, Any], where: str) -> int:

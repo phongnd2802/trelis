@@ -1,0 +1,16 @@
+# Price table for Cost per Correct Answer (#51).
+#
+# `trelis-eval report --prices` reads this file, and defaults to it when it
+# exists. Prices are configuration, not code: fill in what your provider
+# charges for the models Trelis reports in an answer's `generate` trace step.
+#
+# Each `[models."<name>"]` key must equal that step's `model` exactly. Both
+# fields are required, are per million tokens, and must not be negative. The
+# currency is shown in the report's column header.
+#
+# No model entries are committed: the example below is only the shape.
+currency = "USD"
+
+# [models."deepseek-v4-flash-0731"]
+# input_per_million = 0.27
+# output_per_million = 1.10

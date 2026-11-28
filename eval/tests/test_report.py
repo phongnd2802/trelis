@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import math
 import random
 from dataclasses import replace
 from pathlib import Path
@@ -22,6 +23,7 @@ from trelis_eval.ablation_run import (
     GradeOutcomes,
     GradeSummary,
     ManifestRef,
+    ModelMode,
     QuestionMetrics,
     QuestionResult,
     QuestionStatus,
@@ -32,12 +34,15 @@ from trelis_eval.ablation_run import (
     load_ablation_run,
 )
 from trelis_eval.attribution import FailureLabel
-from trelis_eval.client import Usage
+from trelis_eval.client import TraceStep, Usage
 from trelis_eval.graders import CITATION_PRECISION, CORRECTNESS, Grade, GradeStatus
 from trelis_eval.metrics import mean, nearest_rank_percentile
+from trelis_eval.prices import ModelPrice, PriceTable
 from trelis_eval.report import (
+    COST_PER_CORRECT,
     LATENCY_P50,
     LATENCY_P95,
+    TOKENS,
     bootstrap_ci,
     build_matrix,
     render_html,
@@ -93,6 +98,7 @@ def run_file(
     top_k=10,
     run_id="run-1",
     concurrency=1,
+    model_mode=ModelMode.PASSTHROUGH,
 ):
     """Build one results file from per-question metric values and latencies."""
     questions = [
@@ -138,6 +144,7 @@ def run_file(
             questions=tuple(questions),
             summary=summary,
             concurrency=concurrency,
+            model_mode=model_mode,
         ),
     )
 
@@ -180,7 +187,14 @@ def answer_question(index, score, latency_ms=10.0):
     )
 
 
-def answer_run_file(config, correctness, *, judge_model="judge-model", run_id="answer-1"):
+def answer_run_file(
+    config,
+    correctness,
+    *,
+    judge_model="judge-model",
+    run_id="answer-1",
+    model_mode=ModelMode.PASSTHROUGH,
+):
     """Build one answer results file with one correctness Grade per value.
 
     ``None`` in ``correctness`` is a grader_error; a float is an ok score.
@@ -228,6 +242,7 @@ def answer_run_file(config, correctness, *, judge_model="judge-model", run_id="a
             kind=RunKind.ANSWER,
             judge_model=judge_model,
             graders=("correctness",),
+            model_mode=model_mode,
         ),
     )
 
@@ -279,6 +294,7 @@ def multi_grader_answer_run_file(config, grades_by_name, *, run_id):
             kind=RunKind.ANSWER,
             judge_model="judge-model",
             graders=tuple(grades_by_name),
+            model_mode=ModelMode.PASSTHROUGH,
         ),
     )
 
@@ -299,7 +315,14 @@ def not_applicable():
     return Grade(score=None, rationale="nothing to check", status=GradeStatus.NOT_APPLICABLE)
 
 
-def file_from_questions(config, questions, *, run_id="run-1", kind=RunKind.RETRIEVAL):
+def file_from_questions(
+    config,
+    questions,
+    *,
+    run_id="run-1",
+    kind=RunKind.RETRIEVAL,
+    model_mode=ModelMode.PASSTHROUGH,
+):
     """Build one results file from hand-built questions."""
     questions = tuple(questions)
     scored = [question for question in questions if question.status is QuestionStatus.SCORED]
@@ -340,6 +363,7 @@ def file_from_questions(config, questions, *, run_id="run-1", kind=RunKind.RETRI
             kind=kind,
             judge_model="judge-model" if kind is RunKind.ANSWER else None,
             graders=graders,
+            model_mode=model_mode,
         ),
     )
 
@@ -607,23 +631,269 @@ def test_one_column_per_grader_in_registry_order_then_sorted_unknown_names():
     assert matrix.rows[1].graders == frozenset({"correctness"})
 
 
+PRICE_CHAT = "chat-x"
+PRICES = PriceTable(
+    currency="USD",
+    models={PRICE_CHAT: ModelPrice(input_per_million=2.0, output_per_million=10.0)},
+)
+
+
+def cost_question(index, score, prompt, completion, *, model=PRICE_CHAT):
+    """Build one scored answer priced by its generate step and its usage."""
+    trace = (
+        TraceStep(
+            step="generate",
+            technique=None,
+            duration_ms=5,
+            model=model,
+            candidates=None,
+        ),
+    )
+    return replace(
+        answer_question(index, score),
+        usage=Usage(
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=prompt + completion,
+        ),
+        trace=trace,
+    )
+
+
+def question_without_generate_step(index, score, prompt, completion):
+    """Build one scored answer whose trace has no generate step."""
+    return replace(
+        answer_question(index, score),
+        usage=Usage(
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=prompt + completion,
+        ),
+        trace=(
+            TraceStep(
+                step="embed_query",
+                technique="dense",
+                duration_ms=4,
+                model="embed-x",
+                candidates=None,
+            ),
+        ),
+    )
+
+
+def cost_ratio(pairs):
+    """Return a resample's mean cost divided by its mean correctness score."""
+    share = mean([score for _, score in pairs])
+    if share == 0:
+        return math.inf
+    return mean([cost for cost, _ in pairs]) / share
+
+
+def cost_number(value):
+    """Format one cost bound for the cell assertion."""
+    if math.isinf(value):
+        return "∞"
+    return f"{value:#.4g}".removesuffix(".")
+
+
+def matrix_cells(matrix, config="dense"):
+    """Return one row's header labels and cells from the Markdown matrix."""
+    lines = render_markdown(matrix).splitlines()
+    header = next(line for line in lines if line.startswith("| Retrieval Config"))
+    row = next(line for line in lines if line.startswith(f"| {config} |"))
+    return dict(zip(table_cells(header), table_cells(row), strict=True))
+
+
+def test_tokens_are_the_mean_total_tokens_with_a_seeded_interval():
+    questions = [
+        cost_question(0, 1.0, 10, 0),
+        cost_question(1, 1.0, 15, 5),
+        cost_question(2, 0.0, 20, 10),
+    ]
+    run = file_from_questions("dense", questions, kind=RunKind.ANSWER)
+
+    matrix = build_matrix([run], seed=1, resamples=200, prices=PRICES)
+
+    [row] = matrix.rows
+    estimate = row.estimates[TOKENS]
+    assert estimate is not None
+    assert estimate.point == pytest.approx(20.0)
+    assert (estimate.low, estimate.high) == bootstrap_ci(
+        [10.0, 20.0, 30.0],
+        statistics_mean,
+        rng=random.Random("1:dense:tokens"),
+        resamples=200,
+    )
+    cells = matrix_cells(matrix)
+    assert cells["Tokens"] == f"20.0 [{estimate.low:.1f}, {estimate.high:.1f}]"
+
+
+def test_a_retrieval_row_shows_dashes_for_tokens_and_cost():
+    matrix = build_matrix([run_file("dense")], seed=1, resamples=20)
+
+    cells = matrix_cells(matrix)
+
+    assert cells["Tokens"] == "—"
+    assert cells["Cost per Correct Answer"] == "—"
+
+
+def test_cost_per_correct_answer_is_the_mean_cost_over_the_correct_share():
+    questions = [
+        cost_question(0, 1.0, 1_000_000, 0),
+        cost_question(1, 0.0, 0, 100_000),
+        cost_question(2, 1.0, 500_000, 50_000),
+    ]
+    run = file_from_questions("dense", questions, kind=RunKind.ANSWER)
+
+    matrix = build_matrix([run], seed=1, resamples=200, prices=PRICES)
+
+    [row] = matrix.rows
+    estimate = row.estimates[COST_PER_CORRECT]
+    assert estimate is not None
+    assert estimate.point == pytest.approx(2.25)
+    expected = bootstrap_ci(
+        [(2.0, 1.0), (1.0, 0.0), (1.5, 1.0)],
+        cost_ratio,
+        rng=random.Random("1:dense:cost_per_correct"),
+        resamples=200,
+    )
+    assert expected is not None
+    assert (estimate.low, estimate.high) == expected
+    cells = matrix_cells(matrix)
+    assert cells["Cost per Correct Answer (USD)"] == (
+        f"2.250 [{cost_number(expected[0])}, {cost_number(expected[1])}]"
+    )
+
+
+def test_cost_per_correct_answer_is_infinite_when_no_answer_is_correct():
+    questions = [
+        cost_question(0, 0.0, 1_000_000, 0),
+        cost_question(1, 0.0, 0, 100_000),
+    ]
+    run = file_from_questions("dense", questions, kind=RunKind.ANSWER)
+
+    matrix = build_matrix([run], seed=1, resamples=200, prices=PRICES)
+
+    estimate = matrix.rows[0].estimates[COST_PER_CORRECT]
+    assert estimate is not None
+    assert estimate.point == math.inf
+    assert matrix_cells(matrix)["Cost per Correct Answer (USD)"] == "∞"
+
+
+def test_the_cost_interval_is_reproducible():
+    questions = [
+        cost_question(0, 1.0, 1_000_000, 0),
+        cost_question(1, 0.0, 0, 100_000),
+        cost_question(2, 1.0, 500_000, 50_000),
+    ]
+    runs = [file_from_questions("dense", questions, kind=RunKind.ANSWER)]
+
+    first = build_matrix(runs, seed=3, resamples=100, prices=PRICES)
+    second = build_matrix(runs, seed=3, resamples=100, prices=PRICES)
+
+    assert first.rows[0].estimates[COST_PER_CORRECT] == (second.rows[0].estimates[COST_PER_CORRECT])
+    assert render_markdown(first) == render_markdown(second)
+
+
+def test_grader_error_and_not_applicable_correctness_are_left_out_of_the_pairs():
+    questions = [
+        cost_question(0, 1.0, 1_000_000, 0),
+        cost_question(1, 0.0, 0, 100_000),
+        cost_question(2, None, 9_000_000, 0),
+        cost_question(3, NA, 9_000_000, 0),
+    ]
+    run = file_from_questions("dense", questions, kind=RunKind.ANSWER)
+
+    estimate = (
+        build_matrix([run], seed=1, resamples=50, prices=PRICES).rows[0].estimates[COST_PER_CORRECT]
+    )
+
+    assert estimate is not None
+    assert estimate.point == pytest.approx(3.0)
+
+
+def test_a_report_without_a_price_table_says_so_and_shows_a_dash():
+    run = file_from_questions("dense", [cost_question(0, 1.0, 10, 2)], kind=RunKind.ANSWER)
+
+    matrix = build_matrix([run], seed=1, resamples=50)
+    markdown = render_markdown(matrix)
+
+    assert matrix_cells(matrix)["Cost per Correct Answer"] == "—"
+    assert "No price table" in markdown
+
+
+def test_the_note_names_unpriced_models_and_answers_without_a_generate_step():
+    questions = [
+        cost_question(0, 1.0, 10, 2, model="unpriced-chat"),
+        question_without_generate_step(1, 1.0, 10, 2),
+    ]
+    run = file_from_questions("dense", questions, kind=RunKind.ANSWER)
+
+    matrix = build_matrix([run], seed=1, resamples=50, prices=PRICES)
+    markdown = render_markdown(matrix)
+
+    assert matrix_cells(matrix)["Cost per Correct Answer (USD)"] == "—"
+    assert "unpriced-chat" in markdown
+    assert "1 answer has no generate step" in markdown
+
+
+def test_the_cost_column_names_the_currency_and_says_what_it_covers():
+    run = file_from_questions("dense", [cost_question(0, 1.0, 10, 2)], kind=RunKind.ANSWER)
+
+    markdown = render_markdown(build_matrix([run], seed=1, resamples=50, prices=PRICES))
+
+    assert "Cost per Correct Answer (USD)" in markdown
+    assert "Cost covers only the generate call" in markdown
+    assert "embedding" in markdown
+
+
+@pytest.mark.parametrize("mode", [ModelMode.LIVE, ModelMode.PASSTHROUGH])
+def test_latency_is_shown_for_a_live_or_passthrough_run(mode):
+    matrix = build_matrix([run_file("dense", model_mode=mode)], seed=1, resamples=20)
+
+    cells = matrix_cells(matrix)
+
+    assert cells["Latency p50 (ms)"].endswith("]")
+    assert cells["Latency p95 (ms)"].endswith("]")
+    assert "Latency is reported only" not in render_markdown(matrix)
+
+
+@pytest.mark.parametrize(
+    ("mode", "cell"),
+    [
+        (ModelMode.RECORD, "replayed"),
+        (ModelMode.REPLAY, "replayed"),
+        (ModelMode.UNKNOWN, "unknown"),
+    ],
+)
+def test_latency_is_gated_for_a_recorded_replayed_or_unknown_run(mode, cell):
+    matrix = build_matrix([run_file("dense", model_mode=mode)], seed=1, resamples=20)
+
+    cells = matrix_cells(matrix)
+
+    assert cells["Latency p50 (ms)"] == cell
+    assert cells["Latency p95 (ms)"] == cell
+    assert "Latency is reported only for live and passthrough runs" in render_markdown(matrix)
+
+
 BASELINE_MAIN_MATRIX = "\n".join(
     (
         "| Retrieval Config | Recall@5 | Recall@10 | MRR | nDCG@10 | Latency p50 (ms) | "
-        "Latency p95 (ms) | Scored | Skipped | Error | Concurrency |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "Latency p95 (ms) | Tokens | Cost per Correct Answer | Scored | Skipped | Error | "
+        "Concurrency |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         "| bm25+dense+rerank | 0.736 [0.710, 0.757] | 0.840 [0.820, 0.863] | "
-        "0.895 [0.872, 0.927] | 0.774 [0.748, 0.795] | 1221.3 [1217.7, 1227.8] | "
-        "1409.9 [1389.4, 1514.3] | 441 | 59 | 0 | 4 |",
+        "0.895 [0.872, 0.927] | 0.774 [0.748, 0.795] | unknown | unknown | — | — | "
+        "441 | 59 | 0 | 4 |",
         "| bm25+dense | 0.666 [0.640, 0.690] | 0.811 [0.786, 0.828] | "
-        "0.828 [0.802, 0.859] | 0.714 [0.688, 0.735] | 243.5 [242.3, 245.3] | "
-        "259.0 [254.6, 262.3] | 441 | 59 | 0 | 4 |",
+        "0.828 [0.802, 0.859] | 0.714 [0.688, 0.735] | unknown | unknown | — | — | "
+        "441 | 59 | 0 | 4 |",
         "| bm25 | 0.621 [0.595, 0.660] | 0.744 [0.718, 0.766] | "
-        "0.780 [0.759, 0.827] | 0.658 [0.635, 0.680] | 21.0 [20.7, 21.2] | "
-        "29.1 [28.6, 29.9] | 441 | 59 | 0 | 4 |",
+        "0.780 [0.759, 0.827] | 0.658 [0.635, 0.680] | unknown | unknown | — | — | "
+        "441 | 59 | 0 | 4 |",
         "| dense | 0.630 [0.599, 0.651] | 0.779 [0.759, 0.796] | "
-        "0.797 [0.768, 0.820] | 0.678 [0.661, 0.701] | 23925.0 [23415.9, 24410.8] | "
-        "34511.5 [32487.8, 35237.7] | 441 | 59 | 0 | 4 |",
+        "0.797 [0.768, 0.820] | 0.678 [0.661, 0.701] | unknown | unknown | — | — | "
+        "441 | 59 | 0 | 4 |",
     )
 )
 
@@ -646,7 +916,9 @@ def test_the_committed_version_1_baselines_still_render():
     assert "Correctness" not in markdown
     start = markdown.index("| Retrieval Config")
     end = markdown.index("\n\n## Runs")
-    assert markdown[start:end] == BASELINE_MAIN_MATRIX
+    section = markdown[start:end]
+    assert section.startswith(BASELINE_MAIN_MATRIX + "\n\n")
+    assert "Latency is reported only for live and passthrough runs" in section
     assert [table.name for table in matrix.slice_tables] == [
         "comparison_query",
         "inference_query",
@@ -867,6 +1139,8 @@ def test_render_markdown_puts_an_interval_in_every_metric_and_latency_cell():
         "nDCG@10",
         "Latency p50 (ms)",
         "Latency p95 (ms)",
+        "Tokens",
+        "Cost per Correct Answer",
         "Concurrency",
     ):
         assert header in markdown

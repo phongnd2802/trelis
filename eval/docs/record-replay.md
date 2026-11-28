@@ -210,6 +210,18 @@ flushing between them.
   fixtures. Use it to measure real provider latency without touching the
   fixture tree.
 
+An Ablation Run records where its model answers came from, and the mode must
+match how the proxy ran: `--model-mode record` with `--mode record` (or
+`scripts/eval-stack.sh up record`), `--model-mode replay` with `--mode replay`
+(or `up replay`), and `--model-mode passthrough` with `--mode passthrough`. A
+run against a Trelis that calls the providers directly is `--model-mode live`.
+`scripts/eval-stack.sh up` prints the `export TRELIS_EVAL_MODEL_MODE=<mode>`
+line to copy. The Ablation Matrix shows latency only for `live` and
+`passthrough` runs. A `record` run mixes recorded upstream calls with replayed
+ones, so its latency measures neither the provider nor the replay; a `replay`
+run replays every call; both show `replayed`. A run from before model modes
+shows `unknown`.
+
 ## Running the proxy
 
 ```sh
@@ -278,6 +290,7 @@ TRELIS_MODELS_EMBEDDING_BASE_URL=http://127.0.0.1:4100/embedding make dev
 uv run --project eval trelis-eval retrieval run \
   --golden eval/data/multihop-rag/strat500-golden.jsonl \
   --manifest eval/data/multihop-rag/strat500-manifest.jsonl \
+  --model-mode record \
   --run-id before-cache
 ```
 
@@ -297,6 +310,7 @@ file):
 uv run --project eval trelis-eval retrieval run \
   --golden eval/data/multihop-rag/strat500-golden.jsonl \
   --manifest eval/data/multihop-rag/strat500-manifest.jsonl \
+  --model-mode replay \
   --run-id after-cache
 ```
 

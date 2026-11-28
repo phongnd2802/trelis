@@ -7,7 +7,7 @@ import httpx
 import pytest
 from fakes import AnswerServer
 
-from trelis_eval.cli import main
+from trelis_eval.cli import DEFAULT_PRICES, main
 from trelis_eval.golden import (
     Evidence,
     GoldenQuestion,
@@ -393,6 +393,8 @@ def run_retrieval(tmp_path, monkeypatch, transport, *extra):
             str(out_dir),
             "--run-id",
             "20260101T000000Z",
+            "--model-mode",
+            "passthrough",
             *extra,
         ],
         transport=transport,
@@ -430,6 +432,7 @@ def test_retrieval_run_writes_one_file_per_config_under_one_run_id(tmp_path, mon
     ]
     assert lines[0]["run_id"] == "20260101T000000Z"
     assert lines[0]["config"] == {"name": "dense", "techniques": ["dense"]}
+    assert lines[0]["model_mode"] == "passthrough"
     assert lines[0]["golden_set"]["questions"] == 2
     assert lines[-1]["counts"] == {"scored": 2, "skipped": 0, "error": 0}
     assert "test-key" not in (run_dir / "dense.jsonl").read_text(encoding="utf-8")
@@ -452,6 +455,102 @@ def test_retrieval_run_defaults_to_one_dense_config(tmp_path, monkeypatch):
 
     assert code == 0
     assert [path.name for path in (out_dir / "20260101T000000Z").iterdir()] == ["dense.jsonl"]
+
+
+def test_retrieval_run_records_the_model_mode_from_the_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRELIS_API_KEY", "test-key")
+    monkeypatch.setenv("TRELIS_BASE_URL", "http://trelis.test")
+    monkeypatch.setenv("TRELIS_EVAL_MODEL_MODE", "replay")
+    server = RetrievalServer(
+        {
+            "Question mhr-0000?": [retrieval_chunk("doc-a", "chunk-1")],
+            "Question mhr-0001?": [retrieval_chunk("doc-a", "chunk-2")],
+        }
+    )
+    golden_path, manifest_path = write_retrieval_inputs(
+        tmp_path,
+        [
+            retrieval_question("mhr-0000", ["https://example.com/a"]),
+            retrieval_question("mhr-0001", ["https://example.com/a"]),
+        ],
+        [completed_record("https://example.com/a", "doc-a")],
+    )
+    out_dir = tmp_path / "runs"
+
+    code = main(
+        [
+            "retrieval",
+            "run",
+            "--golden",
+            str(golden_path),
+            "--manifest",
+            str(manifest_path),
+            "--out-dir",
+            str(out_dir),
+            "--run-id",
+            "20260101T000000Z",
+        ],
+        transport=httpx.MockTransport(server),
+    )
+
+    assert code == 0
+    header = json.loads(
+        (out_dir / "20260101T000000Z" / "dense.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert header["model_mode"] == "replay"
+
+
+def test_a_retrieval_run_needs_a_model_mode_before_any_request(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("TRELIS_API_KEY", "test-key")
+    monkeypatch.delenv("TRELIS_EVAL_MODEL_MODE", raising=False)
+    golden_path, manifest_path = write_retrieval_inputs(
+        tmp_path,
+        [retrieval_question("mhr-0000", ["https://example.com/a"])],
+        [completed_record("https://example.com/a", "doc-a")],
+    )
+
+    def should_not_be_called(request):
+        pytest.fail("a missing model mode must fail before any request")
+
+    code = main(
+        [
+            "retrieval",
+            "run",
+            "--golden",
+            str(golden_path),
+            "--manifest",
+            str(manifest_path),
+            "--out-dir",
+            str(tmp_path / "runs"),
+        ],
+        transport=httpx.MockTransport(should_not_be_called),
+    )
+
+    assert code == 1
+    error = capsys.readouterr().err
+    assert error.startswith("error: ")
+    assert "--model-mode" in error
+    assert "TRELIS_EVAL_MODEL_MODE" in error
+    assert len(error.splitlines()) == 1
+
+
+def test_an_answer_run_needs_a_model_mode_before_any_request(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("TRELIS_API_KEY", "test-key")
+    monkeypatch.delenv("TRELIS_EVAL_MODEL_MODE", raising=False)
+    set_judge_env(monkeypatch)
+    argv = answer_arguments(tmp_path)
+    model_mode_at = argv.index("--model-mode")
+    del argv[model_mode_at : model_mode_at + 2]
+
+    def should_not_be_called(request):
+        pytest.fail("a missing model mode must fail before any request")
+
+    code = main(argv, transport=httpx.MockTransport(should_not_be_called))
+
+    assert code == 1
+    error = capsys.readouterr().err
+    assert "--model-mode" in error
+    assert "TRELIS_EVAL_MODEL_MODE" in error
 
 
 def test_retrieval_run_rejects_bad_config_syntax_before_calling_trelis(
@@ -477,6 +576,8 @@ def test_retrieval_run_rejects_bad_config_syntax_before_calling_trelis(
             str(manifest_path),
             "--out-dir",
             str(tmp_path / "runs"),
+            "--model-mode",
+            "passthrough",
             "--config",
             "dense+",
         ],
@@ -510,6 +611,8 @@ def test_retrieval_run_rejects_two_configs_with_the_same_canonical_name(
             str(manifest_path),
             "--out-dir",
             str(tmp_path / "runs"),
+            "--model-mode",
+            "passthrough",
             "--config",
             "dense+bm25",
             "--config",
@@ -554,6 +657,8 @@ def test_retrieval_run_exits_one_when_no_question_was_scored(tmp_path, monkeypat
             str(out_dir),
             "--run-id",
             "run-1",
+            "--model-mode",
+            "passthrough",
         ],
         transport=httpx.MockTransport(should_not_be_called),
     )
@@ -823,6 +928,8 @@ def answer_arguments(tmp_path, *extra):
         str(tmp_path / "runs"),
         "--run-id",
         "20260101T000000Z",
+        "--model-mode",
+        "passthrough",
         *extra,
     ]
 
@@ -950,6 +1057,7 @@ def test_answer_run_writes_grades_the_judge_model_and_the_summary(tmp_path, monk
         .splitlines()
     ]
     assert lines[0]["kind"] == "answer"
+    assert lines[0]["model_mode"] == "passthrough"
     assert lines[0]["judge_model"] == "flag-judge-model"
     assert lines[0]["graders"] == ["correctness"]
     assert lines[1]["grades"]["correctness"]["score"] == 1.0
@@ -1236,6 +1344,57 @@ def write_varied_results_file(tmp_path, monkeypatch):
             str(out_dir),
             "--run-id",
             "20260101T000000Z",
+            "--model-mode",
+            "passthrough",
+        ],
+        transport=httpx.MockTransport(server),
+    )
+    assert code == 0
+    return out_dir / "20260101T000000Z" / "dense.jsonl"
+
+
+def write_answer_results_file(tmp_path, monkeypatch):
+    """Write one correctness-graded answer run whose generate step names a model."""
+    monkeypatch.setenv("TRELIS_API_KEY", "test-key")
+    monkeypatch.setenv("TRELIS_BASE_URL", "http://trelis.test")
+    set_judge_env(monkeypatch)
+    questions = [
+        retrieval_question("mhr-0000", ["https://example.com/a"]),
+        retrieval_question("mhr-0001", ["https://example.com/a"]),
+    ]
+    golden_path, manifest_path = write_retrieval_inputs(
+        tmp_path,
+        questions,
+        [completed_record("https://example.com/a", "doc-a")],
+    )
+    trace = [{"step": "generate", "duration_ms": 5, "model": "chat-x"}]
+    server = AnswerServer(
+        {
+            f"Question mhr-000{index}?": {
+                "answer": "An answer.",
+                "results": [retrieval_chunk("doc-a", f"chunk-{index}")],
+                "trace": trace,
+            }
+            for index in range(2)
+        }
+    )
+    out_dir = tmp_path / "runs"
+    code = main(
+        [
+            "answer",
+            "run",
+            "--golden",
+            str(golden_path),
+            "--manifest",
+            str(manifest_path),
+            "--out-dir",
+            str(out_dir),
+            "--run-id",
+            "20260101T000000Z",
+            "--model-mode",
+            "passthrough",
+            "--graders",
+            "correctness",
         ],
         transport=httpx.MockTransport(server),
     )
@@ -1319,3 +1478,63 @@ def test_report_exits_one_on_results_from_different_golden_sets(tmp_path, monkey
     assert code == 1
     assert "Golden Set" in capsys.readouterr().err
     assert not (tmp_path / "report").exists()
+
+
+def test_the_default_price_table_is_the_committed_template():
+    assert DEFAULT_PRICES == Path(__file__).resolve().parent.parent / "prices.toml"
+    assert DEFAULT_PRICES.is_file()
+
+
+def test_report_with_a_missing_price_table_exits_one(tmp_path, monkeypatch, capsys):
+    results = write_varied_results_file(tmp_path, monkeypatch)
+    out_dir = tmp_path / "report"
+
+    code = main(
+        [
+            "report",
+            str(results),
+            "--prices",
+            str(tmp_path / "missing.toml"),
+            "--out-dir",
+            str(out_dir),
+        ]
+    )
+
+    assert code == 1
+    assert "missing.toml" in capsys.readouterr().err
+    assert not out_dir.exists()
+
+
+def test_report_with_a_price_table_adds_the_cost_column(tmp_path, monkeypatch, capsys):
+    results = write_answer_results_file(tmp_path, monkeypatch)
+    prices = tmp_path / "prices.toml"
+    prices.write_text(
+        """
+currency = "USD"
+
+[models."chat-x"]
+input_per_million = 100.0
+output_per_million = 200.0
+""",
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "report"
+
+    code = main(
+        [
+            "report",
+            str(results),
+            "--prices",
+            str(prices),
+            "--resamples",
+            "50",
+            "--out-dir",
+            str(out_dir),
+        ]
+    )
+
+    assert code == 0
+    markdown = (out_dir / "ablation-matrix.md").read_text(encoding="utf-8")
+    assert "Cost per Correct Answer (USD)" in markdown
+    row = next(line for line in markdown.splitlines() if line.startswith("| dense |"))
+    assert "0.001400" in row
