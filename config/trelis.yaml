@@ -102,7 +102,9 @@ chunking:
 
 # Model roles. Each role points at its own OpenAI-compatible provider
 # (base_url, model, api_key); a role left empty is unconfigured. Keep keys
-# out of this file: set TRELIS_MODELS_<ROLE>_API_KEY instead.
+# out of this file: set TRELIS_MODELS_<ROLE>_API_KEY instead. For your own
+# providers, set TRELIS_MODELS_<ROLE>_BASE_URL / _MODEL in .local/models.env
+# (exported by `make dev`) rather than editing this file.
 # models:
 #   chat:
 #     protocol: openai-completions   # POST {base_url}/chat/completions

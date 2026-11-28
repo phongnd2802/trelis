@@ -5,7 +5,8 @@
 #
 # Usage:
 #   scripts/qwen.sh new                 # fresh session for one ticket, approval mode auto; prints its id
-#   scripts/qwen.sh send <id> <file>    # send <file> as one prompt; refuses while the session is busy
+#   scripts/qwen.sh send <id> <file>    # send docs/agents/qwen-brief.md + <file> as one prompt;
+#                                       # refuses while the session is busy
 #   scripts/qwen.sh wait <id>           # block until the prompt finishes; prints a line when Qwen
 #                                       # waits on the user, fits Monitor or run_in_background
 #   scripts/qwen.sh status <id>         # one-line JSON summary of the session
@@ -21,7 +22,7 @@ set -euo pipefail
 
 url=${QWEN_DAEMON_URL:-http://127.0.0.1:4170}
 
-usage() { sed -n '6,13p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+usage() { sed -n '6,14p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 
 die() { echo "qwen.sh: $1" >&2; exit "${2:-4}"; }
 
@@ -64,7 +65,9 @@ case "$cmd" in
       summary <<<"$s" >&2
       exit 3
     fi
-    jq -n --rawfile t "$file" '{prompt: [{type: "text", text: $t}]}' |
+    rules=$(git rev-parse --show-toplevel)/docs/agents/qwen-brief.md
+    [ -r "$rules" ] || die "cannot read $rules" 64
+    jq -n --rawfile r "$rules" --rawfile t "$file" '{prompt: [{type: "text", text: ($r + "\n---\n\n" + $t)}]}' |
       curl -fsS -m 30 -X POST "$url/session/$id/prompt" -H 'Content-Type: application/json' --data-binary @- |
       jq -r '"sent prompt \(.promptId)"'
     ;;

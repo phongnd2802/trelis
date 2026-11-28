@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import math
+import os
 import random
 from dataclasses import replace
 from pathlib import Path
@@ -34,10 +35,11 @@ from trelis_eval.ablation_run import (
     load_ablation_run,
 )
 from trelis_eval.attribution import FailureLabel
+from trelis_eval.cli import DEFAULT_PRICES
 from trelis_eval.client import TraceStep, Usage
 from trelis_eval.graders import CITATION_PRECISION, CORRECTNESS, Grade, GradeStatus
 from trelis_eval.metrics import mean, nearest_rank_percentile
-from trelis_eval.prices import ModelPrice, PriceTable
+from trelis_eval.prices import ModelPrice, PriceTable, load_prices
 from trelis_eval.report import (
     COST_PER_CORRECT,
     LATENCY_P50,
@@ -876,26 +878,25 @@ def test_latency_is_gated_for_a_recorded_replayed_or_unknown_run(mode, cell):
     assert "Latency is reported only for live and passthrough runs" in render_markdown(matrix)
 
 
-BASELINE_MAIN_MATRIX = "\n".join(
-    (
-        "| Retrieval Config | Recall@5 | Recall@10 | MRR | nDCG@10 | Latency p50 (ms) | "
-        "Latency p95 (ms) | Tokens | Cost per Correct Answer | Scored | Skipped | Error | "
-        "Concurrency |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
-        "| bm25+dense+rerank | 0.736 [0.710, 0.757] | 0.840 [0.820, 0.863] | "
-        "0.895 [0.872, 0.927] | 0.774 [0.748, 0.795] | unknown | unknown | — | — | "
-        "441 | 59 | 0 | 4 |",
-        "| bm25+dense | 0.666 [0.640, 0.690] | 0.811 [0.786, 0.828] | "
-        "0.828 [0.802, 0.859] | 0.714 [0.688, 0.735] | unknown | unknown | — | — | "
-        "441 | 59 | 0 | 4 |",
-        "| bm25 | 0.621 [0.595, 0.660] | 0.744 [0.718, 0.766] | "
-        "0.780 [0.759, 0.827] | 0.658 [0.635, 0.680] | unknown | unknown | — | — | "
-        "441 | 59 | 0 | 4 |",
-        "| dense | 0.630 [0.599, 0.651] | 0.779 [0.759, 0.796] | "
-        "0.797 [0.768, 0.820] | 0.678 [0.661, 0.701] | unknown | unknown | — | — | "
-        "441 | 59 | 0 | 4 |",
+GOLDEN = Path(__file__).parent / "golden"
+"""Committed renders of the baselines report; a diff in them is a report change."""
+
+UPDATE_GOLDEN = "TRELIS_EVAL_UPDATE_GOLDEN"
+"""Set to 1 to rewrite the golden renders from the current report code."""
+
+
+def assert_golden(name: str, rendered: str) -> None:
+    """Compare a render with its committed golden file, or rewrite it on request."""
+    path = GOLDEN / name
+    if os.environ.get(UPDATE_GOLDEN) == "1":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(rendered, encoding="utf-8")
+        return
+    assert path.exists(), f"{path} is missing; run `{UPDATE_GOLDEN}=1 make eval-test` to create it"
+    assert rendered == path.read_text(encoding="utf-8"), (
+        f"the report render differs from {path}; if the change is intended, run "
+        f"`{UPDATE_GOLDEN}=1 make eval-test` and commit the updated golden file"
     )
-)
 
 
 def test_the_committed_version_1_baselines_still_render():
@@ -906,8 +907,11 @@ def test_the_committed_version_1_baselines_still_render():
         [load_ablation_run(path) for path in baselines],
         seed=1,
         resamples=50,
+        prices=load_prices(DEFAULT_PRICES),
     )
 
+    assert_golden("baselines-report.md", render_markdown(matrix))
+    assert_golden("baselines-report.html", render_html(matrix))
     assert all(row.kind is RunKind.RETRIEVAL for row in matrix.rows)
     assert matrix.graders == ()
     assert all(row.graders == frozenset() for row in matrix.rows)
@@ -917,7 +921,6 @@ def test_the_committed_version_1_baselines_still_render():
     start = markdown.index("| Retrieval Config")
     end = markdown.index("\n\n## Runs")
     section = markdown[start:end]
-    assert section.startswith(BASELINE_MAIN_MATRIX + "\n\n")
     assert "Latency is reported only for live and passthrough runs" in section
     assert [table.name for table in matrix.slice_tables] == [
         "comparison_query",
