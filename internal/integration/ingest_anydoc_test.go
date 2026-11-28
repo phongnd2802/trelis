@@ -74,17 +74,18 @@ func TestStartingIngestTwiceReusesTheCompletedRun(t *testing.T) {
 		t.Fatalf("dial Temporal: %v", err)
 	}
 	defer c.Close()
-	runID := workflowRunID(t, c, id)
+	uploadID := tr.documentUploadID(t, id)
+	runID := workflowRunID(t, c, id, uploadID)
 
 	starter := ingest.NewStarter(c, tr.taskQueue)
-	documentID := uuid.MustParse(id)
+	documentID, upload := uuid.MustParse(id), uuid.MustParse(uploadID)
 	for range 2 {
-		if err := starter.StartIngest(ctx, documentID); err != nil {
+		if err := starter.StartIngest(ctx, documentID, upload); err != nil {
 			t.Fatalf("StartIngest: %v", err)
 		}
 	}
 
-	if after := workflowRunID(t, c, id); after != runID {
+	if after := workflowRunID(t, c, id, uploadID); after != runID {
 		t.Errorf("workflow run changed from %s to %s after starting twice, want the same run", runID, after)
 	}
 	if doc := tr.waitForIngest(t, alice, id); doc.ParseStatus != "completed" {
@@ -95,12 +96,14 @@ func TestStartingIngestTwiceReusesTheCompletedRun(t *testing.T) {
 	}
 }
 
-// workflowRunID is the workflow run Temporal currently serves documentID from.
-func workflowRunID(t *testing.T, c client.Client, documentID string) string {
+// workflowRunID is the workflow run Temporal currently serves one upload of
+// documentID from.
+func workflowRunID(t *testing.T, c client.Client, documentID, uploadID string) string {
 	t.Helper()
-	desc, err := c.DescribeWorkflow(context.Background(), documentID, "")
+	id := ingestWorkflowID(documentID, uploadID)
+	desc, err := c.DescribeWorkflow(context.Background(), id, "")
 	if err != nil {
-		t.Fatalf("describe workflow %s: %v", documentID, err)
+		t.Fatalf("describe workflow %s: %v", id, err)
 	}
 	return desc.WorkflowExecution.RunID
 }

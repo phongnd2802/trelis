@@ -22,6 +22,11 @@ type batchCall struct {
 	Queue    string
 }
 
+// uploadRef is one Document upload an activity was called for.
+type uploadRef struct {
+	DocumentID, UploadID string
+}
+
 // stubActivities stands in for the service-backed activities in workflow
 // tests. Each call is recorded, and the queue an activity was scheduled on
 // comes from its activity context, which is how the tests see that the embed
@@ -54,6 +59,15 @@ type stubActivities struct {
 	completeGate chan struct{}
 	// failedReasons are the reasons passed to MarkFailed.
 	failedReasons []string
+	// deleteSupersededCalls are the (document, upload) pairs the superseded
+	// upload cleanup ran for.
+	deleteSupersededCalls []uploadRef
+	// deleteSupersededFailures is how many times the superseded upload
+	// cleanup fails before succeeding.
+	deleteSupersededFailures int
+	// deleteSupersededErr, when set, fails every superseded upload cleanup
+	// with it.
+	deleteSupersededErr error
 	// deleteObjectsCalls are the Documents the cleanup activity was asked to
 	// delete the objects of.
 	deleteObjectsCalls []string
@@ -65,7 +79,7 @@ type stubActivities struct {
 	events []string
 }
 
-func (s *stubActivities) parseAndChunk(context.Context, string) (int, error) {
+func (s *stubActivities) parseAndChunk(context.Context, string, string) (int, error) {
 	s.mu.Lock()
 	s.parseCalls++
 	s.events = append(s.events, "parse")
@@ -77,7 +91,7 @@ func (s *stubActivities) parseAndChunk(context.Context, string) (int, error) {
 	return chunks, err
 }
 
-func (s *stubActivities) embedBatch(ctx context.Context, _ string, from, to int) (int, error) {
+func (s *stubActivities) embedBatch(ctx context.Context, _, _ string, from, to int) (int, error) {
 	s.mu.Lock()
 	s.batchCalls = append(s.batchCalls, batchCall{From: from, To: to, Queue: activity.GetInfo(ctx).TaskQueue})
 	s.events = append(s.events, "batch")
@@ -104,7 +118,7 @@ func (s *stubActivities) embedBatch(ctx context.Context, _ string, from, to int)
 	return to - from, nil
 }
 
-func (s *stubActivities) complete(context.Context, string) error {
+func (s *stubActivities) complete(context.Context, string, string) error {
 	s.mu.Lock()
 	s.completeCalls++
 	s.events = append(s.events, "complete")
@@ -116,11 +130,26 @@ func (s *stubActivities) complete(context.Context, string) error {
 	return err
 }
 
-func (s *stubActivities) markFailed(_ context.Context, _, reason string) error {
+func (s *stubActivities) markFailed(_ context.Context, _, _, reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failedReasons = append(s.failedReasons, reason)
 	s.events = append(s.events, "mark_failed")
+	return nil
+}
+
+func (s *stubActivities) deleteSupersededUploads(_ context.Context, documentID, uploadID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleteSupersededCalls = append(s.deleteSupersededCalls, uploadRef{DocumentID: documentID, UploadID: uploadID})
+	s.events = append(s.events, "delete_superseded")
+	if s.deleteSupersededErr != nil {
+		return s.deleteSupersededErr
+	}
+	if s.deleteSupersededFailures > 0 {
+		s.deleteSupersededFailures--
+		return errors.New("object storage unreachable")
+	}
 	return nil
 }
 
@@ -159,6 +188,14 @@ func (s *stubActivities) snapshot() (parse, complete int, batches []batchCall, f
 		append([]string(nil), s.failedReasons...), append([]string(nil), s.events...)
 }
 
+// supersededUploadCalls returns the (document, upload) pairs the superseded
+// upload cleanup ran for.
+func (s *stubActivities) supersededUploadCalls() []uploadRef {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.deleteSupersededCalls)
+}
+
 // newWorkflowEnv registers the stubs under the names the workflow calls and
 // returns the test environment.
 func newWorkflowEnv(t *testing.T, stubs *stubActivities) *testsuite.TestWorkflowEnvironment {
@@ -169,9 +206,13 @@ func newWorkflowEnv(t *testing.T, stubs *stubActivities) *testsuite.TestWorkflow
 	env.RegisterActivityWithOptions(stubs.embedBatch, activity.RegisterOptions{Name: EmbedBatchActivity})
 	env.RegisterActivityWithOptions(stubs.complete, activity.RegisterOptions{Name: CompleteActivity})
 	env.RegisterActivityWithOptions(stubs.markFailed, activity.RegisterOptions{Name: MarkFailedActivity})
+	env.RegisterActivityWithOptions(stubs.deleteSupersededUploads, activity.RegisterOptions{Name: DeleteSupersededUploadsActivity})
 	env.RegisterActivityWithOptions(stubs.deleteObjects, activity.RegisterOptions{Name: DeleteObjectsActivity})
 	return env
 }
+
+// testUploadID is the upload the workflow tests run for.
+const testUploadID = "b1c2d3e4-0000-0000-0000-00000000aaaa"
 
 // runWorkflow executes the workflow with chunks Chunks and the test batch
 // size.
@@ -179,7 +220,7 @@ func runWorkflow(t *testing.T, stubs *stubActivities, documentID string) *testsu
 	t.Helper()
 	env := newWorkflowEnv(t, stubs)
 	workflowDef := &IngestWorkflow{ModelTaskQueue: testModelTaskQueue, EmbedBatchSize: 3}
-	env.ExecuteWorkflow(workflowDef.Run, documentID)
+	env.ExecuteWorkflow(workflowDef.Run, documentID, testUploadID)
 	return env
 }
 
@@ -320,13 +361,19 @@ func TestFailureReasonOnlyShowsMessagesChosenForReaders(t *testing.T) {
 // testNamespace is the namespace the Temporal test environment reports.
 const testNamespace = "default-test-namespace"
 
+// ingestWorkflowTestID is the ingest workflow ID for documentID and
+// testUploadID.
+func ingestWorkflowTestID(documentID string) string {
+	return ingestWorkflowID(documentID, testUploadID)
+}
+
 // runDeleteWorkflow executes the delete workflow with a cancel request that
 // answers cancelErr.
 func runDeleteWorkflow(t *testing.T, stubs *stubActivities, documentID string, cancelErr error) *testsuite.TestWorkflowEnvironment {
 	t.Helper()
 	env := newWorkflowEnv(t, stubs)
-	env.OnRequestCancelExternalWorkflow(testNamespace, documentID, "").Return(cancelErr).Once()
-	env.ExecuteWorkflow((&DeleteDocumentWorkflow{}).Run, documentID)
+	env.OnRequestCancelExternalWorkflow(testNamespace, ingestWorkflowTestID(documentID), "").Return(cancelErr).Once()
+	env.ExecuteWorkflow((&DeleteDocumentWorkflow{}).Run, documentID, testUploadID)
 	return env
 }
 
@@ -334,13 +381,13 @@ func TestDeleteWorkflowCancelsTheIngestThenDeletesTheObjects(t *testing.T) {
 	stubs := &stubActivities{}
 	env := newWorkflowEnv(t, stubs)
 	const documentID = "b1c2d3e4-0000-0000-0000-000000000005"
-	env.OnRequestCancelExternalWorkflow(testNamespace, documentID, "").
+	env.OnRequestCancelExternalWorkflow(testNamespace, ingestWorkflowTestID(documentID), "").
 		Return(func(string, string, string) error {
 			stubs.record("cancel")
 			return nil
 		}).Once()
 
-	env.ExecuteWorkflow((&DeleteDocumentWorkflow{}).Run, documentID)
+	env.ExecuteWorkflow((&DeleteDocumentWorkflow{}).Run, documentID, testUploadID)
 	if err := env.GetWorkflowError(); err != nil {
 		t.Fatalf("workflow error = %v, want success", err)
 	}
@@ -397,7 +444,7 @@ func TestIngestWorkflowCancelledDuringAnEmbedBatchEndsWithoutMarkingFailed(t *te
 	defer close(stubs.batchesGate)
 
 	env.ExecuteWorkflow((&IngestWorkflow{ModelTaskQueue: testModelTaskQueue, EmbedBatchSize: 3}).Run,
-		"b1c2d3e4-0000-0000-0000-000000000009")
+		"b1c2d3e4-0000-0000-0000-000000000009", testUploadID)
 	err := env.GetWorkflowError()
 	if err == nil || !temporal.IsCanceledError(err) {
 		t.Fatalf("workflow error = %v, want the cancelled workflow", err)
@@ -418,7 +465,7 @@ func TestIngestWorkflowCancelledDuringParseEndsWithoutMarkingFailed(t *testing.T
 	defer close(stubs.parseGate)
 
 	env.ExecuteWorkflow((&IngestWorkflow{ModelTaskQueue: testModelTaskQueue, EmbedBatchSize: 3}).Run,
-		"b1c2d3e4-0000-0000-0000-00000000000a")
+		"b1c2d3e4-0000-0000-0000-00000000000a", testUploadID)
 	err := env.GetWorkflowError()
 	if err == nil || !temporal.IsCanceledError(err) {
 		t.Fatalf("workflow error = %v, want the cancelled workflow", err)
@@ -439,7 +486,7 @@ func TestIngestWorkflowCancelledDuringCompleteEndsWithoutMarkingFailed(t *testin
 	defer close(stubs.completeGate)
 
 	env.ExecuteWorkflow((&IngestWorkflow{ModelTaskQueue: testModelTaskQueue, EmbedBatchSize: 3}).Run,
-		"b1c2d3e4-0000-0000-0000-00000000000b")
+		"b1c2d3e4-0000-0000-0000-00000000000b", testUploadID)
 	err := env.GetWorkflowError()
 	if err == nil || !temporal.IsCanceledError(err) {
 		t.Fatalf("workflow error = %v, want the cancelled workflow", err)
@@ -450,6 +497,95 @@ func TestIngestWorkflowCancelledDuringCompleteEndsWithoutMarkingFailed(t *testin
 	}
 	if len(failed) != 0 {
 		t.Errorf("MarkFailed called with %q, want nothing marked for a cancelled complete", failed)
+	}
+}
+
+func TestIngestWorkflowDoesNotMarkFailedWhenTheUploadWasSuperseded(t *testing.T) {
+	stubs := &stubActivities{chunks: 2, completeErr: temporal.NewNonRetryableApplicationError(
+		"the upload was superseded by a newer one", supersededUploadType, nil)}
+	env := runWorkflow(t, stubs, "b1c2d3e4-0000-0000-0000-00000000000d")
+	if err := env.GetWorkflowError(); err == nil {
+		t.Fatal("workflow succeeded, want the superseded upload to end it")
+	}
+
+	parse, complete, _, failed, _ := stubs.snapshot()
+	if parse != 1 || complete != 1 {
+		t.Errorf("parse and complete calls = %d and %d, want one each", parse, complete)
+	}
+	if len(failed) != 0 {
+		t.Errorf("MarkFailed called with %q, want nothing marked for a superseded upload", failed)
+	}
+}
+
+func TestIngestWorkflowDeletesSupersededUploadsAfterParseAndBeforeTheBatches(t *testing.T) {
+	stubs := &stubActivities{chunks: 7}
+	env := runWorkflow(t, stubs, "b1c2d3e4-0000-0000-0000-00000000000e")
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error = %v, want success", err)
+	}
+
+	_, complete, batches, failed, events := stubs.snapshot()
+	if complete != 1 {
+		t.Errorf("Complete ran %d times, want once", complete)
+	}
+	if len(batches) != 3 {
+		t.Errorf("embed batches = %d, want three", len(batches))
+	}
+	if len(failed) != 0 {
+		t.Errorf("MarkFailed called with %q, want never on success", failed)
+	}
+	if len(events) < 2 || events[0] != "parse" || events[1] != "delete_superseded" {
+		t.Fatalf("activity events = %v, want parse then delete_superseded", events)
+	}
+	if last := events[len(events)-1]; last != "complete" {
+		t.Errorf("last activity = %q, want complete", last)
+	}
+	for _, event := range events[2 : len(events)-1] {
+		if event != "batch" {
+			t.Errorf("activity %q ran between the cleanup and complete, want only embed batches: %v", event, events)
+		}
+	}
+	calls := stubs.supersededUploadCalls()
+	want := []uploadRef{{DocumentID: "b1c2d3e4-0000-0000-0000-00000000000e", UploadID: testUploadID}}
+	if !slices.Equal(calls, want) {
+		t.Errorf("superseded upload cleanup ran for %v, want %v", calls, want)
+	}
+}
+
+func TestIngestWorkflowKeepsGoingWhenDeletingSupersededUploadsFails(t *testing.T) {
+	stubs := &stubActivities{chunks: 7, deleteSupersededFailures: deleteSupersededUploadsAttempts}
+	env := runWorkflow(t, stubs, "b1c2d3e4-0000-0000-0000-00000000000f")
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error = %v, want a failed cleanup not to fail the Document", err)
+	}
+
+	_, complete, _, failed, _ := stubs.snapshot()
+	if complete != 1 {
+		t.Errorf("Complete ran %d times, want once after the failed cleanup", complete)
+	}
+	if len(failed) != 0 {
+		t.Errorf("MarkFailed called with %q, want the cleanup failure to be left to the reconciler", failed)
+	}
+	if calls := stubs.supersededUploadCalls(); len(calls) != deleteSupersededUploadsAttempts {
+		t.Errorf("superseded upload cleanup ran %d times, want its %d attempts",
+			len(calls), deleteSupersededUploadsAttempts)
+	}
+}
+
+func TestIngestWorkflowEndsWhenASupersededCleanupIsSuperseded(t *testing.T) {
+	stubs := &stubActivities{chunks: 7, deleteSupersededErr: temporal.NewNonRetryableApplicationError(
+		"the upload was superseded by a newer one", supersededUploadType, nil)}
+	env := runWorkflow(t, stubs, "b1c2d3e4-0000-0000-0000-000000000010")
+	if err := env.GetWorkflowError(); err == nil {
+		t.Fatal("workflow succeeded, want the superseded cleanup to end it")
+	}
+
+	_, complete, batches, failed, _ := stubs.snapshot()
+	if complete != 0 || len(batches) != 0 {
+		t.Errorf("complete and batch calls = %d and %d, want neither after the run was superseded", complete, len(batches))
+	}
+	if len(failed) != 0 {
+		t.Errorf("MarkFailed called with %q, want nothing marked for a superseded upload", failed)
 	}
 }
 
@@ -466,7 +602,7 @@ func TestIngestWorkflowCancelledAfterABatchFailureEndsWithoutMarkingFailed(t *te
 	defer close(stubs.batchesGate)
 
 	env.ExecuteWorkflow((&IngestWorkflow{ModelTaskQueue: testModelTaskQueue, EmbedBatchSize: 3}).Run,
-		"b1c2d3e4-0000-0000-0000-00000000000c")
+		"b1c2d3e4-0000-0000-0000-00000000000c", testUploadID)
 	err := env.GetWorkflowError()
 	if err == nil || !temporal.IsCanceledError(err) {
 		t.Fatalf("workflow error = %v, want a cancelled run even though one batch failed for real", err)

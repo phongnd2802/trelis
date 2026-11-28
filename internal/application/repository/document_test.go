@@ -65,7 +65,7 @@ func TestListReadableDocumentIDsReturnsOnlyCompletedReadableDocuments(t *testing
 	}
 }
 
-func TestListPendingDocumentIDsReturnsOnlyPendingDocuments(t *testing.T) {
+func TestListPendingDocumentsReturnsOnlyPendingDocumentsWithTheirUpload(t *testing.T) {
 	s, ids := seeded(t)
 	ctx := context.Background()
 	docs := NewDocumentRepository(s)
@@ -78,33 +78,116 @@ func TestListPendingDocumentIDsReturnsOnlyPendingDocuments(t *testing.T) {
 		}
 	}
 
-	got, err := docs.ListPendingDocumentIDs(ctx)
+	got, err := docs.ListPendingDocuments(ctx)
 	if err != nil {
-		t.Fatalf("ListPendingDocumentIDs: %v", err)
+		t.Fatalf("ListPendingDocuments: %v", err)
 	}
-	if want := []uuid.UUID{pending.ID}; !slices.Equal(got, want) {
-		t.Errorf("pending IDs = %v, want %v", got, want)
+	want := []types.PendingDocument{{
+		DocumentID: pending.ID,
+		UploadID:   pending.UploadID,
+	}}
+	if !slices.Equal(got, want) {
+		t.Errorf("pending documents = %+v, want %+v", got, want)
 	}
 }
 
-func TestListDocumentUploadIDsReturnsTheCurrentUploadOfEachDocument(t *testing.T) {
+func TestListDocumentUploadsReturnsTheCurrentUploadAndStatusOfEachDocument(t *testing.T) {
 	s, ids := seeded(t)
 	ctx := context.Background()
 	docs := NewDocumentRepository(s)
 	aliceDoc, bobDoc := document(t, s, ids["alice"]), document(t, s, ids["bob"])
+	if err := docs.SetParseStatus(ctx, bobDoc.ID, types.ParseStatusCompleted, ""); err != nil {
+		t.Fatalf("SetParseStatus: %v", err)
+	}
 
-	got, err := docs.ListDocumentUploadIDs(ctx, []uuid.UUID{aliceDoc.ID, bobDoc.ID, uuid.New()})
+	got, err := docs.ListDocumentUploads(ctx, []uuid.UUID{aliceDoc.ID, bobDoc.ID, uuid.New()})
 	if err != nil {
-		t.Fatalf("ListDocumentUploadIDs: %v", err)
+		t.Fatalf("ListDocumentUploads: %v", err)
 	}
-	want := map[uuid.UUID]uuid.UUID{aliceDoc.ID: aliceDoc.UploadID, bobDoc.ID: bobDoc.UploadID}
+	want := map[uuid.UUID]types.DocumentUpload{
+		aliceDoc.ID: {
+			DocumentID:  aliceDoc.ID,
+			UploadID:    aliceDoc.UploadID,
+			ParseStatus: types.ParseStatusPending,
+		},
+		bobDoc.ID: {
+			DocumentID:  bobDoc.ID,
+			UploadID:    bobDoc.UploadID,
+			ParseStatus: types.ParseStatusCompleted,
+		},
+	}
 	if !maps.Equal(got, want) {
-		t.Errorf("upload IDs = %v, want %v", got, want)
+		t.Errorf("uploads = %+v, want %+v", got, want)
 	}
 
-	got, err = docs.ListDocumentUploadIDs(ctx, nil)
+	got, err = docs.ListDocumentUploads(ctx, nil)
 	if err != nil || len(got) != 0 {
-		t.Errorf("ListDocumentUploadIDs(nil) = %v, %v; want an empty map and no error", got, err)
+		t.Errorf("ListDocumentUploads(nil) = %v, %v; want an empty map and no error", got, err)
+	}
+}
+
+func TestReplaceDocumentUploadAppliesOnlyWhileThePreviousUploadIsCurrent(t *testing.T) {
+	s, ids := seeded(t)
+	ctx := context.Background()
+	docs := NewDocumentRepository(s)
+	doc := document(t, s, ids["alice"])
+
+	updated := *doc
+	updated.UploadID = uuid.New()
+	updated.Title = "v2.txt"
+	updated.FileName = "v2.txt"
+	updated.FileType = "txt"
+	updated.FileSize = 2
+	updated.FileHash = uuid.NewString()
+	updated.ObjectKey = "documents/" + doc.ID.String() + "/" + updated.UploadID.String() + "/source"
+
+	got, err := docs.ReplaceDocumentUpload(ctx, &updated, doc.UploadID)
+	if err != nil {
+		t.Fatalf("ReplaceDocumentUpload: %v", err)
+	}
+	if got.UploadID != updated.UploadID || got.FileName != "v2.txt" || got.FileHash != updated.FileHash ||
+		got.ParseStatus != types.ParseStatusPending {
+		t.Errorf("replaced Document = %+v, want the new upload, file metadata and pending status", got)
+	}
+
+	// The old upload ID is no longer current, so a second replacement of the
+	// version the caller read finds no row.
+	stale := updated
+	stale.UploadID = uuid.New()
+	if _, err := docs.ReplaceDocumentUpload(ctx, &stale, doc.UploadID); !errors.Is(err, ErrUploadChanged) {
+		t.Errorf("ReplaceDocumentUpload with a stale previous upload = %v, want ErrUploadChanged", err)
+	}
+	if _, err := docs.ReplaceDocumentUpload(ctx, &stale, uuid.New()); !errors.Is(err, ErrUploadChanged) {
+		t.Errorf("ReplaceDocumentUpload with an unknown previous upload = %v, want ErrUploadChanged", err)
+	}
+
+	if _, err := docs.DeleteDocument(ctx, doc.ID); err != nil {
+		t.Fatalf("DeleteDocument: %v", err)
+	}
+	if _, err := docs.ReplaceDocumentUpload(ctx, &stale, doc.UploadID); !errors.Is(err, ErrDocumentNotFound) {
+		t.Errorf("ReplaceDocumentUpload of a deleted Document = %v, want ErrDocumentNotFound", err)
+	}
+}
+
+func TestGetAndLockDocumentUploadID(t *testing.T) {
+	s, ids := seeded(t)
+	ctx := context.Background()
+	docs := NewDocumentRepository(s)
+	doc := document(t, s, ids["alice"])
+
+	got, err := docs.GetDocumentUploadID(ctx, doc.ID)
+	if err != nil || got != doc.UploadID {
+		t.Errorf("GetDocumentUploadID = %s, %v; want %s", got, err, doc.UploadID)
+	}
+	got, err = docs.LockDocumentUploadID(ctx, doc.ID)
+	if err != nil || got != doc.UploadID {
+		t.Errorf("LockDocumentUploadID = %s, %v; want %s", got, err, doc.UploadID)
+	}
+	if _, err := docs.GetDocumentUploadID(ctx, uuid.New()); !errors.Is(err, ErrDocumentNotFound) {
+		t.Errorf("GetDocumentUploadID(unknown) = %v, want ErrDocumentNotFound", err)
+	}
+	if _, err := docs.LockDocumentUploadID(ctx, uuid.New()); !errors.Is(err, ErrDocumentNotFound) {
+		t.Errorf("LockDocumentUploadID(unknown) = %v, want ErrDocumentNotFound", err)
 	}
 }
 
@@ -145,8 +228,12 @@ func TestDeleteDocumentRemovesItsChunksParentChunksAndAccessList(t *testing.T) {
 	}
 
 	docs := NewDocumentRepository(s)
-	if err := docs.DeleteDocument(ctx, doc.ID); err != nil {
+	deletedUpload, err := docs.DeleteDocument(ctx, doc.ID)
+	if err != nil {
 		t.Fatalf("DeleteDocument: %v", err)
+	}
+	if deletedUpload != doc.UploadID {
+		t.Errorf("DeleteDocument returned upload %s, want the row's %s", deletedUpload, doc.UploadID)
 	}
 
 	if _, err := docs.GetDocumentByID(ctx, doc.ID); !errors.Is(err, ErrDocumentNotFound) {
@@ -161,7 +248,7 @@ func TestDeleteDocumentRemovesItsChunksParentChunksAndAccessList(t *testing.T) {
 			t.Errorf("%s holds %d rows for the deleted Document, want 0 by cascade", table, rows)
 		}
 	}
-	if err := docs.DeleteDocument(ctx, uuid.New()); !errors.Is(err, ErrDocumentNotFound) {
+	if _, err := docs.DeleteDocument(ctx, uuid.New()); !errors.Is(err, ErrDocumentNotFound) {
 		t.Errorf("DeleteDocument(unknown) = %v, want ErrDocumentNotFound", err)
 	}
 }

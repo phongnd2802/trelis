@@ -23,12 +23,14 @@ import (
 // methods are never called here, so the embedded interface can stay nil.
 type fakeIngestService struct {
 	interfaces.IngestService
-	result  types.ChunkingResult
-	attempt int
+	result   types.ChunkingResult
+	attempt  int
+	uploadID uuid.UUID
 }
 
-func (f *fakeIngestService) ParseAndChunk(_ context.Context, _ uuid.UUID, attempt int) (types.ChunkingResult, error) {
+func (f *fakeIngestService) ParseAndChunk(_ context.Context, _ uuid.UUID, uploadID uuid.UUID, attempt int) (types.ChunkingResult, error) {
 	f.attempt = attempt
+	f.uploadID = uploadID
 	return f.result, nil
 }
 
@@ -39,6 +41,7 @@ func TestParseAndChunkActivityLogsTheChunkingReport(t *testing.T) {
 	t.Cleanup(func() { zap.ReplaceGlobals(previous) })
 
 	documentID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000d1")
+	uploadID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000e1")
 	result := types.ChunkingResult{
 		Chunks:       7,
 		ParentChunks: 2,
@@ -56,7 +59,7 @@ func TestParseAndChunkActivityLogsTheChunkingReport(t *testing.T) {
 	suite := &testsuite.WorkflowTestSuite{}
 	env := suite.NewTestActivityEnvironment()
 	env.RegisterActivity(activity.ParseAndChunk)
-	val, err := env.ExecuteActivity(activity.ParseAndChunk, documentID.String())
+	val, err := env.ExecuteActivity(activity.ParseAndChunk, documentID.String(), uploadID.String())
 	if err != nil {
 		t.Fatalf("ParseAndChunk: %v", err)
 	}
@@ -69,6 +72,9 @@ func TestParseAndChunkActivityLogsTheChunkingReport(t *testing.T) {
 	}
 	if service.attempt != 1 {
 		t.Errorf("service got attempt %d, want the activity's first attempt 1", service.attempt)
+	}
+	if service.uploadID != uploadID {
+		t.Errorf("service got upload %s, want %s", service.uploadID, uploadID)
 	}
 
 	entries := logs.FilterMessage("ingest: Chunks stored").All()
@@ -95,11 +101,14 @@ func TestParseAndChunkActivityLogsTheChunkingReport(t *testing.T) {
 	if fmt.Sprint(fields["document"]) != documentID.String() {
 		t.Errorf("document = %v, want %s", fields["document"], documentID)
 	}
+	if fmt.Sprint(fields["upload"]) != uploadID.String() {
+		t.Errorf("upload = %v, want %s", fields["upload"], uploadID)
+	}
 	// The line carries IDs, counts and fixed validator reasons only. The
 	// activity never receives Chunk text, so no content field or value can
 	// appear; assert the shape rather than trusting the caller.
-	if len(fields) != len(want)+1 {
-		t.Errorf("log fields = %v, want document plus %d report fields", fields, len(want))
+	if len(fields) != len(want)+2 {
+		t.Errorf("log fields = %v, want document and upload plus %d report fields", fields, len(want))
 	}
 	if line := fmt.Sprint(entry); strings.Contains(line, "context_header") || strings.Contains(line, "content") {
 		t.Errorf("the Chunks stored line carries Chunk content: %s", line)

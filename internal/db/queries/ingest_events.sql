@@ -1,10 +1,11 @@
 -- Appends one Ingest Event to its Document's stream and returns it with the
--- per-Document seq and created_at Postgres assigned. The UPDATE advances the
--- Document's counter under its row lock, held until this transaction commits:
--- the next event of that Document cannot take a seq until this one has
--- committed, so seq order is commit order and a reader that resumes after a
--- seq never misses an event. Zero rows means the Document is gone; the
--- repository maps that to ErrDocumentNotFound.
+-- per-Document seq and created_at Postgres assigned, and the upload the
+-- event belongs to. The UPDATE advances the Document's counter under its row
+-- lock, held until this transaction commits: the next event of that Document
+-- cannot take a seq until this one has committed, so seq order is commit
+-- order and a reader that resumes after a seq never misses an event. Zero
+-- rows means the Document is gone; the repository maps that to
+-- ErrDocumentNotFound.
 --
 -- A caller inside a transaction inserts the event first: the UPDATE locks the
 -- Document row before the transaction touches any Chunk rows, the same order
@@ -17,8 +18,8 @@ WITH next AS (
     WHERE id = sqlc.arg(document_id)
     RETURNING ingest_event_seq
 )
-INSERT INTO ingest_events (document_id, seq, type, detail)
-SELECT sqlc.arg(document_id), next.ingest_event_seq, sqlc.arg(type), sqlc.arg(detail)
+INSERT INTO ingest_events (document_id, seq, type, detail, upload_id)
+SELECT sqlc.arg(document_id), next.ingest_event_seq, sqlc.arg(type), sqlc.arg(detail), sqlc.arg(upload_id)
 FROM next
 RETURNING *;
 

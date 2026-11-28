@@ -82,19 +82,36 @@ func (tr *trelis) waitForObjectsGone(t *testing.T, documentID string) {
 	}
 }
 
-// waitForIngestCanceled polls Temporal until the Document's ingest workflow
-// (workflow ID = Document ID) is CANCELED.
-func waitForIngestCanceled(t *testing.T, documentID string) {
+// documentUploadID reads the Document's current upload ID from Postgres. A
+// test needs it to name the Document's ingest workflow.
+func (tr *trelis) documentUploadID(t *testing.T, documentID string) string {
+	t.Helper()
+	var uploadID string
+	if err := tr.pgConn(t).QueryRow(context.Background(),
+		"SELECT upload_id FROM documents WHERE id = $1", documentID).Scan(&uploadID); err != nil {
+		t.Fatalf("read upload of Document %s: %v", documentID, err)
+	}
+	return uploadID
+}
+
+// ingestWorkflowID is the ID of the ingest workflow for one upload.
+func ingestWorkflowID(documentID, uploadID string) string {
+	return "ingest/" + documentID + "/" + uploadID
+}
+
+// waitForIngestStatus polls Temporal until the upload's ingest workflow has
+// status.
+func waitForIngestStatus(t *testing.T, documentID, uploadID string, want enumspb.WorkflowExecutionStatus) {
 	t.Helper()
 	c := temporalClient(t)
 	const timeout = 30 * time.Second
 	deadline := time.Now().Add(timeout)
 	var last string
 	for {
-		desc, err := c.DescribeWorkflow(context.Background(), documentID, "")
+		desc, err := c.DescribeWorkflow(context.Background(), ingestWorkflowID(documentID, uploadID), "")
 		if err == nil {
 			status := desc.Status
-			if status == enumspb.WORKFLOW_EXECUTION_STATUS_CANCELED {
+			if status == want {
 				return
 			}
 			last = status.String()
@@ -102,7 +119,8 @@ func waitForIngestCanceled(t *testing.T, documentID string) {
 			last = err.Error()
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("ingest workflow %s is %s after %v, want CANCELED", documentID, last, timeout)
+			t.Fatalf("ingest workflow of Document %s upload %s is %s after %v, want %s",
+				documentID, uploadID, last, timeout, want)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -162,6 +180,7 @@ func TestDeletingADocumentMidIngestCancelsItAndStaysGone(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
+	uploadID := tr.documentUploadID(t, id)
 	resp := tr.deleteDocument(t, alice, id)
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("DELETE mid-ingest = %d, want 204", resp.StatusCode)
@@ -173,7 +192,7 @@ func TestDeletingADocumentMidIngestCancelsItAndStaysGone(t *testing.T) {
 		t.Errorf("Chunks after the delete = %q, want none", chunks)
 	}
 	tr.waitForObjectsGone(t, id)
-	waitForIngestCanceled(t, id)
+	waitForIngestStatus(t, id, uploadID, enumspb.WORKFLOW_EXECUTION_STATUS_CANCELED)
 }
 
 func TestAReaderWhoIsNotTheOwnerCannotDelete(t *testing.T) {

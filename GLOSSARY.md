@@ -14,6 +14,10 @@ _Avoid_: Knowledge, file (when meaning the ingested unit)
 The bytes a Principal uploaded for a Document, kept exactly as uploaded.
 _Avoid_: Original, raw file, attachment
 
+**Upload**:
+One copy of a Document's Source File, written under its own upload ID; re-uploading replaces the Document's previous Upload.
+_Avoid_: Version (when meaning the upload), revision
+
 **Figure**:
 An image inside a Document (a photo, chart or scanned table), taken out when the Document is parsed; readable only by a Principal who can read that Document.
 _Avoid_: Media, image (in prose), picture, asset

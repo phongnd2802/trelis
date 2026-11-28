@@ -23,6 +23,7 @@ func NewWorker(c client.Client, taskQueue, modelTaskQueue string, embedBatchSize
 	w.RegisterActivityWithOptions(activities.ParseAndChunk, activity.RegisterOptions{Name: ParseAndChunkActivity})
 	w.RegisterActivityWithOptions(activities.Complete, activity.RegisterOptions{Name: CompleteActivity})
 	w.RegisterActivityWithOptions(activities.MarkFailed, activity.RegisterOptions{Name: MarkFailedActivity})
+	w.RegisterActivityWithOptions(activities.DeleteSupersededUploads, activity.RegisterOptions{Name: DeleteSupersededUploadsActivity})
 	w.RegisterActivityWithOptions(activities.DeleteObjects, activity.RegisterOptions{Name: DeleteObjectsActivity})
 	return w
 }

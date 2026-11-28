@@ -10,6 +10,12 @@ import (
 
 // ChunkRepository persists the Chunks of a Document.
 type ChunkRepository interface {
+	// DeleteChunks removes every Chunk and Parent Chunk of documentID, deleting
+	// the Chunks first because they carry the Parent Chunk links. It starts no
+	// transaction: the caller runs it in one with the Document update. It is
+	// idempotent.
+	DeleteChunks(ctx context.Context, documentID uuid.UUID) error
+
 	// ReplaceChunks deletes every Parent Chunk and Chunk of documentID and
 	// inserts set's Parent Chunks in Seq order, then its Chunks with their
 	// Parent Chunk links. It deletes the Chunks before the Parent Chunks;

@@ -23,11 +23,17 @@ const (
 	// Detail is an EmbedBatchFinishedDetail.
 	IngestEventEmbedBatchFinished = "embed_batch_finished"
 	// IngestEventCompleted means the Document is completed. Detail is empty,
-	// and no event follows it on the stream.
+	// and no event of that upload follows it on the stream. After a re-upload,
+	// upload_replaced and the new upload's events do.
 	IngestEventCompleted = "completed"
 	// IngestEventFailed means the Document is failed. Detail is a
-	// FailedDetail, and no event follows it on the stream.
+	// FailedDetail, and no event of that upload follows it on the stream.
 	IngestEventFailed = "failed"
+	// IngestEventUploadReplaced means a re-upload replaced the Document's
+	// Source File and upload. Detail is an UploadReplacedDetail. It is not
+	// terminal: the new upload's events follow it, and a stream that saw an
+	// older upload's terminal event keeps going until the current upload's.
+	IngestEventUploadReplaced = "upload_replaced"
 )
 
 // IngestEvent is one step of a Document's ingest, recorded in Postgres so a
@@ -43,6 +49,10 @@ type IngestEvent struct {
 	Seq int64 `json:"-"`
 	// DocumentID is the Document whose ingest the event belongs to.
 	DocumentID uuid.UUID `json:"document_id"`
+	// UploadID is the upload the event belongs to. A re-upload starts a new
+	// one, so a stream can tell an older upload's terminal event from the
+	// current upload's.
+	UploadID uuid.UUID `json:"upload_id"`
 	// Type is one of the IngestEvent* constants.
 	Type string `json:"type"`
 	// Detail is the JSON object type describes.
@@ -80,8 +90,22 @@ type FailedDetail struct {
 	Reason string `json:"reason"`
 }
 
-// IsTerminal reports whether the event ends its Document's stream: completed
-// or failed. The stream writes no event after a terminal one.
+// UploadReplacedDetail is the detail of an IngestEventUploadReplaced event.
+type UploadReplacedDetail struct {
+	// UploadID is the new upload the Document now points at.
+	UploadID uuid.UUID `json:"upload_id"`
+}
+
+// IsTerminal reports whether the event would end a stream of its own upload:
+// completed or failed. An older upload's terminal event is followed by an
+// upload_replaced event when the Document is re-uploaded.
 func (e IngestEvent) IsTerminal() bool {
 	return e.Type == IngestEventCompleted || e.Type == IngestEventFailed
+}
+
+// IsTerminalFor reports whether the event ends the stream of a Document whose
+// current upload is uploadID. A terminal event of an older upload does not:
+// the new upload's events follow it.
+func (e IngestEvent) IsTerminalFor(uploadID uuid.UUID) bool {
+	return e.UploadID == uploadID && e.IsTerminal()
 }

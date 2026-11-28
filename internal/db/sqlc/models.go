@@ -90,6 +90,8 @@ type IngestEvent struct {
 	// Event detail carrying IDs and counts only, never Document content, file names or raw errors
 	Detail    []byte
 	CreatedAt time.Time
+	// Upload the event belongs to; the SSE stream ends only at a terminal event of the Document's current upload
+	UploadID uuid.UUID
 }
 
 type ParentChunk struct {

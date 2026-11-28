@@ -34,6 +34,7 @@ func (r *ingestEventRepository) InsertIngestEvent(ctx context.Context, event *ty
 		DocumentID: event.DocumentID,
 		Type:       event.Type,
 		Detail:     event.Detail,
+		UploadID:   event.UploadID,
 	})
 	if errors.Is(err, db.ErrNotFound) {
 		return nil, ErrDocumentNotFound
@@ -64,6 +65,7 @@ func fromIngestEventRow(row sqlc.IngestEvent) *types.IngestEvent {
 	return &types.IngestEvent{
 		Seq:        row.Seq,
 		DocumentID: row.DocumentID,
+		UploadID:   row.UploadID,
 		Type:       row.Type,
 		Detail:     json.RawMessage(row.Detail),
 		CreatedAt:  row.CreatedAt,

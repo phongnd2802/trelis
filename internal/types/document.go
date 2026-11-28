@@ -59,6 +59,22 @@ type Document struct {
 	AccessList *AccessList `json:"access_list,omitempty"`
 }
 
+// PendingDocument names one upload of a Document whose parse status is
+// pending, so the reconciler can submit its ingest start.
+type PendingDocument struct {
+	DocumentID uuid.UUID
+	UploadID   uuid.UUID
+}
+
+// DocumentUpload is a Document's current upload and its parse status. The
+// reconciler uses it to decide whether a replaced upload's objects can be
+// removed yet.
+type DocumentUpload struct {
+	DocumentID  uuid.UUID
+	UploadID    uuid.UUID
+	ParseStatus string
+}
+
 // AccessList names the Principals and Groups allowed to read a Document.
 type AccessList struct {
 	Principals []string `json:"principals"`

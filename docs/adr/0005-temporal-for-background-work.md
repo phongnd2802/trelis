@@ -10,7 +10,7 @@ Ingest (parse, OCR fallback, chunk, embed, per-Chunk extraction fan-out, Entity 
 
 ## Consequences
 
-- Starting a workflow is not part of the Postgres transaction. The workflow ID is the Document ID, so a start can be retried safely, and a reconciler restarts the workflow for any Document left pending without one.
+- Starting a workflow is not part of the Postgres transaction. The workflow ID carries the Document ID and its upload ID (`ingest/{document_id}/{upload_id}`), so a start can be retried safely and a re-upload runs under its own upload ID instead of joining the old one; a reconciler restarts the workflow for any Document left pending without one.
 - Workflow code must be deterministic. All I/O happens in activities, and changing a running workflow's logic needs versioning.
 - Workflows pass IDs, never Document or Chunk content (payload size limits). Large Documents fan out through child workflows in batches to stay within history limits.
 - Agent turns are not workflows, because tokens must stream over SSE with low latency. Tool Approvals are stored in Postgres. Running the agent on Temporal is a tier-3 option.

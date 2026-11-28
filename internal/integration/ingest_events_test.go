@@ -20,9 +20,10 @@ import (
 
 // streamedIngestEvent is one event frame read from an ingest event stream.
 type streamedIngestEvent struct {
-	Seq    int64
-	Type   string
-	Detail json.RawMessage
+	Seq      int64
+	Type     string
+	UploadID string
+	Detail   json.RawMessage
 }
 
 // ingestEventStream is one open SSE response and its scanner.
@@ -96,16 +97,18 @@ func (s *ingestEventStream) next(t *testing.T) (streamedIngestEvent, bool) {
 			}
 			var payload struct {
 				DocumentID string          `json:"document_id"`
+				UploadID   string          `json:"upload_id"`
 				Type       string          `json:"type"`
 				Detail     json.RawMessage `json:"detail"`
 			}
 			if err := json.Unmarshal(data, &payload); err != nil {
 				t.Fatalf("event %q data %s is not JSON: %v", frame.Type, data, err)
 			}
-			if payload.DocumentID != s.documentID || payload.Type != frame.Type {
-				t.Errorf("event %q data = document %q type %q, want %q and %q",
-					frame.Type, payload.DocumentID, payload.Type, s.documentID, frame.Type)
+			if payload.DocumentID != s.documentID || payload.Type != frame.Type || payload.UploadID == "" {
+				t.Errorf("event %q data = document %q upload %q type %q, want %q, an upload and %q",
+					frame.Type, payload.DocumentID, payload.UploadID, payload.Type, s.documentID, frame.Type)
 			}
+			frame.UploadID = payload.UploadID
 			frame.Detail = payload.Detail
 			return frame, true
 		case strings.HasPrefix(line, ":"):
