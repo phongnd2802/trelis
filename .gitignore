@@ -38,6 +38,7 @@ go.work.sum
 /.claude/settings.local.json
 .agents/skills/
 .qwen/skills/
+/skills-lock.json
 
 # Eval harness (eval/, external Python per ADR-0001)
 /eval/data/

@@ -395,3 +395,8 @@ cd eval && uv run pytest
 or `make eval-test` from the repository root. Tests use hand-written fixtures
 in `tests/fixtures/` and `httpx.MockTransport`; they need no running Trelis and
 never download the real dataset.
+
+`tests/golden/` holds the committed Markdown and HTML report of
+`eval/baselines/`, so any change to the report output shows up in the PR diff.
+When a change is intended, rewrite them with
+`TRELIS_EVAL_UPDATE_GOLDEN=1 make eval-test` and commit the result.
