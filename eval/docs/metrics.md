@@ -82,6 +82,16 @@ the nearest-rank definition: sort the latencies and take rank
 mean and both latencies are `null`, not `0`, so "nothing measured" is not
 mistaken for a score of zero.
 
+An answer run's summary also records, per Grader, the mean over the `ok`
+grades and the counts of `ok` and `grader_error`. A Grader with no `ok` grade
+has a `null` mean and keeps its counts. The mean never includes a
+`grader_error` or a question that errored.
+
+`scored` counts every answered question. In an answer run it includes a
+question with no evidence, whose `metrics` is `null` because there is nothing
+to compute retrieval metrics against, so `scored` can exceed the number of
+observations behind the retrieval metric means.
+
 Latency is measured under the run's `concurrency` (how many questions were in
 flight at once, recorded in the header): requests that share Trelis and the
 model provider wait on each other, so compare latencies only between runs at
@@ -91,13 +101,14 @@ the same concurrency. The metrics do not depend on it.
 
 The Ablation Matrix report gives every metric mean and both latency
 percentiles a 95% confidence interval. The interval is a percentile bootstrap
-over the questions that were scored:
+over the observations that estimate uses:
 
-- each resample draws the scored questions with replacement at the same size
-  as the scored set; a metric's per-question value is one observation, and the
-  latency percentiles use the per-call `latency_ms` of the same questions;
+- each resample draws its observations with replacement at the same size: the
+  scored questions for a retrieval metric, the `ok` Grades for a Grader, and
+  the scored questions' per-call `latency_ms` for latency;
 - the statistic is computed on every resample: the mean for Recall@5,
-  Recall@10, MRR and nDCG@10, and the nearest-rank percentile for latency;
+  Recall@10, MRR, nDCG@10 and each Grader, and the nearest-rank percentile for
+  latency;
 - the resample statistics are sorted, and the bounds are the values at rank
   `ceil(q * resamples)` (1-based, at least 1) for `q = 0.025` and
   `q = 0.975`, computed with exact integer arithmetic. The tail is rounded
@@ -113,6 +124,62 @@ The bootstrap is seeded, and each (row, metric) draws from its own
 reordering rows leaves another row's interval unchanged. The same results
 files and seed give byte-identical Markdown and HTML. The interval describes
 the sampled Golden questions, not a rerun of the same questions.
+
+## Graders
+
+A **Grader** scores one answer on one aspect. Every Grader returns a `Grade`
+with a score, a rationale and a status:
+
+- `ok` — the Grader scored the answer; `score` is a number.
+- `grader_error` — the Grader could not score it; `score` is `null`, and the
+  rationale says why: a judge HTTP error, a timeout, a reply that is not the
+  expected JSON, or an answer with nothing to compare against.
+
+A `grader_error` is excluded from the Grader's mean and counted. It is never
+recorded as `0.0`: a judge that could not answer must not look like a wrong
+answer. This is the same rule as a question-level Trelis error, and the two are
+different. A Trelis error means the answer was never produced (`status:
+"error"`, with the request's message); a `grader_error` means an answer exists
+but one check could not score it.
+
+The registry maps a name to a Grader. `trelis-eval answer run --graders` takes
+a comma list and defaults to every registered Grader; an unknown name fails
+before any request and lists the known names. `eval/src/trelis_eval/graders.py`
+holds the registry and the first Grader.
+
+A judge call is retried up to three attempts on a 429, a 5xx or a transport
+failure, with exponential backoff and jitter. A `Retry-After` of up to a
+minute is honoured, a longer one stops the retries, and any other 4xx or a
+2xx reply that cannot be read is not retried. A failure that outlasts the
+attempts is still a `grader_error`.
+
+### Correctness
+
+`correctness` compares the answer with the expected answer. It first
+normalizes both texts: NFKC, casefold, source markers such as `[1]` removed,
+punctuation turned into spaces, then whitespace collapsed and stripped. If the
+normalized texts are equal, the score is `1.0` with rationale `normalized
+match`, and the judge is not called.
+
+Otherwise a judge model compares the answer with the expected answer and
+replies with JSON only: `{"correct": true|false, "rationale": "..."}`. A reply
+wrapped in a Markdown JSON code fence is accepted; anything else is a
+`grader_error`, as is a JSON object with the wrong shape. `true` scores `1.0`
+and `false` scores `0.0`; the judge's rationale is kept.
+
+An empty expected answer (empty, or only whitespace) is a `grader_error` with
+rationale `no expected answer`, and the judge is not called.
+
+The judge is configured separately from the answer generator. The harness reads
+`TRELIS_EVAL_JUDGE_BASE_URL`, `TRELIS_EVAL_JUDGE_MODEL` and
+`TRELIS_EVAL_JUDGE_API_KEY`; `--judge-base-url` and `--judge-model` override the
+first two, and the key is never a flag. The run header records the judge model.
+The judge is an OpenAI-compatible Chat Completions call with `temperature: 0`,
+made from the harness rather than Trelis, so the generator's `models.chat` and
+the judge cannot be confused. The harness cannot check that the two are
+different models, because Trelis does not expose its generator model; choosing
+a different one is the operator's job. In CI the judge is one more
+record/replay proxy role.
 
 ## The Ablation Matrix report
 
@@ -130,9 +197,17 @@ request and no API key. Nothing in the report depends on the wall clock, so
 the same files and seed reproduce it byte for byte.
 
 The matrix has one row per Retrieval Config: Recall@5, Recall@10, MRR,
-nDCG@10, latency p50 and p95, each as `point [low, high]`, then the scored,
-skipped and error counts and the run's `concurrency`. The header records the
-Golden Set path and SHA-256, its question count, `top_k`, the seed, the
+nDCG@10, one column per Grader present in the report, latency p50 and p95,
+each as `point [low, high]`, then the scored, skipped and error counts and the
+run's `concurrency`. The Grader columns are the names in the report's answer
+runs, in registry order, with unknown names sorted after them; each column
+uses the Grader's label. A Grader cell is the mean over its `ok` scores with
+the same seeded bootstrap interval, followed by its `grader_error` count:
+`0.720 [0.660, 0.780] · 3 errors` (`1 error` singular). A row that lacks that
+Grader, and a retrieval row, shows `—`; an answer row with the Grader but no
+`ok` grade shows `n/a` plus the count. A report of retrieval runs alone has no
+Grader columns. Both kinds can appear in one report, and the header records
+the Golden Set path and SHA-256, its question count, `top_k`, the seed, the
 resample count and the confidence level; a second table records each row's
 `run_id` and harness version.
 
@@ -145,16 +220,24 @@ only at the same one.
 
 ## Questions that are not scored
 
-A `null_query` has no evidence: its expected answer is "insufficient
-information", and there is no Document whose retrieval would be right or
-wrong. Such a question is recorded as `skipped`: no request is made, no metric
-is computed, and it is excluded from the means but counted in the summary.
+In a retrieval run, a `null_query` has no evidence: its expected answer is
+"insufficient information", and there is no Document whose retrieval would be
+right or wrong. Such a question is recorded as `skipped`: no request is made,
+no metric is computed, and it is excluded from the means but counted in the
+summary.
+
+An answer run asks every question, including a `null_query`, and grades its
+answer, because "insufficient information" is a real answer to score. A
+scored answer with no evidence has `metrics: null` (there is nothing to
+compute retrieval metrics against) and still contributes to the correctness
+mean; a retrieval run never has a scored question without metrics. `skipped`
+therefore stays `0` in an answer run.
 
 A **400 or 503** answer stops that Ablation Run at once: the config is
 rejected (an unimplemented Retrieval Technique or a missing embedding role),
 so the run is not valid. No results file is written, the command prints
 `config <name>: aborted: <message>`, continues with the next config and exits
-1 at the end.
+1 at the end. This applies to retrieval and answer runs alike.
 
 **10 question errors in a row** also stop that config's Ablation Run, because
 the requests are failing rather than the questions: the provider is refusing
@@ -174,28 +257,29 @@ these: Trelis answers it when a model provider rejects the call
 names the model role rather than the provider's body. One such error is a
 question error like any other; repeated, it trips the consecutive rule above
 and aborts that config's Ablation Run. The run continues otherwise, the
-question is excluded from the means, and it is counted in the summary. This is
-the "grader errors are excluded and counted" rule: a broken question never
-silently becomes a zero.
+question is excluded from the means, and it is counted in the summary. A
+Grader's own failure follows the same rule inside that Grader: excluded from
+its mean and counted, never scored as zero.
 
 Two problems stop a run before any request:
 
-- evidence with no completed record in the ingest manifest, because recall
-  would silently drop below the labels;
+- evidence with no completed record in the ingest manifest, because the
+  retrieval metrics would silently drop below the labels;
 - a Golden question with a `principal`, because per-Principal runs need the
   adversarial access set (issue #55); a run currently acts as the one Principal
   whose API key it uses.
 
-The `trelis-eval retrieval run` command exits 1 when any Retrieval Config
-aborted or scored zero questions. Question errors alone do not change the exit
+The `trelis-eval retrieval run` and `trelis-eval answer run` commands exit 1
+when any Retrieval Config aborted or scored zero questions. Question errors
+alone do not change the exit
 code, but they are visible in the summary line (including the first recorded
 error message) and the results file.
 
-## JSONL schema, version 1
+## JSONL schema, version 2
 
 One Ablation Run writes one file at
 `<out-dir>/<run-id>/<config-name>.jsonl`. Every line is one JSON object, no
-blank lines, and every line carries `"schema_version": 1` and a `"type"`:
+blank lines, and every line carries `"schema_version": 2` and a `"type"`:
 
 1. one `run` header;
 2. one `question` per Golden question, in Golden Set order;
@@ -203,49 +287,83 @@ blank lines, and every line carries `"schema_version": 1` and a `"type"`:
 
 `trelis-eval` writes the file and `load_ablation_run` reads it. The reader
 validates the schema version, the record types and their order, and the field
-types, so a later ticket can build reports on the file without guessing.
+types, so a later ticket can build reports on the file without guessing. A
+version-1 file has no `kind`, `judge_model`, `graders`, answer fields or
+summary `grades`; the reader loads it as a retrieval run. The four files in
+`eval/baselines/` are version 1, and `trelis-eval report` keeps reading them.
 
 The header carries the SHA-256 of the Golden Set and manifest so a results
-file can be tied to the exact inputs. `config.name` is the `+`-joined
-techniques in sorted order, and the reader rejects a name that is not that
-canonical join. It never carries an API key, and a question line never carries
-Chunk `content` or `context_header`: results files are versioned and shared,
-while text can be re-read from Trelis. The `evidence` list is de-duplicated
+file can be tied to the exact inputs. `kind` is `retrieval` for a file written
+by `retrieval run` and `answer` for one written by `answer run`. An answer
+header also records the judge model (null when no judge-based Grader ran) and
+the Grader names. `config.name` is the `+`-joined techniques in sorted order,
+and the reader rejects a name that is not that canonical join. No file carries
+an API key or the judge's key, and a question line never carries Chunk
+`content` or `context_header`: results files are versioned and shared, while
+text can be re-read from Trelis. The `evidence` list is de-duplicated
 `source_id` values; `retrieved` follows the API's result order. Each scored
-question keeps the `POST /retrieve` `trace`, so latency can be attributed per
-Retrieval Technique and model without a schema change.
+question keeps the API's `trace`, so latency can be attributed per Retrieval
+Technique and model without a schema change.
 
 ### `run`
 
+A retrieval run:
+
 ```json
-{"schema_version": 1, "type": "run", "run_id": "20260101T000000Z", "config": {"name": "dense", "techniques": ["dense"]}, "top_k": 10, "concurrency": 1, "golden_set": {"path": "eval/data/multihop-rag/subset-golden.jsonl", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "questions": 500}, "manifest": {"path": "eval/data/multihop-rag/manifest.jsonl", "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}, "base_url": "http://localhost:8080", "harness_version": "0.1.0", "started_at": "2026-01-01T00:00:00+00:00"}
+{"schema_version": 2, "type": "run", "kind": "retrieval", "run_id": "20260101T000000Z", "config": {"name": "dense", "techniques": ["dense"]}, "top_k": 10, "concurrency": 1, "golden_set": {"path": "eval/data/multihop-rag/subset-golden.jsonl", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "questions": 500}, "manifest": {"path": "eval/data/multihop-rag/manifest.jsonl", "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}, "base_url": "http://localhost:8080", "harness_version": "0.1.0", "started_at": "2026-01-01T00:00:00+00:00"}
 ```
 
-### `question` — scored
+An answer run adds `judge_model` and `graders`:
 
 ```json
-{"schema_version": 1, "type": "question", "id": "mhr-0000", "slices": ["comparison_query", "hops-2"], "status": "scored", "evidence": ["https://example.com/alpha", "https://example.com/beta"], "retrieved": [{"chunk_id": "11111111-1111-1111-1111-111111111111", "document_id": "22222222-2222-2222-2222-222222222222", "source_id": "https://example.com/alpha", "score": 0.82, "scores": {"dense": 0.82}}, {"chunk_id": "33333333-3333-3333-3333-333333333333", "document_id": "44444444-4444-4444-4444-444444444444", "source_id": null, "score": 0.77, "scores": {"dense": 0.77}}, {"chunk_id": "55555555-5555-5555-5555-555555555555", "document_id": "66666666-6666-6666-6666-666666666666", "source_id": "https://example.com/beta", "score": 0.71, "scores": {"dense": 0.71}}], "trace": [{"step": "embed_query", "technique": "dense", "duration_ms": 3, "model": "text-embedding-3-small"}, {"step": "search", "technique": "dense", "duration_ms": 6, "candidates": 3}], "metrics": {"recall@5": 1.0, "recall@10": 1.0, "mrr": 1.0, "ndcg@10": 0.9197207891481876}, "latency_ms": 12.4}
+{"schema_version": 2, "type": "run", "kind": "answer", "run_id": "20260101T000000Z", "config": {"name": "dense", "techniques": ["dense"]}, "top_k": 10, "concurrency": 1, "golden_set": {"path": "eval/data/multihop-rag/subset-golden.jsonl", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "questions": 500}, "manifest": {"path": "eval/data/multihop-rag/manifest.jsonl", "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}, "base_url": "http://localhost:8080", "harness_version": "0.1.0", "started_at": "2026-01-01T00:00:00+00:00", "judge_model": "judge-model", "graders": ["correctness"]}
+```
+
+### `question` — retrieval, scored
+
+```json
+{"schema_version": 2, "type": "question", "id": "mhr-0000", "slices": ["comparison_query", "hops-2"], "status": "scored", "evidence": ["https://example.com/alpha", "https://example.com/beta"], "retrieved": [{"chunk_id": "11111111-1111-1111-1111-111111111111", "document_id": "22222222-2222-2222-2222-222222222222", "source_id": "https://example.com/alpha", "score": 0.82, "scores": {"dense": 0.82}}, {"chunk_id": "33333333-3333-3333-3333-333333333333", "document_id": "44444444-4444-4444-4444-444444444444", "source_id": null, "score": 0.77, "scores": {"dense": 0.77}}, {"chunk_id": "55555555-5555-5555-5555-555555555555", "document_id": "66666666-6666-6666-6666-666666666666", "source_id": "https://example.com/beta", "score": 0.71, "scores": {"dense": 0.71}}], "trace": [{"step": "embed_query", "technique": "dense", "duration_ms": 3, "model": "text-embedding-3-small"}, {"step": "search", "technique": "dense", "duration_ms": 6, "candidates": 3}], "metrics": {"recall@5": 1.0, "recall@10": 1.0, "mrr": 1.0, "ndcg@10": 0.9197207891481876}, "latency_ms": 12.4}
 ```
 
 The unmapped Chunk at rank 2 stays in the ranked list as `null` and occupies a
 rank, but it is never relevant. The two evidence Documents at ranks 1 and 3
 give nDCG@10 = `(1/log2(2) + 1/log2(4)) / (1/log2(2) + 1/log2(3))`.
 
+### `question` — answer, scored
+
+```json
+{"schema_version": 2, "type": "question", "id": "mhr-0000", "slices": ["comparison_query", "hops-2"], "status": "scored", "evidence": ["https://example.com/alpha"], "retrieved": [{"chunk_id": "11111111-1111-1111-1111-111111111111", "document_id": "22222222-2222-2222-2222-222222222222", "source_id": "https://example.com/alpha", "score": 0.82, "scores": {"dense": 0.82}}], "trace": [{"step": "embed_query", "technique": "dense", "duration_ms": 3, "model": "text-embedding-3-small"}, {"step": "search", "technique": "dense", "duration_ms": 6, "candidates": 1}, {"step": "generate", "technique": null, "duration_ms": 900, "model": "chat-model"}], "metrics": {"recall@5": 1.0, "recall@10": 1.0, "mrr": 1.0, "ndcg@10": 1.0}, "latency_ms": 1004.2, "answer": "The Alpha Mission launched in 2024 [1].", "citations": [{"marker": 1, "chunk_id": "11111111-1111-1111-1111-111111111111", "document_id": "22222222-2222-2222-2222-222222222222"}], "finish_reason": "stop", "usage": {"prompt_tokens": 1200, "completion_tokens": 40, "total_tokens": 1240}, "grades": {"correctness": {"score": 1.0, "rationale": "normalized match", "status": "ok"}}}
+```
+
+A `grader_error` entry carries `"score": null`, the reason in `rationale` and
+`"status": "grader_error"`. A scored answer with no evidence has `"metrics":
+null` and still carries its answer and grades.
+
 ### `question` — skipped and error
 
 ```json
-{"schema_version": 1, "type": "question", "id": "mhr-0002", "slices": ["null_query", "hops-0"], "status": "skipped", "evidence": [], "retrieved": [], "trace": [], "metrics": null, "latency_ms": 0.0}
+{"schema_version": 2, "type": "question", "id": "mhr-0002", "slices": ["null_query", "hops-0"], "status": "skipped", "evidence": [], "retrieved": [], "trace": [], "metrics": null, "latency_ms": 0.0}
 ```
 
 ```json
-{"schema_version": 1, "type": "question", "id": "mhr-0003", "slices": ["temporal_query", "hops-1"], "status": "error", "evidence": ["https://example.com/delta"], "retrieved": [], "trace": [], "metrics": null, "latency_ms": 5.2, "error": "HTTP 500 (code 1000): internal server error"}
+{"schema_version": 2, "type": "question", "id": "mhr-0003", "slices": ["temporal_query", "hops-1"], "status": "error", "evidence": ["https://example.com/delta"], "retrieved": [], "trace": [], "metrics": null, "latency_ms": 5.2, "error": "HTTP 500 (code 1000): internal server error"}
 ```
 
-`metrics` is an object only for `scored`; `error` appears only on `error`;
-`trace` is empty on `skipped` and `error`.
+`metrics` is an object for a scored retrieval question, and may be `null` for
+a scored answer question with no evidence. `error` appears only on `error`;
+`trace` is empty on `skipped` and `error`. An answer file's skipped and error
+records also carry `"answer": null`, `"citations": []`,
+`"finish_reason": null`, `"usage": null` and `"grades": {}`; only a scored
+answer has values there. A retrieval file's question records carry none of
+those five fields.
 
 ### `summary`
 
 ```json
-{"schema_version": 1, "type": "summary", "metrics": {"recall@5": 0.9975, "recall@10": 1.0, "mrr": 0.9932, "ndcg@10": 0.9411}, "counts": {"scored": 497, "skipped": 3, "error": 0}, "latency_ms": {"p50": 11.8, "p95": 34.2}, "finished_at": "2026-01-01T00:10:00+00:00"}
+{"schema_version": 2, "type": "summary", "metrics": {"recall@5": 0.9975, "recall@10": 1.0, "mrr": 0.9932, "ndcg@10": 0.9411}, "counts": {"scored": 497, "skipped": 3, "error": 0}, "latency_ms": {"p50": 11.8, "p95": 34.2}, "grades": {"correctness": {"mean": 0.72, "ok": 8, "grader_error": 1}}, "finished_at": "2026-01-01T00:10:00+00:00"}
 ```
+
+A retrieval run omits `grades` entirely; the reader rejects it there, just as
+it rejects answer-only fields in a retrieval header or question. An answer run
+writes one entry per Grader it ran: the mean over the `ok` scores (`null` when
+there is none) and the `ok` and `grader_error` counts.

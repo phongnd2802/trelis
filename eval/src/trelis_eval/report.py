@@ -1,11 +1,12 @@
 """The Ablation Matrix report: bootstrap confidence intervals over results files.
 
 The report is built from Ablation Run results files alone. Every Retrieval
-Config gets a row with the four metric means and the two latency percentiles,
-each with a seeded percentile-bootstrap confidence interval, plus the counts
-and the run's concurrency. The same files and seed render byte-identical
-Markdown and HTML: no wall-clock time, no machine paths and no randomness
-outside the seeded RNG. ``eval/docs/metrics.md`` holds the definitions.
+Config gets a row with the four metric means, one column per Grader in the
+report, and the two latency percentiles, each with a seeded percentile-bootstrap
+confidence interval, plus the counts and the run's concurrency. The same files
+and seed render byte-identical Markdown and HTML: no wall-clock time, no
+machine paths and no randomness outside the seeded RNG.
+``eval/docs/metrics.md`` holds the definitions.
 """
 
 from __future__ import annotations
@@ -24,10 +25,14 @@ from .ablation_run import (
     NDCG_10,
     RECALL_5,
     RECALL_10,
+    AblationRun,
     AblationRunFile,
     GoldenSetRef,
     QuestionStatus,
+    RunKind,
+    grade_outcomes,
 )
+from .graders import default_grader_names, grader_label
 from .metrics import mean, nearest_rank_percentile
 
 LATENCY_P50 = "latency_p50"
@@ -58,9 +63,12 @@ class MatrixRow:
     run_id: str
     harness_version: str
     concurrency: int
+    kind: RunKind
     scored: int
     skipped: int
     error: int
+    graders: frozenset[str]
+    grader_errors: dict[str, int]
     estimates: dict[str, MetricEstimate | None]
 
 
@@ -73,6 +81,7 @@ class AblationMatrix:
     seed: int
     resamples: int
     confidence: float
+    graders: tuple[str, ...]
     rows: tuple[MatrixRow, ...]
 
 
@@ -128,47 +137,69 @@ def build_matrix(
     if not run_files:
         raise ValueError("no results files to report on")
     _check_comparable(run_files)
+    grader_names = _report_grader_names(run_files)
 
     rows = []
     for run_file in run_files:
         run = run_file.run
         metric_values: dict[str, list[float]] = {name: [] for name in METRIC_NAMES}
         latencies: list[float] = []
+        run_graders = _graders_in_run(run)
+        grader_values: dict[str, list[float]] = {}
+        grader_errors: dict[str, int] = {}
+        for name in grader_names:
+            if name in run_graders:
+                scores, error_count = grade_outcomes(run.questions, name)
+                grader_values[name] = scores
+                grader_errors[name] = error_count
+
         for result in run.questions:
-            if result.status is not QuestionStatus.SCORED or result.metrics is None:
+            if result.status is not QuestionStatus.SCORED:
                 continue
-            values = result.metrics.to_json()
-            for name in METRIC_NAMES:
-                metric_values[name].append(values[name])
             latencies.append(result.latency_ms)
+            if result.metrics is not None:
+                values = result.metrics.to_json()
+                for name in METRIC_NAMES:
+                    metric_values[name].append(values[name])
 
         config = run.config.name
         series = [
             *((name, metric_values[name], _resample_mean) for name in METRIC_NAMES),
+            *(
+                (name, grader_values[name], _resample_mean)
+                for name in grader_names
+                if name in grader_values
+            ),
             (LATENCY_P50, latencies, _resample_percentile(50)),
             (LATENCY_P95, latencies, _resample_percentile(95)),
         ]
+        estimates: dict[str, MetricEstimate | None] = {
+            name: _estimate(
+                observations,
+                statistic,
+                seed=seed,
+                config=config,
+                metric=name,
+                resamples=resamples,
+                confidence=confidence,
+            )
+            for name, observations, statistic in series
+        }
+        for name in grader_names:
+            estimates.setdefault(name, None)
         rows.append(
             MatrixRow(
                 config=config,
                 run_id=run_file.run_id,
                 harness_version=run_file.harness_version,
                 concurrency=run.concurrency,
+                kind=run.kind,
                 scored=run.summary.scored,
                 skipped=run.summary.skipped,
                 error=run.summary.error,
-                estimates={
-                    name: _estimate(
-                        observations,
-                        statistic,
-                        seed=seed,
-                        config=config,
-                        metric=name,
-                        resamples=resamples,
-                        confidence=confidence,
-                    )
-                    for name, observations, statistic in series
-                },
+                graders=run_graders,
+                grader_errors=grader_errors,
+                estimates=estimates,
             )
         )
 
@@ -179,12 +210,32 @@ def build_matrix(
         seed=seed,
         resamples=resamples,
         confidence=confidence,
+        graders=grader_names,
         rows=tuple(rows),
     )
 
 
+def _report_grader_names(run_files: Sequence[AblationRunFile]) -> tuple[str, ...]:
+    """Return the Grader columns: registry order first, then unknown names sorted."""
+    present: set[str] = set()
+    for run_file in run_files:
+        if run_file.run.kind is RunKind.ANSWER:
+            present.update(_graders_in_run(run_file.run))
+    known = [name for name in default_grader_names() if name in present]
+    return tuple(known + sorted(present - set(known)))
+
+
+def _graders_in_run(run: AblationRun) -> frozenset[str]:
+    """Return the Graders an Ablation Run names or holds a Grade for."""
+    names = set(run.graders)
+    for result in run.questions:
+        names.update(result.grades)
+    return frozenset(names)
+
+
 def render_markdown(matrix: AblationMatrix) -> str:
     """Render the Ablation Matrix as a standalone Markdown document."""
+    columns = _columns(matrix)
     lines = ["# Ablation Matrix", "", _preamble(matrix), ""]
     for label, value, is_code in _metadata(matrix):
         rendered = f"`{value}`" if is_code else value
@@ -193,10 +244,10 @@ def render_markdown(matrix: AblationMatrix) -> str:
     if _mixed_concurrency(matrix.rows):
         lines += [_concurrency_note(matrix.rows), ""]
     lines += [
-        "| " + " | ".join(label for label, _ in _COLUMNS) + " |",
-        "| " + " | ".join("---" for _ in _COLUMNS) + " |",
+        "| " + " | ".join(label for label, _ in columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
     ]
-    lines += [_markdown_matrix_row(row) for row in matrix.rows]
+    lines += [_markdown_matrix_row(row, columns) for row in matrix.rows]
     lines += [
         "",
         "## Runs",
@@ -214,6 +265,7 @@ def render_markdown(matrix: AblationMatrix) -> str:
 
 def render_html(matrix: AblationMatrix) -> str:
     """Render the Ablation Matrix as one self-contained HTML document."""
+    columns = _columns(matrix)
     lines = [
         "<!DOCTYPE html>",
         '<html lang="en">',
@@ -248,11 +300,11 @@ def render_html(matrix: AblationMatrix) -> str:
         "<thead><tr>",
         *(
             f"<th>{escape(label)}</th>" if index == 0 else f'<th class="num">{escape(label)}</th>'
-            for index, (label, _) in enumerate(_COLUMNS)
+            for index, (label, _) in enumerate(columns)
         ),
         "</tr></thead>",
         "<tbody>",
-        *(_html_matrix_row(row) for row in matrix.rows),
+        *(_html_matrix_row(row, columns) for row in matrix.rows),
         "</tbody>",
         "</table>",
         "</div>",
@@ -415,25 +467,51 @@ def _cell(
     return lambda row: formatter(row.estimates[name])
 
 
-_CI_NOTE = "Confidence intervals are percentile bootstrap intervals over the scored questions."
+def _grader_cell(name: str) -> Callable[[MatrixRow], str]:
+    """Return the formatter for one Grader column, showing grader_error beside it."""
 
-_COLUMNS: tuple[tuple[str, Callable[[MatrixRow], str]], ...] = (
-    ("Retrieval Config", lambda row: row.config),
-    *((METRIC_LABELS[name], _cell(name, _format_metric)) for name in METRIC_NAMES),
-    ("Latency p50 (ms)", _cell(LATENCY_P50, _format_latency)),
-    ("Latency p95 (ms)", _cell(LATENCY_P95, _format_latency)),
-    ("Scored", lambda row: str(row.scored)),
-    ("Skipped", lambda row: str(row.skipped)),
-    ("Error", lambda row: str(row.error)),
-    ("Concurrency", lambda row: str(row.concurrency)),
+    def format_cell(row: MatrixRow) -> str:
+        if name not in row.graders:
+            return "—"
+        cell = _format_metric(row.estimates.get(name))
+        errors = row.grader_errors.get(name, 0)
+        if errors:
+            noun = "error" if errors == 1 else "errors"
+            return f"{cell} · {errors} {noun}"
+        return cell
+
+    return format_cell
+
+
+_CI_NOTE = (
+    "Confidence intervals are percentile bootstrap intervals over the observations each "
+    "estimate uses; a Grader's interval covers its ok grades and excludes grader_error."
 )
+
+
+def _columns(matrix: AblationMatrix) -> tuple[tuple[str, Callable[[MatrixRow], str]], ...]:
+    """Return the matrix columns, with one Grader column per Grader in the report."""
+    return (
+        ("Retrieval Config", lambda row: row.config),
+        *((METRIC_LABELS[name], _cell(name, _format_metric)) for name in METRIC_NAMES),
+        *((grader_label(name), _grader_cell(name)) for name in matrix.graders),
+        ("Latency p50 (ms)", _cell(LATENCY_P50, _format_latency)),
+        ("Latency p95 (ms)", _cell(LATENCY_P95, _format_latency)),
+        ("Scored", lambda row: str(row.scored)),
+        ("Skipped", lambda row: str(row.skipped)),
+        ("Error", lambda row: str(row.error)),
+        ("Concurrency", lambda row: str(row.concurrency)),
+    )
+
 
 _RUN_COLUMNS = ("Retrieval Config", "Run ID", "Harness version")
 
 
-def _markdown_matrix_row(row: MatrixRow) -> str:
+def _markdown_matrix_row(
+    row: MatrixRow, columns: Sequence[tuple[str, Callable[[MatrixRow], str]]]
+) -> str:
     """Format one Ablation Matrix table row."""
-    cells = (_markdown_text(format_cell(row)) for _, format_cell in _COLUMNS)
+    cells = (_markdown_text(format_cell(row)) for _, format_cell in columns)
     return "| " + " | ".join(cells) + " |"
 
 
@@ -442,13 +520,15 @@ def _markdown_text(value: str) -> str:
     return value.replace("|", "\\|")
 
 
-def _html_matrix_row(row: MatrixRow) -> str:
+def _html_matrix_row(
+    row: MatrixRow, columns: Sequence[tuple[str, Callable[[MatrixRow], str]]]
+) -> str:
     """Format one Ablation Matrix table row."""
     cells = [
         f"<td>{escape(format_cell(row))}</td>"
         if index == 0
         else f'<td class="num">{escape(format_cell(row))}</td>'
-        for index, (_, format_cell) in enumerate(_COLUMNS)
+        for index, (_, format_cell) in enumerate(columns)
     ]
     return "<tr>" + "".join(cells) + "</tr>"
 

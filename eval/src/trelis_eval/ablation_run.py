@@ -1,8 +1,10 @@
 """Run one Ablation Run and read/write its versioned JSONL.
 
-An Ablation Run scores one Retrieval Config against a Golden Set through
-``POST /retrieve``. Relevance is at Document level; ``eval/docs/metrics.md``
-holds the formulas and the schema.
+A retrieval Ablation Run scores one Retrieval Config against a Golden Set
+through ``POST /retrieve``; an answer Ablation Run asks ``POST /answer`` with
+debug, computes the same retrieval metrics from its retrieved Chunks and runs
+each Grader over the answer. Relevance is at Document level;
+``eval/docs/metrics.md`` holds the formulas and the schema.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ import json
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from importlib.metadata import version
@@ -32,8 +34,9 @@ from ._fields import (
     string_field,
     string_list_field,
 )
-from .client import TraceStep, TrelisClient, TrelisError
+from .client import Citation, RetrievedChunk, TraceStep, TrelisClient, TrelisError, Usage
 from .golden import GoldenQuestion
+from .graders import Grade, Grader, GradeStatus, GradingInput, validate_grader_names
 from .metrics import (
     mean,
     ndcg_at_k,
@@ -42,7 +45,7 @@ from .metrics import (
     reciprocal_rank,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 MAX_CONCURRENCY = 32
 """The most questions one Ablation Run keeps in flight at once."""
@@ -61,6 +64,13 @@ class QuestionStatus(StrEnum):
     SCORED = "scored"
     SKIPPED = "skipped"
     ERROR = "error"
+
+
+class RunKind(StrEnum):
+    """Whether a run called POST /retrieve or POST /answer."""
+
+    RETRIEVAL = "retrieval"
+    ANSWER = "answer"
 
 
 class AblationAborted(RuntimeError):
@@ -184,7 +194,11 @@ class QuestionMetrics:
 
 @dataclass(frozen=True)
 class QuestionResult:
-    """The outcome of asking one Golden question under one Retrieval Config."""
+    """The outcome of asking one Golden question under one Retrieval Config.
+
+    An answer run also fills ``answer``, ``citations``, ``finish_reason``,
+    ``usage`` and ``grades``; a retrieval run leaves them at their defaults.
+    """
 
     id: str
     slices: tuple[str, ...]
@@ -195,11 +209,29 @@ class QuestionResult:
     metrics: QuestionMetrics | None
     latency_ms: float
     error: str | None = None
+    answer: str | None = None
+    citations: tuple[Citation, ...] = ()
+    finish_reason: str | None = None
+    usage: Usage | None = None
+    grades: dict[str, Grade] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class GradeSummary:
+    """One Grader's mean over its ok grades and the two countable outcomes."""
+
+    mean: float | None
+    ok: int
+    grader_error: int
+
+    def to_json(self) -> dict[str, Any]:
+        """Return the fields written to the summary line."""
+        return {"mean": self.mean, "ok": self.ok, "grader_error": self.grader_error}
 
 
 @dataclass(frozen=True)
 class RunSummary:
-    """Means over the scored questions, counts, and scored-call latencies."""
+    """Means over the scored questions, counts, latencies and Grader scores."""
 
     recall_at_5: float | None
     recall_at_10: float | None
@@ -210,6 +242,7 @@ class RunSummary:
     error: int
     latency_p50: float | None
     latency_p95: float | None
+    grades: dict[str, GradeSummary] = field(default_factory=dict)
 
     @property
     def metrics(self) -> dict[str, float | None]:
@@ -244,6 +277,11 @@ class AblationRun:
     # Requests in flight at once. Latency is measured under this load, so two
     # runs' latencies compare only at the same concurrency.
     concurrency: int = 1
+    kind: RunKind = RunKind.RETRIEVAL
+    # The judge model an answer run's judge-based Graders called; None when no
+    # such Grader ran.
+    judge_model: str | None = None
+    graders: tuple[str, ...] = ()
 
 
 def run_ablation(
@@ -272,6 +310,86 @@ def run_ablation(
     errors are counted in the order their results arrive, the results keep
     Golden Set order, and an abort cancels the questions not yet sent.
     """
+    _check_run_options(top_k, concurrency, max_consecutive_errors)
+    _check_principals(golden)
+    _check_evidence(golden, manifest)
+
+    started_at = _utc_now()
+    results = _score_questions(
+        lambda question: _score_retrieval_question(
+            client, question, manifest, config, top_k, clock
+        ),
+        golden,
+        concurrency,
+        max_consecutive_errors,
+    )
+    finished_at = _utc_now()
+    return AblationRun(
+        config=config,
+        top_k=top_k,
+        started_at=started_at,
+        finished_at=finished_at,
+        questions=results,
+        summary=_summarize(results, ()),
+        concurrency=concurrency,
+    )
+
+
+def run_answer_ablation(
+    client: TrelisClient,
+    golden: Sequence[GoldenQuestion],
+    manifest: Manifest,
+    config: RetrievalConfig,
+    graders: Sequence[Grader],
+    top_k: int = 10,
+    *,
+    judge_model: str | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    concurrency: int = 1,
+    max_consecutive_errors: int = 10,
+) -> AblationRun:
+    """Ask every Golden question, compute its retrieval metrics and grade it.
+
+    The answer call asks for the debug object, so the retrieved Chunks feed the
+    same Document-level metrics a retrieval run computes. A question with no
+    evidence is still asked and graded, but has no retrieval metric (its
+    ``metrics`` is None). A Trelis error is recorded on the question and
+    excluded from the means; a Grader's own failure is a ``grader_error``
+    Grade and never a question error. The concurrency, abort-after-repeated-
+    errors, evidence and Principal rules are the retrieval run's.
+    """
+    _check_run_options(top_k, concurrency, max_consecutive_errors)
+    _check_principals(golden)
+    _check_evidence(golden, manifest)
+    names = tuple(grader.name for grader in graders)
+    validate_grader_names(names)
+
+    started_at = _utc_now()
+    results = _score_questions(
+        lambda question: _score_answer_question(
+            client, question, manifest, config, top_k, graders, clock
+        ),
+        golden,
+        concurrency,
+        max_consecutive_errors,
+    )
+    finished_at = _utc_now()
+    return AblationRun(
+        config=config,
+        top_k=top_k,
+        started_at=started_at,
+        finished_at=finished_at,
+        questions=results,
+        summary=_summarize(results, names),
+        concurrency=concurrency,
+        kind=RunKind.ANSWER,
+        judge_model=judge_model,
+        graders=names,
+    )
+
+
+def _check_run_options(top_k: int, concurrency: int, max_consecutive_errors: int) -> None:
+    """Reject a run option before any request is made."""
     if (
         not isinstance(concurrency, int)
         or isinstance(concurrency, bool)
@@ -290,19 +408,14 @@ def run_ablation(
         raise ValueError(
             f"max_consecutive_errors must be a non-negative integer, got {max_consecutive_errors!r}"
         )
-    _check_principals(golden)
-    _check_evidence(golden, manifest)
 
-    started_at = _utc_now()
-    results = _score_questions(
-        client, golden, manifest, config, top_k, clock, concurrency, max_consecutive_errors
-    )
-    finished_at = _utc_now()
 
+def _summarize(results: tuple[QuestionResult, ...], grader_names: Sequence[str]) -> RunSummary:
+    """Average the scored questions and count every Grader outcome."""
     scored = [result for result in results if result.status is QuestionStatus.SCORED]
     scored_metrics = [result.metrics for result in scored if result.metrics is not None]
     latencies = [result.latency_ms for result in scored]
-    summary = RunSummary(
+    return RunSummary(
         recall_at_5=mean([metrics.recall_at_5 for metrics in scored_metrics]),
         recall_at_10=mean([metrics.recall_at_10 for metrics in scored_metrics]),
         mrr=mean([metrics.mrr for metrics in scored_metrics]),
@@ -312,16 +425,35 @@ def run_ablation(
         error=sum(1 for result in results if result.status is QuestionStatus.ERROR),
         latency_p50=nearest_rank_percentile(latencies, 50),
         latency_p95=nearest_rank_percentile(latencies, 95),
+        grades={name: _grade_summary(name, scored) for name in grader_names},
     )
-    return AblationRun(
-        config=config,
-        top_k=top_k,
-        started_at=started_at,
-        finished_at=finished_at,
-        questions=results,
-        summary=summary,
-        concurrency=concurrency,
-    )
+
+
+def grade_outcomes(results: Sequence[QuestionResult], name: str) -> tuple[list[float], int]:
+    """Return one Grader's ok scores and its grader_error count.
+
+    Only scored questions count. A question that errored has no Grade, and a
+    Grader's own failure is counted, never turned into a score.
+    """
+    scores = []
+    grader_error = 0
+    for result in results:
+        if result.status is not QuestionStatus.SCORED:
+            continue
+        grade = result.grades.get(name)
+        if grade is None:
+            continue
+        if grade.status is GradeStatus.OK:
+            scores.append(grade.score)
+        else:
+            grader_error += 1
+    return scores, grader_error
+
+
+def _grade_summary(name: str, scored: Sequence[QuestionResult]) -> GradeSummary:
+    """Average one Grader's ok scores, counting the two outcomes."""
+    scores, grader_error = grade_outcomes(scored, name)
+    return GradeSummary(mean=mean(scores), ok=len(scores), grader_error=grader_error)
 
 
 def step_latencies(run: AblationRun) -> dict[str, tuple[int, int]]:
@@ -346,12 +478,8 @@ def step_latencies(run: AblationRun) -> dict[str, tuple[int, int]]:
 
 
 def _score_questions(
-    client: TrelisClient,
+    score_one: Callable[[GoldenQuestion], QuestionResult],
     golden: Sequence[GoldenQuestion],
-    manifest: Manifest,
-    config: RetrievalConfig,
-    top_k: int,
-    clock: Callable[[], float],
     concurrency: int,
     max_consecutive_errors: int,
 ) -> tuple[QuestionResult, ...]:
@@ -366,23 +494,17 @@ def _score_questions(
         results = []
         consecutive_errors = 0
         for question in golden:
-            result = _score_question(client, question, manifest, config, top_k, clock)
+            result = score_one(question)
             results.append(result)
             consecutive_errors = _next_consecutive_errors(consecutive_errors, result)
             _abort_after_errors(consecutive_errors, result, max_consecutive_errors)
         return tuple(results)
-    return _score_concurrently(
-        client, golden, manifest, config, top_k, clock, concurrency, max_consecutive_errors
-    )
+    return _score_concurrently(score_one, golden, concurrency, max_consecutive_errors)
 
 
 def _score_concurrently(
-    client: TrelisClient,
+    score_one: Callable[[GoldenQuestion], QuestionResult],
     golden: Sequence[GoldenQuestion],
-    manifest: Manifest,
-    config: RetrievalConfig,
-    top_k: int,
-    clock: Callable[[], float],
     concurrency: int,
     max_consecutive_errors: int,
 ) -> tuple[QuestionResult, ...]:
@@ -400,11 +522,7 @@ def _score_concurrently(
 
     def submit_next() -> None:
         nonlocal next_index
-        pending[
-            executor.submit(
-                _score_question, client, golden[next_index], manifest, config, top_k, clock
-            )
-        ] = next_index
+        pending[executor.submit(score_one, golden[next_index])] = next_index
         next_index += 1
 
     try:
@@ -471,7 +589,7 @@ def _check_evidence(golden: Sequence[GoldenQuestion], manifest: Manifest) -> Non
         )
 
 
-def _score_question(
+def _score_retrieval_question(
     client: TrelisClient,
     question: GoldenQuestion,
     manifest: Manifest,
@@ -480,18 +598,9 @@ def _score_question(
     clock: Callable[[], float],
 ) -> QuestionResult:
     """Ask one question, or skip it when it has no evidence to score against."""
-    evidence = tuple(dict.fromkeys(item.source_id for item in question.evidence))
+    evidence = _evidence(question)
     if not evidence:
-        return QuestionResult(
-            id=question.id,
-            slices=question.slices,
-            status=QuestionStatus.SKIPPED,
-            evidence=(),
-            retrieved=(),
-            trace=(),
-            metrics=None,
-            latency_ms=0.0,
-        )
+        return _skipped_result(question)
 
     started = clock()
     try:
@@ -499,49 +608,12 @@ def _score_question(
     except TrelisError as exc:
         if exc.status in (400, 503):
             raise AblationAborted(exc.status, str(exc)) from exc
-        return QuestionResult(
-            id=question.id,
-            slices=question.slices,
-            status=QuestionStatus.ERROR,
-            evidence=evidence,
-            retrieved=(),
-            trace=(),
-            metrics=None,
-            latency_ms=_elapsed_ms(started, clock()),
-            error=str(exc),
-        )
+        return _error_result(question, evidence, started, clock, str(exc))
     except httpx.HTTPError as exc:
-        return QuestionResult(
-            id=question.id,
-            slices=question.slices,
-            status=QuestionStatus.ERROR,
-            evidence=evidence,
-            retrieved=(),
-            trace=(),
-            metrics=None,
-            latency_ms=_elapsed_ms(started, clock()),
-            error=str(exc),
-        )
+        return _error_result(question, evidence, started, clock, str(exc))
     latency_ms = _elapsed_ms(started, clock())
 
-    retrieved = tuple(
-        RetrievedRecord(
-            chunk_id=result.chunk_id,
-            document_id=result.document_id,
-            source_id=manifest.source_by_document.get(result.document_id),
-            score=result.score,
-            scores=dict(result.scores),
-        )
-        for result in answer.results
-    )
-    ranked = [record.source_id for record in retrieved]
-    relevant = set(evidence)
-    metrics = QuestionMetrics(
-        recall_at_5=recall_at_k(ranked, relevant, 5),
-        recall_at_10=recall_at_k(ranked, relevant, 10),
-        mrr=reciprocal_rank(ranked, relevant),
-        ndcg_at_10=ndcg_at_k(ranked, relevant, 10),
-    )
+    retrieved = _retrieved_records(answer.results, manifest)
     return QuestionResult(
         id=question.id,
         slices=question.slices,
@@ -549,8 +621,135 @@ def _score_question(
         evidence=evidence,
         retrieved=retrieved,
         trace=answer.trace,
-        metrics=metrics,
+        metrics=_question_metrics(retrieved, evidence),
         latency_ms=latency_ms,
+    )
+
+
+def _score_answer_question(
+    client: TrelisClient,
+    question: GoldenQuestion,
+    manifest: Manifest,
+    config: RetrievalConfig,
+    top_k: int,
+    graders: Sequence[Grader],
+    clock: Callable[[], float],
+) -> QuestionResult:
+    """Ask one question through POST /answer, then run every Grader on it."""
+    evidence = _evidence(question)
+
+    started = clock()
+    try:
+        answer = client.answer(question.question, top_k, config.techniques)
+    except TrelisError as exc:
+        if exc.status in (400, 503):
+            raise AblationAborted(exc.status, str(exc)) from exc
+        return _error_result(question, evidence, started, clock, str(exc))
+    except httpx.HTTPError as exc:
+        return _error_result(question, evidence, started, clock, str(exc))
+    latency_ms = _elapsed_ms(started, clock())
+
+    debug = answer.debug
+    if debug is None:
+        return _error_result(
+            question,
+            evidence,
+            started,
+            clock,
+            "answer succeeded without the debug object",
+        )
+    retrieved = _retrieved_records(debug.results, manifest)
+    grading_input = GradingInput(
+        question=question.question,
+        expected_answer=question.expected_answer,
+        answer=answer.answer,
+        citations=answer.citations,
+        retrieved=debug.results,
+    )
+    return QuestionResult(
+        id=question.id,
+        slices=question.slices,
+        status=QuestionStatus.SCORED,
+        evidence=evidence,
+        retrieved=retrieved,
+        trace=debug.trace,
+        metrics=_question_metrics(retrieved, evidence) if evidence else None,
+        latency_ms=latency_ms,
+        answer=answer.answer,
+        citations=answer.citations,
+        finish_reason=answer.finish_reason,
+        usage=debug.usage,
+        grades={grader.name: grader.grade(grading_input) for grader in graders},
+    )
+
+
+def _evidence(question: GoldenQuestion) -> tuple[str, ...]:
+    """Return the question's distinct evidence source_ids, in order."""
+    return tuple(dict.fromkeys(item.source_id for item in question.evidence))
+
+
+def _skipped_result(question: GoldenQuestion) -> QuestionResult:
+    """Return the record of a question that needs no request."""
+    return QuestionResult(
+        id=question.id,
+        slices=question.slices,
+        status=QuestionStatus.SKIPPED,
+        evidence=(),
+        retrieved=(),
+        trace=(),
+        metrics=None,
+        latency_ms=0.0,
+    )
+
+
+def _error_result(
+    question: GoldenQuestion,
+    evidence: tuple[str, ...],
+    started: float,
+    clock: Callable[[], float],
+    error: str,
+) -> QuestionResult:
+    """Return the record of a question whose request failed."""
+    return QuestionResult(
+        id=question.id,
+        slices=question.slices,
+        status=QuestionStatus.ERROR,
+        evidence=evidence,
+        retrieved=(),
+        trace=(),
+        metrics=None,
+        latency_ms=_elapsed_ms(started, clock()),
+        error=error,
+    )
+
+
+def _retrieved_records(
+    results: Sequence[RetrievedChunk], manifest: Manifest
+) -> tuple[RetrievedRecord, ...]:
+    """Map API results to the Document ids and source_ids a results file keeps."""
+    return tuple(
+        RetrievedRecord(
+            chunk_id=result.chunk_id,
+            document_id=result.document_id,
+            source_id=manifest.source_by_document.get(result.document_id),
+            score=result.score,
+            scores=dict(result.scores),
+        )
+        for result in results
+    )
+
+
+def _question_metrics(
+    retrieved: Sequence[RetrievedRecord], evidence: Sequence[str]
+) -> QuestionMetrics:
+    """Compute the four retrieval metrics of one ranked, evidenced question."""
+    ranked = [record.source_id for record in retrieved]
+    relevant = set(evidence)
+    return QuestionMetrics(
+        recall_at_5=recall_at_k(ranked, relevant, 5),
+        recall_at_10=recall_at_k(ranked, relevant, 10),
+        mrr=reciprocal_rank(ranked, relevant),
+        ndcg_at_10=ndcg_at_k(ranked, relevant, 10),
     )
 
 
@@ -611,6 +810,9 @@ class _RunHeader:
     harness_version: str
     started_at: str
     concurrency: int
+    kind: RunKind
+    judge_model: str | None
+    graders: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -633,16 +835,17 @@ def write_ablation_run(path: str | Path, run_file: AblationRunFile) -> None:
     with path.open("w", encoding="utf-8") as out:
         out.write(_dump(_run_record(run_file)) + "\n")
         for question in run.questions:
-            out.write(_dump(_question_record(question)) + "\n")
+            out.write(_dump(_question_record(question, run.kind)) + "\n")
         out.write(_dump(_summary_record(run)) + "\n")
 
 
 def _run_record(run_file: AblationRunFile) -> dict[str, Any]:
     """Build the header line of a results file."""
     run = run_file.run
-    return {
+    record: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "type": "run",
+        "kind": run.kind.value,
         "run_id": run_file.run_id,
         "config": {
             "name": run.config.name,
@@ -663,9 +866,13 @@ def _run_record(run_file: AblationRunFile) -> dict[str, Any]:
         "harness_version": run_file.harness_version,
         "started_at": run.started_at,
     }
+    if run.kind is RunKind.ANSWER:
+        record["judge_model"] = run.judge_model
+        record["graders"] = list(run.graders)
+    return record
 
 
-def _question_record(result: QuestionResult) -> dict[str, Any]:
+def _question_record(result: QuestionResult, kind: RunKind) -> dict[str, Any]:
     """Build one question line of a results file."""
     record: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -690,7 +897,40 @@ def _question_record(result: QuestionResult) -> dict[str, Any]:
     }
     if result.error is not None:
         record["error"] = result.error
+    if kind is RunKind.ANSWER:
+        record["answer"] = result.answer
+        record["citations"] = [_citation_record(citation) for citation in result.citations]
+        record["finish_reason"] = result.finish_reason
+        record["usage"] = _usage_record(result.usage) if result.usage is not None else None
+        record["grades"] = {name: _grade_record(grade) for name, grade in result.grades.items()}
     return record
+
+
+def _citation_record(citation: Citation) -> dict[str, Any]:
+    """Build one citation of an answer question line."""
+    return {
+        "marker": citation.marker,
+        "chunk_id": citation.chunk_id,
+        "document_id": citation.document_id,
+    }
+
+
+def _usage_record(usage: Usage) -> dict[str, int]:
+    """Build the token usage of an answer question line."""
+    return {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    }
+
+
+def _grade_record(grade: Grade) -> dict[str, Any]:
+    """Build one Grader's verdict of an answer question line."""
+    return {
+        "score": grade.score,
+        "rationale": grade.rationale,
+        "status": grade.status.value,
+    }
 
 
 def _trace_record(step: TraceStep) -> dict[str, Any]:
@@ -709,7 +949,7 @@ def _trace_record(step: TraceStep) -> dict[str, Any]:
 
 def _summary_record(run: AblationRun) -> dict[str, Any]:
     """Build the summary line of a results file."""
-    return {
+    record: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "type": "summary",
         "metrics": run.summary.metrics,
@@ -720,6 +960,11 @@ def _summary_record(run: AblationRun) -> dict[str, Any]:
         },
         "finished_at": run.finished_at,
     }
+    if run.kind is RunKind.ANSWER:
+        record["grades"] = {
+            name: grade_summary.to_json() for name, grade_summary in run.summary.grades.items()
+        }
+    return record
 
 
 def _dump(value: Any) -> str:
@@ -754,8 +999,10 @@ def load_ablation_run(path: str | Path) -> AblationRunFile:
             )
 
     header = _parse_run_record(first, first_where)
-    questions = tuple(_parse_question_record(value, where) for where, value in records[1:-1])
-    summary, finished_at = _parse_summary_record(last, last_where)
+    questions = tuple(
+        _parse_question_record(value, where, header.kind) for where, value in records[1:-1]
+    )
+    summary, finished_at = _parse_summary_record(last, last_where, header.kind)
     return AblationRunFile(
         run_id=header.run_id,
         golden_set=header.golden_set,
@@ -770,6 +1017,9 @@ def load_ablation_run(path: str | Path) -> AblationRunFile:
             finished_at=finished_at,
             questions=questions,
             summary=summary,
+            kind=header.kind,
+            judge_model=header.judge_model,
+            graders=header.graders,
         ),
     )
 
@@ -785,32 +1035,57 @@ def _decode_line(path: Path, number: int, raw_line: str) -> tuple[str, dict[str,
         raise ValueError(f"{where}: invalid JSON: {exc.msg}") from exc
     if not isinstance(value, dict):
         raise ValueError(f"{where}: expected a JSON object")
-    if value.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError(
-            f"{where}: schema_version must be {SCHEMA_VERSION}, got {value.get('schema_version')!r}"
-        )
+    version = value.get("schema_version")
+    if version not in (1, SCHEMA_VERSION):
+        raise ValueError(f"{where}: schema_version must be 1 or {SCHEMA_VERSION}, got {version!r}")
     return where, value
 
 
 def _parse_run_record(value: dict[str, Any], where: str) -> _RunHeader:
-    """Validate the header line."""
+    """Validate the header line, defaulting a version-1 file to a retrieval run."""
+    required = {
+        "schema_version",
+        "type",
+        "run_id",
+        "config",
+        "top_k",
+        "concurrency",
+        "golden_set",
+        "manifest",
+        "base_url",
+        "harness_version",
+        "started_at",
+    }
     check_fields(
         value,
-        {
-            "schema_version",
-            "type",
-            "run_id",
-            "config",
-            "top_k",
-            "concurrency",
-            "golden_set",
-            "manifest",
-            "base_url",
-            "harness_version",
-            "started_at",
-        },
+        required | {"kind", "judge_model", "graders"},
         where,
+        required=required,
     )
+    version = value.get("schema_version")
+    if version == 1 and "kind" in value:
+        raise ValueError(f"{where}: a version-1 run must not carry 'kind'")
+    if version == SCHEMA_VERSION and "kind" not in value:
+        raise ValueError(f"{where}: a version-{SCHEMA_VERSION} run needs 'kind'")
+    kind = _parse_run_kind(value, where)
+    if kind is RunKind.ANSWER:
+        missing = sorted({"judge_model", "graders"} - set(value))
+        if missing:
+            raise ValueError(
+                f"{where}: an answer run needs field(s): "
+                + ", ".join(repr(name) for name in missing)
+            )
+        judge_model = optional_string_field(value, "judge_model", where)
+        graders = string_list_field(value, "graders", where)
+        if any(not name.strip() for name in graders):
+            raise ValueError(f"{where}: 'graders' must not contain an empty name")
+        if len(set(graders)) != len(graders):
+            raise ValueError(f"{where}: 'graders' must not list a Grader twice")
+    else:
+        if "judge_model" in value or "graders" in value:
+            raise ValueError(f"{where}: only an answer run may carry 'judge_model' or 'graders'")
+        judge_model = None
+        graders = ()
     return _RunHeader(
         run_id=string_field(value, "run_id", where),
         config=_parse_config(value.get("config"), f"{where}: config"),
@@ -821,7 +1096,20 @@ def _parse_run_record(value: dict[str, Any], where: str) -> _RunHeader:
         harness_version=string_field(value, "harness_version", where),
         started_at=string_field(value, "started_at", where),
         concurrency=_concurrency_field(value, where),
+        kind=kind,
+        judge_model=judge_model,
+        graders=graders,
     )
+
+
+def _parse_run_kind(value: dict[str, Any], where: str) -> RunKind:
+    """Read the header's kind, which a version-1 file does not have."""
+    raw_kind = value.get("kind", RunKind.RETRIEVAL.value)
+    try:
+        return RunKind(raw_kind)
+    except (TypeError, ValueError):
+        choices = ", ".join(repr(item.value) for item in RunKind)
+        raise ValueError(f"{where}: 'kind' must be one of {choices}, got {raw_kind!r}") from None
 
 
 def _concurrency_field(value: dict[str, Any], where: str) -> int:
@@ -884,23 +1172,25 @@ def _parse_manifest_ref(value: Any, where: str) -> ManifestRef:
     )
 
 
-def _parse_question_record(value: dict[str, Any], where: str) -> QuestionResult:
-    """Validate one question line."""
+def _parse_question_record(value: dict[str, Any], where: str, kind: RunKind) -> QuestionResult:
+    """Validate one question line, which an answer run extends."""
+    base_fields = {
+        "schema_version",
+        "type",
+        "id",
+        "slices",
+        "status",
+        "evidence",
+        "retrieved",
+        "trace",
+        "metrics",
+        "latency_ms",
+        "error",
+    }
+    answer_fields = {"answer", "citations", "finish_reason", "usage", "grades"}
     check_fields(
         value,
-        {
-            "schema_version",
-            "type",
-            "id",
-            "slices",
-            "status",
-            "evidence",
-            "retrieved",
-            "trace",
-            "metrics",
-            "latency_ms",
-            "error",
-        },
+        base_fields | (answer_fields if kind is RunKind.ANSWER else set()),
         where,
         required={
             "schema_version",
@@ -939,13 +1229,51 @@ def _parse_question_record(value: dict[str, Any], where: str) -> QuestionResult:
 
     metrics_value = value.get("metrics")
     if status is QuestionStatus.SCORED:
-        metrics = _parse_question_metrics(metrics_value, f"{where}: metrics")
+        if metrics_value is None and kind is RunKind.ANSWER:
+            if evidence:
+                raise ValueError(f"{where}: a scored answer with evidence needs a 'metrics' object")
+            # An answer run grades a question with no evidence; it just has no
+            # retrieval metric to compute.
+            metrics = None
+        else:
+            metrics = _parse_question_metrics(metrics_value, f"{where}: metrics")
     else:
         if metrics_value is not None:
             raise ValueError(
                 f"{where}: metrics must be null unless status is {QuestionStatus.SCORED.value!r}"
             )
         metrics = None
+
+    answer: str | None = None
+    citations: tuple[Citation, ...] = ()
+    finish_reason: str | None = None
+    usage: Usage | None = None
+    grades: dict[str, Grade] = {}
+    if kind is RunKind.ANSWER:
+        missing = sorted(answer_fields - set(value))
+        if missing:
+            raise ValueError(
+                f"{where}: an answer question needs field(s): "
+                + ", ".join(repr(name) for name in missing)
+            )
+        answer = optional_string_field(value, "answer", where)
+        finish_reason = optional_string_field(value, "finish_reason", where)
+        citations = _parse_citations(value.get("citations"), f"{where}: citations")
+        usage = _parse_usage(value.get("usage"), f"{where}: usage")
+        grades = _parse_grades(value.get("grades"), f"{where}: grades")
+        if status is QuestionStatus.SCORED:
+            if answer is None or finish_reason is None or usage is None:
+                raise ValueError(
+                    f"{where}: a scored answer needs 'answer', 'finish_reason' and 'usage'"
+                )
+        else:
+            if answer is not None or finish_reason is not None or usage is not None:
+                raise ValueError(
+                    f"{where}: only a scored answer may carry 'answer', 'finish_reason' or 'usage'"
+                )
+            if citations or grades:
+                raise ValueError(f"{where}: only a scored answer may carry 'citations' or 'grades'")
+
     return QuestionResult(
         id=question_id,
         slices=slices,
@@ -956,7 +1284,75 @@ def _parse_question_record(value: dict[str, Any], where: str) -> QuestionResult:
         metrics=metrics,
         latency_ms=latency_ms,
         error=error,
+        answer=answer,
+        citations=citations,
+        finish_reason=finish_reason,
+        usage=usage,
+        grades=grades,
     )
+
+
+def _parse_citations(value: Any, where: str) -> tuple[Citation, ...]:
+    """Validate the citations list of an answer question line."""
+    if not isinstance(value, list):
+        raise ValueError(f"{where}: expected a list")
+    citations = []
+    for index, item in enumerate(value):
+        item_where = f"{where}[{index}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"{item_where}: expected a JSON object")
+        check_fields(item, {"marker", "chunk_id", "document_id"}, item_where)
+        citations.append(
+            Citation(
+                marker=int_field(item, "marker", item_where),
+                chunk_id=string_field(item, "chunk_id", item_where),
+                document_id=string_field(item, "document_id", item_where),
+            )
+        )
+    return tuple(citations)
+
+
+def _parse_usage(value: Any, where: str) -> Usage | None:
+    """Validate the usage object of an answer question line."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"{where}: expected a JSON object or null")
+    check_fields(value, {"prompt_tokens", "completion_tokens", "total_tokens"}, where)
+    return Usage(
+        prompt_tokens=int_field(value, "prompt_tokens", where),
+        completion_tokens=int_field(value, "completion_tokens", where),
+        total_tokens=int_field(value, "total_tokens", where),
+    )
+
+
+def _parse_grades(value: Any, where: str) -> dict[str, Grade]:
+    """Validate the Grader verdicts of an answer question line."""
+    if not isinstance(value, dict):
+        raise ValueError(f"{where}: expected a JSON object")
+    grades = {}
+    for name, item in value.items():
+        item_where = f"{where}[{name!r}]"
+        if not name.strip():
+            raise ValueError(f"{where}: a Grader name must not be empty")
+        if not isinstance(item, dict):
+            raise ValueError(f"{item_where}: expected a JSON object")
+        check_fields(item, {"score", "rationale", "status"}, item_where)
+        raw_status = item.get("status")
+        try:
+            grade_status = GradeStatus(raw_status)
+        except (TypeError, ValueError):
+            choices = ", ".join(repr(choice.value) for choice in GradeStatus)
+            raise ValueError(
+                f"{item_where}: 'status' must be one of {choices}, got {raw_status!r}"
+            ) from None
+        score = optional_float_field(item, "score", item_where)
+        rationale = string_field(item, "rationale", item_where)
+        try:
+            grades[name] = Grade(score=score, rationale=rationale, status=grade_status)
+        except ValueError as exc:
+            raise ValueError(f"{item_where}: {exc}") from exc
+    return grades
 
 
 def _parse_retrieved(value: Any, where: str) -> tuple[RetrievedRecord, ...]:
@@ -1024,13 +1420,26 @@ def _parse_question_metrics(value: Any, where: str) -> QuestionMetrics:
     )
 
 
-def _parse_summary_record(value: dict[str, Any], where: str) -> tuple[RunSummary, str]:
+def _parse_summary_record(
+    value: dict[str, Any], where: str, kind: RunKind
+) -> tuple[RunSummary, str]:
     """Validate the summary line and return it with its finished_at."""
     check_fields(
         value,
-        {"schema_version", "type", "metrics", "counts", "latency_ms", "finished_at"},
+        {
+            "schema_version",
+            "type",
+            "metrics",
+            "counts",
+            "latency_ms",
+            "grades",
+            "finished_at",
+        },
         where,
+        required={"schema_version", "type", "metrics", "counts", "latency_ms", "finished_at"},
     )
+    if kind is RunKind.RETRIEVAL and "grades" in value:
+        raise ValueError(f"{where}: only an answer run may carry 'grades'")
     metrics = value.get("metrics")
     if not isinstance(metrics, dict):
         raise ValueError(f"{where}: 'metrics' must be a JSON object")
@@ -1054,7 +1463,32 @@ def _parse_summary_record(value: dict[str, Any], where: str) -> tuple[RunSummary
         error=int_field(counts, "error", where),
         latency_p50=optional_float_field(latency, "p50", where),
         latency_p95=optional_float_field(latency, "p95", where),
+        grades=_parse_grade_summaries(value.get("grades", {}), f"{where}: grades"),
     )
     if min(summary.scored, summary.skipped, summary.error) < 0:
         raise ValueError(f"{where}: counts must not be negative")
     return summary, finished_at
+
+
+def _parse_grade_summaries(value: Any, where: str) -> dict[str, GradeSummary]:
+    """Validate the per-Grader summary object."""
+    if not isinstance(value, dict):
+        raise ValueError(f"{where}: expected a JSON object")
+    summaries = {}
+    for name, item in value.items():
+        item_where = f"{where}[{name!r}]"
+        if not name.strip():
+            raise ValueError(f"{where}: a Grader name must not be empty")
+        if not isinstance(item, dict):
+            raise ValueError(f"{item_where}: expected a JSON object")
+        check_fields(item, {"mean", "ok", "grader_error"}, item_where)
+        ok = int_field(item, "ok", item_where)
+        grader_error = int_field(item, "grader_error", item_where)
+        if ok < 0 or grader_error < 0:
+            raise ValueError(f"{item_where}: counts must not be negative")
+        summaries[name] = GradeSummary(
+            mean=optional_float_field(item, "mean", item_where),
+            ok=ok,
+            grader_error=grader_error,
+        )
+    return summaries

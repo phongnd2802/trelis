@@ -25,14 +25,19 @@ role:
 ```
 TRELIS_MODELS_EMBEDDING_BASE_URL=http://127.0.0.1:4100/embedding
 TRELIS_MODELS_CHAT_BASE_URL=http://127.0.0.1:4100/chat
+TRELIS_EVAL_JUDGE_BASE_URL=http://127.0.0.1:4100/judge
 ```
 
-Trelis posts to `{base_url}/embeddings`, `{base_url}/chat/completions`,
-`{base_url}/responses` or `{base_url}/rerank`. The proxy resolves
+The judge is not a Trelis model role: `trelis-eval answer run` calls it from
+the harness. It is routed like a role anyway, because the proxy accepts any
+name matching `[a-z]+`, and `judge` needed no proxy change. Trelis posts to
+`{base_url}/embeddings`, `{base_url}/chat/completions`, `{base_url}/responses`
+or `{base_url}/rerank`; the harness posts to
+`{judge_base_url}/chat/completions`. The proxy resolves
 `POST /<role>/<rest>` to `<upstream for role>/<rest>`, so
-`/embedding/embeddings` goes to
-`https://openrouter.ai/api/v1/embeddings` when `embedding` is configured with
-that URL.
+`/embedding/embeddings` goes to `https://openrouter.ai/api/v1/embeddings`
+when `embedding` is configured with that URL, and `/judge/chat/completions`
+goes to the judge provider.
 
 The forwarding URL is `<upstream>/<rest>` with the upstream's trailing slash
 removed. A query string on the incoming request is kept, forwarded and stored
@@ -68,6 +73,33 @@ proxy forwards it in `Authorization` without ever putting it in a URL.
 
 In `replay` no upstream is called, so no provider key is needed and Trelis's
 own key value is irrelevant.
+
+### The judge
+
+`trelis-eval answer run` uses a judge model for the correctness Grader. Its
+configuration is separate from Trelis's `models.chat`: the harness reads
+`TRELIS_EVAL_JUDGE_BASE_URL` (or `--judge-base-url`), `TRELIS_EVAL_JUDGE_MODEL`
+(or `--judge-model`) and `TRELIS_EVAL_JUDGE_API_KEY`. Route the judge through
+the same proxy as the embedding role:
+
+```sh
+uv run --project eval trelis-eval proxy --mode record \
+  --upstream embedding=https://openrouter.ai/api/v1 \
+  --upstream judge=https://openrouter.ai/api/v1 \
+  --fixtures eval/fixtures/models
+```
+
+Set `TRELIS_EVAL_JUDGE_BASE_URL=http://127.0.0.1:4100/judge` for the harness
+in both modes. The proxy's startup hint prints
+`TRELIS_MODELS_<ROLE>_BASE_URL` lines for Trelis's own roles, including a
+`TRELIS_MODELS_JUDGE_BASE_URL` for the service's judge role; the harness's
+judge is not that role, so set `TRELIS_EVAL_JUDGE_BASE_URL` to the same URL
+instead. The judge's Chat Completions body (`model`, `messages`,
+`temperature: 0`) is keyed like any other fixture, so a changed prompt or
+judge model is a replay miss rather than a silently different verdict. In
+`replay` the harness still reads `TRELIS_EVAL_JUDGE_API_KEY` and sends it as
+`Authorization`, because it always sends one; with no upstream the proxy never
+uses the value, so any non-empty value works.
 
 ## The key
 

@@ -10,11 +10,12 @@ versioned files, not server state.
 The harness fetches the MultiHop-RAG Benchmark Corpus, ingests a subset as
 Documents, waits for ingest to finish, reads and writes Golden Sets, and
 scores Ablation Runs under Retrieval Configs with Recall@5, Recall@10, MRR and
-nDCG@10. It also runs an OpenAI-compatible record/replay proxy so paid model
-calls are recorded once and replayed for free.
+nDCG@10. Answer Ablation Runs also grade each answer with a Grader, starting
+with correctness. It also runs an OpenAI-compatible record/replay proxy so
+paid model calls are recorded once and replayed for free.
 
 Terms are the ones in [GLOSSARY.md](../GLOSSARY.md): Corpus, Benchmark
-Corpus, Document, Principal, Access List, Golden Set, Slice.
+Corpus, Document, Principal, Access List, Golden Set, Slice, Grader.
 
 ## Setup
 
@@ -185,10 +186,59 @@ with the next one; any other request error, including a 502 from a model
 provider that rejected the call, is recorded on the question and excluded from
 the means, not scored as zero. Errors alone do not change the exit code.
 
+## Run an answer ablation
+
+An answer Ablation Run asks `POST /answer` with `debug: true`, computes the
+same retrieval metrics from the retrieved Chunks, and grades every answer. It
+uses the same Golden Set and manifest as a retrieval run, so ingest once and
+score both.
+
+The judge is a separate model from the answer generator. Put its settings in
+`.local/eval.env` at the repository root (gitignored) and export them in the
+shell that runs the harness; never write a real key into this README or any
+tracked file:
+
+```sh
+# .local/eval.env
+TRELIS_EVAL_JUDGE_BASE_URL=<OpenAI-compatible base URL>
+TRELIS_EVAL_JUDGE_MODEL=<judge model name>
+TRELIS_EVAL_JUDGE_API_KEY=<judge API key>
+```
+
+```sh
+set -a; . .local/eval.env; set +a
+uv run --project eval trelis-eval answer run \
+  --golden eval/data/multihop-rag/subset-golden.jsonl \
+  --manifest eval/data/multihop-rag/manifest.jsonl \
+  --graders correctness
+```
+
+`--judge-base-url` and `--judge-model` override the first two variables; the
+key is read from `TRELIS_EVAL_JUDGE_API_KEY` only, never from a flag.
+`--graders` takes a comma list and defaults to every registered Grader.
+`correctness` is the first one ([docs/metrics.md](docs/metrics.md#graders)):
+a normalized match scores 1 without a judge call, otherwise the judge is asked
+for a JSON verdict. A judge that cannot answer is a `grader_error`, excluded
+from the mean and counted, never a zero.
+
+The other options are `retrieval run`'s: `--config` (repeatable), `--top-k`,
+`--concurrency`, `--max-consecutive-errors`, `--request-timeout`, `--out-dir`,
+`--run-id` and `--base-url`. A null query is still asked and graded; it just
+has no retrieval metric. The results file records the judge model and the
+Grader names, and the summary line adds each Grader's mean and counts.
+
+To record and replay the judge too, point its base URL at the proxy: pass
+`--upstream judge=<provider URL>` in `record` mode and set
+`TRELIS_EVAL_JUDGE_BASE_URL=http://127.0.0.1:4100/judge` in both modes. The
+proxy already routes any `[a-z]+` role, so it needs no change. The harness
+still requires a non-empty `TRELIS_EVAL_JUDGE_API_KEY` in replay, because it
+always sends an `Authorization` header; the proxy ignores its value when no
+upstream is called.
+
 ## Build the Ablation Matrix report
 
 Turn results files into the Ablation Matrix, with a 95% confidence interval on
-every metric and latency percentile:
+every metric, each Grader column and every latency percentile:
 
 ```sh
 uv run --project eval trelis-eval report eval/baselines

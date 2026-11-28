@@ -6,12 +6,16 @@ import httpx
 import pytest
 
 from trelis_eval.client import (
+    AnswerDebug,
+    AnswerResult,
+    Citation,
     Document,
     RetrievalAnswer,
     RetrievedChunk,
     TraceStep,
     TrelisClient,
     TrelisError,
+    Usage,
 )
 
 BASE_URL = "http://trelis.test"
@@ -356,3 +360,152 @@ def test_retrieve_accepts_a_trace_step_without_optional_fields():
     assert answer.trace == (
         TraceStep(step="search", technique=None, duration_ms=1, model=None, candidates=None),
     )
+
+
+def answer_data():
+    data = retrieval_data()
+    return {
+        "answer": "The Alpha Mission launched in 2024 [1].",
+        "citations": [{"marker": 1, "chunk_id": "chunk-1", "document_id": "doc-1"}],
+        "finish_reason": "stop",
+        "debug": {
+            "results": data["results"],
+            "trace": data["trace"],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 20, "total_tokens": 140},
+        },
+    }
+
+
+def test_answer_posts_the_query_with_debug_and_parses_the_answer():
+    seen = {}
+
+    def handler(request):
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"success": True, "data": answer_data()})
+
+    result = make_client(handler).answer("Which missions?", 5, ["dense", "bm25"])
+
+    assert seen == {
+        "method": "POST",
+        "url": f"{BASE_URL}/answer",
+        "body": {
+            "query": "Which missions?",
+            "top_k": 5,
+            "retrieval_config": {"techniques": ["dense", "bm25"]},
+            "debug": True,
+        },
+    }
+    assert result == AnswerResult(
+        answer="The Alpha Mission launched in 2024 [1].",
+        citations=(Citation(marker=1, chunk_id="chunk-1", document_id="doc-1"),),
+        finish_reason="stop",
+        debug=AnswerDebug(
+            results=(
+                RetrievedChunk(
+                    chunk_id="chunk-1",
+                    document_id="doc-1",
+                    seq=0,
+                    content="The Alpha Mission launched in 2024.",
+                    context_header="# Alpha Mission Launches",
+                    score=0.75,
+                    scores={"dense": 0.75},
+                ),
+                RetrievedChunk(
+                    chunk_id="chunk-2",
+                    document_id="doc-2",
+                    seq=3,
+                    content="The Beta Probe returned in 2024.",
+                    context_header="",
+                    score=0.5,
+                    scores={"dense": 0.5},
+                ),
+            ),
+            trace=(
+                TraceStep(
+                    step="embed_query",
+                    technique="dense",
+                    duration_ms=4,
+                    model="text-embedding-3-small",
+                    candidates=None,
+                ),
+                TraceStep(
+                    step="search",
+                    technique="dense",
+                    duration_ms=6,
+                    model=None,
+                    candidates=2,
+                ),
+            ),
+            usage=Usage(prompt_tokens=120, completion_tokens=20, total_tokens=140),
+        ),
+    )
+
+
+def test_answer_without_debug_keeps_the_debug_object_absent():
+    data = answer_data()
+    del data["debug"]
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"success": True, "data": data})
+
+    seen = {}
+
+    result = make_client(handler).answer("Which?", 10, ["dense"], debug=False)
+
+    assert seen["body"]["debug"] is False
+    assert result.debug is None
+
+
+def test_answer_raises_trelis_error_like_retrieve():
+    def handler(request):
+        return httpx.Response(
+            400,
+            json={
+                "success": False,
+                "error": {"code": 1010, "message": "bad request", "details": None},
+            },
+        )
+
+    with pytest.raises(TrelisError) as caught:
+        make_client(handler).answer("Which?", 10, ["dense"])
+
+    assert caught.value.status == 400
+    assert caught.value.code == 1010
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {**answer_data(), "answer": None},
+        {**answer_data(), "citations": "nope"},
+        {**answer_data(), "finish_reason": None},
+        {
+            **answer_data(),
+            "debug": {
+                "results": [],
+                "trace": [],
+                "usage": {"prompt_tokens": "many"},
+            },
+        },
+    ],
+)
+def test_answer_rejects_a_malformed_answer(data):
+    def handler(request):
+        return httpx.Response(200, json={"success": True, "data": data})
+
+    with pytest.raises(TrelisError, match="malformed answer"):
+        make_client(handler).answer("Which?", 10, ["dense"])
+
+
+def test_answer_requires_the_debug_object_when_it_asked_for_one():
+    data = answer_data()
+    del data["debug"]
+
+    def handler(request):
+        return httpx.Response(200, json={"success": True, "data": data})
+
+    with pytest.raises(TrelisError, match="debug"):
+        make_client(handler).answer("Which?", 10, ["dense"])
