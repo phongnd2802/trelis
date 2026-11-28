@@ -70,3 +70,15 @@ FROM document_groups dg
 JOIN groups g ON g.id = dg.group_id
 WHERE dg.document_id = $1
 ORDER BY g.name;
+
+-- Every Document whose parse_status is pending: its workflow start failed,
+-- or the run is queued and has not set processing yet. Submitting it again is
+-- safe because the workflow ID is the Document ID and StartIngest joins an
+-- open run (ADR-0005).
+-- name: ListPendingDocumentIDs :many
+SELECT id FROM documents WHERE parse_status = 'pending' ORDER BY id;
+
+-- The current upload ID of each of the given Documents. The reconciler
+-- treats objects under any other upload ID as a replaced upload (ADR-0006).
+-- name: ListDocumentUploadIDs :many
+SELECT id, upload_id FROM documents WHERE id = ANY(sqlc.arg(document_ids)::uuid[]);

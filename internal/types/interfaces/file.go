@@ -13,6 +13,7 @@ import (
 	"errors"
 	"io"
 	"mime/multipart"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -32,6 +33,19 @@ type FileService interface {
 	// DeleteFile deletes the object at key; deleting a missing one is not an
 	// error.
 	DeleteFile(ctx context.Context, key string) error
+	// ListObjects returns every object whose key starts with prefix, ordered
+	// by key, with the time each was last modified.
+	ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error)
+	// DeletePrefix deletes every object whose key starts with prefix. It is
+	// idempotent: a prefix with no objects is not an error.
+	DeletePrefix(ctx context.Context, prefix string) error
+}
+
+// ObjectInfo is one object in the store: its key and when it was last
+// modified.
+type ObjectInfo struct {
+	Key          string
+	LastModified time.Time
 }
 
 // ErrFileNotFound is returned by GetFile when no object exists at the key.

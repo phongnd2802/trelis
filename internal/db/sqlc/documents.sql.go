@@ -247,6 +247,65 @@ func (q *Queries) ListDocumentPrincipals(ctx context.Context, documentID uuid.UU
 	return items, nil
 }
 
+const listDocumentUploadIDs = `-- name: ListDocumentUploadIDs :many
+SELECT id, upload_id FROM documents WHERE id = ANY($1::uuid[])
+`
+
+type ListDocumentUploadIDsRow struct {
+	ID       uuid.UUID
+	UploadID uuid.UUID
+}
+
+// The current upload ID of each of the given Documents. The reconciler
+// treats objects under any other upload ID as a replaced upload (ADR-0006).
+func (q *Queries) ListDocumentUploadIDs(ctx context.Context, documentIds []uuid.UUID) ([]ListDocumentUploadIDsRow, error) {
+	rows, err := q.db.Query(ctx, listDocumentUploadIDs, documentIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListDocumentUploadIDsRow
+	for rows.Next() {
+		var i ListDocumentUploadIDsRow
+		if err := rows.Scan(&i.ID, &i.UploadID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPendingDocumentIDs = `-- name: ListPendingDocumentIDs :many
+SELECT id FROM documents WHERE parse_status = 'pending' ORDER BY id
+`
+
+// Every Document whose parse_status is pending: its workflow start failed,
+// or the run is queued and has not set processing yet. Submitting it again is
+// safe because the workflow ID is the Document ID and StartIngest joins an
+// open run (ADR-0005).
+func (q *Queries) ListPendingDocumentIDs(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listPendingDocumentIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listReadableDocumentIDs = `-- name: ListReadableDocumentIDs :many
 SELECT id FROM documents
 WHERE parse_status = 'completed'

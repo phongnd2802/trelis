@@ -160,6 +160,35 @@ func (r *documentRepository) ListReadableDocumentIDs(ctx context.Context, princi
 	return ids, nil
 }
 
+// ListPendingDocumentIDs returns the IDs of Documents with parse_status
+// pending, including ones whose workflow is queued but has not set processing
+// yet. Starting one again joins the open run, because the workflow ID is the
+// Document ID.
+func (r *documentRepository) ListPendingDocumentIDs(ctx context.Context) ([]uuid.UUID, error) {
+	ids, err := r.store.Querier(ctx).ListPendingDocumentIDs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list pending document IDs: %w", err)
+	}
+	return ids, nil
+}
+
+// ListDocumentUploadIDs returns the current upload ID of each Document in ids
+// that still exists, keyed by Document ID.
+func (r *documentRepository) ListDocumentUploadIDs(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]uuid.UUID, error) {
+	uploads := make(map[uuid.UUID]uuid.UUID, len(ids))
+	if len(ids) == 0 {
+		return uploads, nil
+	}
+	rows, err := r.store.Querier(ctx).ListDocumentUploadIDs(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("list document upload IDs: %w", err)
+	}
+	for _, row := range rows {
+		uploads[row.ID] = row.UploadID
+	}
+	return uploads, nil
+}
+
 // GetAccessList returns the names on a Document's Access List, sorted.
 func (r *documentRepository) GetAccessList(ctx context.Context, id uuid.UUID) (*types.AccessList, error) {
 	q := r.store.Querier(ctx)

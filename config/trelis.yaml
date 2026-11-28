@@ -100,6 +100,15 @@ chunking:
   # at least twice chunk_size.
   parent_chunk_size: 2048
 
+# Reconciler. Every server process runs one pass just after start and then
+# once per interval. A pass restarts the ingest workflow of a Document left
+# pending because starting it failed (starting is not in the upload's
+# transaction, ADR-0005) and deletes objects that outlived their Document row
+# (ADR-0006). Every step is idempotent, so several replicas may run it at
+# once.
+reconciler:
+  interval: 1m
+
 # Model roles. Each role points at its own OpenAI-compatible provider
 # (base_url, model, api_key); a role left empty is unconfigured. Keep keys
 # out of this file: set TRELIS_MODELS_<ROLE>_API_KEY instead. For your own

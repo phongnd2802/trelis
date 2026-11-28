@@ -26,15 +26,16 @@ const minShutdownTimeout = time.Second
 // Config is the whole service configuration.
 type Config struct {
 	// Env is development or production; it picks the log defaults.
-	Env      string   `mapstructure:"env"`
-	Server   Server   `mapstructure:"server"`
-	Postgres Postgres `mapstructure:"postgres"`
-	Neo4j    Neo4j    `mapstructure:"neo4j"`
-	Temporal Temporal `mapstructure:"temporal"`
-	Storage  Storage  `mapstructure:"storage"`
-	Models   Models   `mapstructure:"models"`
-	Chunking Chunking `mapstructure:"chunking"`
-	Log      Log      `mapstructure:"log"`
+	Env        string     `mapstructure:"env"`
+	Server     Server     `mapstructure:"server"`
+	Postgres   Postgres   `mapstructure:"postgres"`
+	Neo4j      Neo4j      `mapstructure:"neo4j"`
+	Temporal   Temporal   `mapstructure:"temporal"`
+	Storage    Storage    `mapstructure:"storage"`
+	Models     Models     `mapstructure:"models"`
+	Chunking   Chunking   `mapstructure:"chunking"`
+	Reconciler Reconciler `mapstructure:"reconciler"`
+	Log        Log        `mapstructure:"log"`
 }
 
 // Server configures the HTTP listener.
@@ -227,6 +228,7 @@ func (c *Config) validate() error {
 	errs = append(errs, c.Storage.S3.validate()...)
 	errs = append(errs, c.Models.validate()...)
 	errs = append(errs, c.Chunking.validate()...)
+	errs = append(errs, c.Reconciler.validate()...)
 	errs = append(errs, c.Log.validate()...)
 
 	return errors.Join(errs...)

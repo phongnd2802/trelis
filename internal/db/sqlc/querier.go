@@ -45,12 +45,20 @@ type Querier interface {
 	ListAPIKeys(ctx context.Context, principalID uuid.UUID) ([]ListAPIKeysRow, error)
 	ListDocumentGroups(ctx context.Context, documentID uuid.UUID) ([]string, error)
 	ListDocumentPrincipals(ctx context.Context, documentID uuid.UUID) ([]string, error)
+	// The current upload ID of each of the given Documents. The reconciler
+	// treats objects under any other upload ID as a replaced upload (ADR-0006).
+	ListDocumentUploadIDs(ctx context.Context, documentIds []uuid.UUID) ([]ListDocumentUploadIDsRow, error)
 	// Parent Chunks of the readable Documents (#36): retrieval matches Chunks,
 	// then replaces them with the Parent Chunks they link to. The readable-ID
 	// filter is part of the query, so a Parent Chunk of a Document the caller
 	// cannot read is never returned even when a stale Chunk still links to it
 	// (ADR-0004).
 	ListParentChunks(ctx context.Context, arg ListParentChunksParams) ([]ParentChunk, error)
+	// Every Document whose parse_status is pending: its workflow start failed,
+	// or the run is queued and has not set processing yet. Submitting it again is
+	// safe because the workflow ID is the Document ID and StartIngest joins an
+	// open run (ADR-0005).
+	ListPendingDocumentIDs(ctx context.Context) ([]uuid.UUID, error)
 	ListPrincipalGroups(ctx context.Context, principalID uuid.UUID) ([]ListPrincipalGroupsRow, error)
 	// The Documents a Principal can read that finished ingest. Retrieval passes
 	// this set into every search; a Document still processing has only part of
