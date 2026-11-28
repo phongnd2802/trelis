@@ -9,8 +9,7 @@ import (
 // SSEWriter frames Server-Sent Events on a ResponseWriter and flushes every
 // frame, so a client receives each one before the handler returns. The caller
 // sets Content-Type: text/event-stream and the other stream headers before
-// the first write. The ingest progress stream uses it today; streamed answers
-// (#43) will use the same writer.
+// the first write. The ingest progress and streamed answer streams use it.
 type SSEWriter struct {
 	w http.ResponseWriter
 }

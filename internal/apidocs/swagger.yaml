@@ -452,22 +452,31 @@ paths:
     post:
       consumes:
       - application/json
-      description: Retrieves the Documents the caller can read, then asks models.chat
+      description: 'Retrieves the Documents the caller can read, then asks models.chat
         for one answer that cites the retrieved Chunks. Sources are numbered [1]..[n]
         in retrieval order; each claim is cited with its source numbers in square
         brackets, the answer text keeps the valid markers, and citations lists each
         cited source once in order of first appearance. A marker outside 1..n is removed
         from the text and never cited; a marker inside Markdown code or a Markdown
         link is left untouched and never cited. When retrieval finds nothing the answer
-        is a fixed sentence in the question's language and no chat call is made. debug
-        adds the retrieved Chunks (exactly as POST /retrieve answers them), the trace
-        with a final generate step, and the chat call's token usage. Malformed JSON,
-        unknown fields, invalid values and the retrieval rules are 400; a body over
-        64 KiB is 413; without models.chat the route answers 503 before any retrieval,
-        and retrieval's own 503 (models.embedding for dense, models.rerank for rerank)
-        passes through; a model provider's rejection of a retrieval or chat call (its
-        credentials, credit, permission or rate limit) is 502 and names the model
-        role in its message, and any other model failure is a generic 500.
+        is a fixed sentence in the question''s language and no chat call is made.
+        debug adds the retrieved Chunks (exactly as POST /retrieve answers them),
+        the trace with a final generate step, and the chat call''s token usage. With
+        Accept: text/event-stream the answer streams Answer Events as Server-Sent
+        Events instead: id is the per-answer seq and event is started {"answer_id"},
+        token {"text"} per model delta, citation {"marker","chunk_id","document_id"}
+        after the text, then done {"answer","finish_reason","debug"?}; an error {"message"}
+        replaces done when generation fails, and both are terminal. The chat stream
+        is opened before the SSE response, so a provider rejection is the same JSON
+        502. A dropped client resumes at GET /answers/{answer_id}/events with Last-Event-ID.
+        Malformed JSON, unknown fields, invalid values and the retrieval rules are
+        400; a body over 64 KiB is 413; without models.chat the route answers 503
+        before any retrieval, and retrieval''s own 503 (models.embedding for dense,
+        models.rerank for rerank) passes through; a model provider''s rejection of
+        a retrieval or opening the chat stream (its credentials, credit, permission
+        or rate limit) is 502 and names the model role in its message, and any other
+        model failure is a generic 500. Every one of these failures answers the JSON
+        error before the SSE headers.'
       parameters:
       - description: The query, how many Chunks to retrieve, which Retrieval Techniques
           to run and whether to return the debug object
@@ -478,9 +487,12 @@ paths:
           $ref: '#/definitions/types.AnswerRequest'
       produces:
       - application/json
+      - text/event-stream
       responses:
         "200":
-          description: OK
+          description: 'The JSON answer when Accept does not ask for text/event-stream;
+            otherwise Server-Sent Events: started, token..., citation..., then done
+            or error'
           schema:
             allOf:
             - $ref: '#/definitions/handler.DataResponse'
@@ -522,6 +534,58 @@ paths:
       security:
       - bearerAuth: []
       summary: Answer a question from readable Documents
+      tags:
+      - answering
+  /answers/{answer_id}/events:
+    get:
+      description: Streams a Pipeline Answer's Answer Events as Server-Sent Events,
+        starting after Last-Event-ID. Each frame's id is the event's seq within the
+        answer and event is started, token, citation, done or error. started carries
+        {"answer_id"}, token {"text"} (the raw model delta), citation {"marker","chunk_id","document_id"}
+        once per cited source in first-appearance order, and done {"answer","finish_reason","debug"?}
+        or error {"message"} ends the stream. Only the Principal who asked for the
+        answer may resume it; any other caller gets the same 404 as for an unknown
+        or expired answer ID.
+      parameters:
+      - description: Answer ID
+        format: uuid
+        in: path
+        name: answer_id
+        required: true
+        type: string
+      - description: Seq of the last event the client saw; only later events are sent
+        in: header
+        name: Last-Event-ID
+        type: string
+      produces:
+      - text/event-stream
+      responses:
+        "200":
+          description: Server-Sent Events, one frame per answer event; the stream
+            ends after done or error
+          schema:
+            type: string
+        "400":
+          description: Invalid Last-Event-ID
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "401":
+          description: Missing or invalid API key
+          schema:
+            $ref: '#/definitions/router.ErrorResponse'
+        "404":
+          description: No answer stream with that ID, it expired, or it belongs to
+            another Principal
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal server error; a failed API key check answers the router's
+            error body instead
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - bearerAuth: []
+      summary: Resume a streamed Pipeline Answer
       tags:
       - answering
   /chunks/{id}:

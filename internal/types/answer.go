@@ -51,3 +51,74 @@ type AnswerResult struct {
 	// out.
 	Debug *AnswerDebug `json:"debug,omitempty"`
 }
+
+// AnswerEventType names one kind of Answer Event.
+type AnswerEventType string
+
+// The Answer Event types of a streamed Pipeline Answer, in the order the
+// service emits them. started comes first, token events follow while the chat
+// role streams, one citation event precedes done for every cited source, and
+// done or error is terminal.
+const (
+	AnswerEventStarted  AnswerEventType = "started"
+	AnswerEventToken    AnswerEventType = "token"
+	AnswerEventCitation AnswerEventType = "citation"
+	AnswerEventDone     AnswerEventType = "done"
+	AnswerEventError    AnswerEventType = "error"
+)
+
+// AnswerEvent is one Answer Event: one event of a streamed Pipeline Answer.
+// Seq numbers the events of one answer from 1, so a client resumes with the
+// seq of the last event it saw.
+type AnswerEvent struct {
+	Seq  int64
+	Type AnswerEventType
+	// Data is the event's JSON payload; the handler frames it as the data
+	// line and never changes it.
+	Data any
+}
+
+// AnswerSubscription is one read of an answer's buffered events: the Answer
+// Events after the requested seq, a channel closed when more arrive or the
+// stream ends, and whether it has ended.
+type AnswerSubscription struct {
+	Events []AnswerEvent
+	Wait   <-chan struct{}
+	Done   bool
+}
+
+// AnswerStartedEvent is the first event of a streamed answer: the answer ID a
+// client uses to resume.
+type AnswerStartedEvent struct {
+	AnswerID uuid.UUID `json:"answer_id"`
+}
+
+// AnswerTokenEvent is one raw text delta from the chat role. Concatenating
+// the token events gives the model's full reply, before citation markers are
+// cleaned.
+type AnswerTokenEvent struct {
+	Text string `json:"text"`
+}
+
+// AnswerCitationEvent is one source the answer cites: the marker in the text
+// and the Chunk and Document it opens.
+type AnswerCitationEvent struct {
+	Marker     int       `json:"marker"`
+	ChunkID    uuid.UUID `json:"chunk_id"`
+	DocumentID uuid.UUID `json:"document_id"`
+}
+
+// AnswerDoneEvent is the terminal event of a successful streamed answer. The
+// answer is the cleaned text, exactly as the JSON answer would return it.
+type AnswerDoneEvent struct {
+	Answer       string `json:"answer"`
+	FinishReason string `json:"finish_reason"`
+	// Debug is present only when the request set debug.
+	Debug *AnswerDebug `json:"debug,omitempty"`
+}
+
+// AnswerErrorEvent is the terminal event of a failed streamed answer. Message
+// is generic: the cause is logged, never sent to the client.
+type AnswerErrorEvent struct {
+	Message string `json:"message"`
+}

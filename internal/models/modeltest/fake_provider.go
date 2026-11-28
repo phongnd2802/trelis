@@ -26,7 +26,8 @@
 // NOTICE.) Embeddings and rerank need no script: they answer from the
 // input text ([FakeProvider.EmbedAs] and [FakeProvider.ScoreAs] pin values).
 // [FakeProvider.FailNext] makes an endpoint return errors for a while,
-// [FakeProvider.Delay] holds a request in flight, and
+// [FakeProvider.Delay] holds a request in flight,
+// [FakeProvider.StreamHold] holds a streamed chat between chunks, and
 // [FakeProvider.CallCount] and [FakeProvider.Requests] report what each
 // endpoint received.
 package modeltest
@@ -65,11 +66,16 @@ type FakeProvider struct {
 	rules    []rule
 	failures map[Endpoint][]failure
 	delays   map[Endpoint]time.Duration
-	requests map[Endpoint][]Request
-	vectors  map[string][]float32
-	scores   map[[2]string]float64
-	dims     int
-	seq      int
+	// streamHold, when non-nil, blocks a streamed chat after its first text
+	// chunk until the channel closes.
+	streamHold <-chan struct{}
+	// streamedText counts the text chunks the current streamed chat sent.
+	streamedText int
+	requests     map[Endpoint][]Request
+	vectors      map[string][]float32
+	scores       map[[2]string]float64
+	dims         int
+	seq          int
 }
 
 // script is one Script registration; replies still to be given.
@@ -162,6 +168,44 @@ func (p *FakeProvider) Delay(e Endpoint, d time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.delays[e] = d
+}
+
+// StreamHold makes a streamed chat pause after its first text chunk until
+// release closes, so a test can read that chunk while the provider still has
+// chunks to send. Nil removes the hold.
+func (p *FakeProvider) StreamHold(release <-chan struct{}) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.streamHold = release
+}
+
+// StreamedTextChunks is how many text chunks the current streamed chat has
+// sent, for a test proving a chunk arrived while the provider was held.
+func (p *FakeProvider) StreamedTextChunks() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.streamedText
+}
+
+// beginStreamedChat resets the text chunk count for a new stream.
+func (p *FakeProvider) beginStreamedChat() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.streamedText = 0
+}
+
+// recordStreamedTextChunk counts one text chunk sent.
+func (p *FakeProvider) recordStreamedTextChunk() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.streamedText++
+}
+
+// streamRelease returns the current stream hold, or nil. p.mu is not held.
+func (p *FakeProvider) streamRelease() <-chan struct{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.streamHold
 }
 
 // CallCount is how many requests e received, failed ones included.

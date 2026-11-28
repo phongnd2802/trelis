@@ -108,6 +108,10 @@ _Avoid_: Long-term memory, profile
 An answer produced by a fixed sequence of retrieval and generation steps.
 _Avoid_: RAG mode, simple mode
 
+**Answer Event**:
+One event of a streamed Pipeline Answer, numbered in order with a sequence number per answer, so a client can follow the answer as a Server-Sent Events stream and resume from the last event it saw.
+_Avoid_: Token message, SSE message
+
 **Agent Answer**:
 An answer produced by a model that decides, step by step, which tools to call before answering.
 _Avoid_: Agentic mode, deep mode

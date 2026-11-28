@@ -335,7 +335,8 @@ func run(configPath string, args []string) (err error) {
 	docs := handler.NewDocumentHandler(documentService, cfg.Storage.MaxFileSize())
 	retrievalService := service.NewRetrievalService(docRepo, repository.NewChunkSearcher(dbStore), embedder, reranker)
 	retrieval := handler.NewRetrievalHandler(retrievalService)
-	answers := handler.NewAnswerHandler(service.NewAnswerService(retrievalService, answerGenerator))
+	answerService := service.NewAnswerService(retrievalService, answerGenerator)
+	answers := handler.NewAnswerHandler(answerService)
 	chunks := handler.NewChunkHandler(service.NewChunkService(repository.NewChunkReader(dbStore)))
 
 	ready := router.Readiness{Timeout: readyTimeout, Checks: []router.Check{
@@ -356,10 +357,16 @@ func run(configPath string, args []string) (err error) {
 	// keep the message and the field name.
 	logger.Ctx(ctx).Info("trelis listening", zap.String("addr", ln.Addr().String()), zap.String("config", configPath))
 
-	if err := router.Serve(ctx, ln, router.New(ready, service.NewAuthService(principalRepo, keyRepo),
+	serveErr := router.Serve(ctx, ln, router.New(ready, service.NewAuthService(principalRepo, keyRepo),
 		handler.NewPrincipalHandler(principals), docs, retrieval, answers, chunks,
-		cfg.Server.Swagger), cfg.Server.ShutdownTimeout); err != nil {
-		return err
+		cfg.Server.Swagger), cfg.Server.ShutdownTimeout)
+	closeCtx, cancelClose := context.WithTimeout(context.WithoutCancel(ctx), cfg.Server.ShutdownTimeout)
+	defer cancelClose()
+	if err := answerService.Close(closeCtx); err != nil {
+		logger.Ctx(ctx).Warn("answer generation still running at shutdown", zap.Error(err))
+	}
+	if serveErr != nil {
+		return serveErr
 	}
 	logger.Ctx(ctx).Info("trelis stopped")
 	return nil
