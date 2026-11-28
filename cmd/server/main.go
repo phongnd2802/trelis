@@ -312,10 +312,12 @@ func run(configPath string, args []string) (err error) {
 		logger.Ctx(ctx).Warn("no chat model configured; pipeline answers will answer service unavailable")
 	}
 	starter := ingest.NewStarter(temporal, cfg.Temporal.TaskQueue)
+	chunkRepo := repository.NewChunkRepository(dbStore)
 	// One Starter serves both roles: the ingest start and the delete cleanup.
-	documentService := service.NewDocumentService(dbStore, docRepo, principalRepo, eventRepo, files, starter, starter)
+	documentService := service.NewDocumentService(dbStore, docRepo, principalRepo, eventRepo,
+		chunkRepo, files, starter, starter)
 	ingestActivities := ingest.NewActivities(service.NewIngestService(dbStore, docRepo,
-		repository.NewChunkRepository(dbStore), eventRepo, files, parser.NewFormatRouter(false), embedder,
+		chunkRepo, eventRepo, files, parser.NewFormatRouter(false), embedder,
 		cfg.Chunking.SplitterConfig()), documentService)
 	stopIngestWorker := startWorker(ctx, "ingest", cfg.Temporal.TaskQueue, func() worker.Worker {
 		return ingest.NewWorker(temporal, cfg.Temporal.TaskQueue, cfg.Temporal.ModelTaskQueue,

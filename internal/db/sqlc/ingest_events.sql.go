@@ -18,32 +18,39 @@ WITH next AS (
     WHERE id = $1
     RETURNING ingest_event_seq
 )
-INSERT INTO ingest_events (document_id, seq, type, detail)
-SELECT $1, next.ingest_event_seq, $2, $3
+INSERT INTO ingest_events (document_id, seq, type, detail, upload_id)
+SELECT $1, next.ingest_event_seq, $2, $3, $4
 FROM next
-RETURNING document_id, seq, type, detail, created_at
+RETURNING document_id, seq, type, detail, created_at, upload_id
 `
 
 type InsertIngestEventParams struct {
 	DocumentID uuid.UUID
 	Type       string
 	Detail     []byte
+	UploadID   uuid.UUID
 }
 
 // Appends one Ingest Event to its Document's stream and returns it with the
-// per-Document seq and created_at Postgres assigned. The UPDATE advances the
-// Document's counter under its row lock, held until this transaction commits:
-// the next event of that Document cannot take a seq until this one has
-// committed, so seq order is commit order and a reader that resumes after a
-// seq never misses an event. Zero rows means the Document is gone; the
-// repository maps that to ErrDocumentNotFound.
+// per-Document seq and created_at Postgres assigned, and the upload the
+// event belongs to. The UPDATE advances the Document's counter under its row
+// lock, held until this transaction commits: the next event of that Document
+// cannot take a seq until this one has committed, so seq order is commit
+// order and a reader that resumes after a seq never misses an event. Zero
+// rows means the Document is gone; the repository maps that to
+// ErrDocumentNotFound.
 //
 // A caller inside a transaction inserts the event first: the UPDATE locks the
 // Document row before the transaction touches any Chunk rows, the same order
 // the delete cascade uses, so the two cannot deadlock. The lock is held until
 // commit, which is what makes seq order commit order.
 func (q *Queries) InsertIngestEvent(ctx context.Context, arg InsertIngestEventParams) (IngestEvent, error) {
-	row := q.db.QueryRow(ctx, insertIngestEvent, arg.DocumentID, arg.Type, arg.Detail)
+	row := q.db.QueryRow(ctx, insertIngestEvent,
+		arg.DocumentID,
+		arg.Type,
+		arg.Detail,
+		arg.UploadID,
+	)
 	var i IngestEvent
 	err := row.Scan(
 		&i.DocumentID,
@@ -51,12 +58,13 @@ func (q *Queries) InsertIngestEvent(ctx context.Context, arg InsertIngestEventPa
 		&i.Type,
 		&i.Detail,
 		&i.CreatedAt,
+		&i.UploadID,
 	)
 	return i, err
 }
 
 const listIngestEventsAfter = `-- name: ListIngestEventsAfter :many
-SELECT document_id, seq, type, detail, created_at FROM ingest_events
+SELECT document_id, seq, type, detail, created_at, upload_id FROM ingest_events
 WHERE document_id = $1
   AND seq > $2
 ORDER BY seq
@@ -85,6 +93,7 @@ func (q *Queries) ListIngestEventsAfter(ctx context.Context, arg ListIngestEvent
 			&i.Type,
 			&i.Detail,
 			&i.CreatedAt,
+			&i.UploadID,
 		); err != nil {
 			return nil, err
 		}

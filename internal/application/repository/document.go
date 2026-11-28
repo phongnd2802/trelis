@@ -22,6 +22,9 @@ var (
 	// ErrDuplicateDocument means the owner already has a Document with that
 	// content hash.
 	ErrDuplicateDocument = errors.New("document with the same content already exists")
+	// ErrUploadChanged means the Document's upload ID no longer matches the
+	// one the caller read: a concurrent re-upload or a delete won.
+	ErrUploadChanged = errors.New("document upload changed")
 )
 
 type documentRepository struct {
@@ -82,6 +85,45 @@ func (r *documentRepository) GetDocumentByOwnerAndHash(ctx context.Context, owne
 	return fromRow(row), nil
 }
 
+// ReplaceDocumentUpload applies updated's new upload and file metadata in
+// place, but only while the Document's upload ID is still previousUploadID.
+// It starts no transaction: the caller runs it in one with the Chunk delete
+// and the upload_replaced event. A concurrent re-upload is ErrUploadChanged,
+// a delete is ErrDocumentNotFound and the owner already holding that content
+// is ErrDuplicateDocument.
+func (r *documentRepository) ReplaceDocumentUpload(ctx context.Context, updated *types.Document, previousUploadID uuid.UUID) (*types.Document, error) {
+	q := r.store.Querier(ctx)
+	row, err := q.ReplaceDocumentUpload(ctx, sqlc.ReplaceDocumentUploadParams{
+		UploadID:         updated.UploadID,
+		ObjectKey:        updated.ObjectKey,
+		FileName:         updated.FileName,
+		FileType:         updated.FileType,
+		FileSize:         updated.FileSize,
+		FileHash:         updated.FileHash,
+		Title:            updated.Title,
+		ID:               updated.ID,
+		PreviousUploadID: previousUploadID,
+	})
+	if errors.Is(err, db.ErrNotFound) {
+		// No row matched the id and previous upload. Tell the two causes
+		// apart so the caller can answer a conflict for a concurrent
+		// re-upload and not-found for a delete.
+		if _, getErr := q.GetDocumentByID(ctx, updated.ID); errors.Is(getErr, db.ErrNotFound) {
+			return nil, ErrDocumentNotFound
+		} else if getErr != nil {
+			return nil, fmt.Errorf("document %s: %w", updated.ID, getErr)
+		}
+		return nil, ErrUploadChanged
+	}
+	if db.IsUniqueViolation(err) {
+		return nil, ErrDuplicateDocument
+	}
+	if err != nil {
+		return nil, fmt.Errorf("replace upload of document %s: %w", updated.ID, err)
+	}
+	return fromRow(row), nil
+}
+
 // GetDocumentByID returns the Document without checking an Access List. It is
 // the system view the ingest activities use, which run with no Principal.
 func (r *documentRepository) GetDocumentByID(ctx context.Context, id uuid.UUID) (*types.Document, error) {
@@ -93,6 +135,33 @@ func (r *documentRepository) GetDocumentByID(ctx context.Context, id uuid.UUID) 
 		return nil, fmt.Errorf("document %s: %w", id, err)
 	}
 	return fromRow(row), nil
+}
+
+// GetDocumentUploadID returns the Document's current upload ID without
+// locking. An activity calls it after its event insert already holds the row
+// lock.
+func (r *documentRepository) GetDocumentUploadID(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	uploadID, err := r.store.Querier(ctx).GetDocumentUploadID(ctx, id)
+	if errors.Is(err, db.ErrNotFound) {
+		return uuid.Nil, ErrDocumentNotFound
+	}
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("upload of document %s: %w", id, err)
+	}
+	return uploadID, nil
+}
+
+// LockDocumentUploadID returns the Document's current upload ID, locking the
+// row until the surrounding transaction ends.
+func (r *documentRepository) LockDocumentUploadID(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	uploadID, err := r.store.Querier(ctx).LockDocumentUploadID(ctx, id)
+	if errors.Is(err, db.ErrNotFound) {
+		return uuid.Nil, ErrDocumentNotFound
+	}
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("lock upload of document %s: %w", id, err)
+	}
+	return uploadID, nil
 }
 
 // SetParseStatus sets a Document's parse status and, when it failed, the
@@ -115,17 +184,19 @@ func (r *documentRepository) SetParseStatus(ctx context.Context, id uuid.UUID, s
 }
 
 // DeleteDocument removes a Document; its Chunks, Parent Chunks and Access
-// List rows go with it by ON DELETE CASCADE. A Document already gone is
-// ErrDocumentNotFound, which covers a concurrent delete.
-func (r *documentRepository) DeleteDocument(ctx context.Context, id uuid.UUID) error {
-	rows, err := r.store.Querier(ctx).DeleteDocument(ctx, id)
+// List rows go with it by ON DELETE CASCADE. It returns the upload ID the row
+// had when it was deleted, so a cleanup cancels the ingest of the upload that
+// actually existed. A Document already gone is ErrDocumentNotFound, which
+// covers a concurrent delete.
+func (r *documentRepository) DeleteDocument(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	uploadID, err := r.store.Querier(ctx).DeleteDocument(ctx, id)
+	if errors.Is(err, db.ErrNotFound) {
+		return uuid.Nil, ErrDocumentNotFound
+	}
 	if err != nil {
-		return fmt.Errorf("delete document %s: %w", id, err)
+		return uuid.Nil, fmt.Errorf("delete document %s: %w", id, err)
 	}
-	if rows == 0 {
-		return ErrDocumentNotFound
-	}
-	return nil
+	return uploadID, nil
 }
 
 // GetReadableDocumentByID returns the Document if principalID can read it.
@@ -174,31 +245,42 @@ func (r *documentRepository) ListReadableDocumentIDs(ctx context.Context, princi
 	return ids, nil
 }
 
-// ListPendingDocumentIDs returns the IDs of Documents with parse_status
-// pending, including ones whose workflow is queued but has not set processing
-// yet. Starting one again joins the open run, because the workflow ID is the
-// Document ID.
-func (r *documentRepository) ListPendingDocumentIDs(ctx context.Context) ([]uuid.UUID, error) {
-	ids, err := r.store.Querier(ctx).ListPendingDocumentIDs(ctx)
+// ListPendingDocuments returns the current upload of every Document with
+// parse_status pending, including ones whose workflow is queued but has not
+// set processing yet. Starting one again joins the open run, because the
+// workflow ID carries the Document and upload IDs.
+func (r *documentRepository) ListPendingDocuments(ctx context.Context) ([]types.PendingDocument, error) {
+	rows, err := r.store.Querier(ctx).ListPendingDocuments(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list pending document IDs: %w", err)
+		return nil, fmt.Errorf("list pending documents: %w", err)
 	}
-	return ids, nil
+	documents := make([]types.PendingDocument, len(rows))
+	for i, row := range rows {
+		documents[i] = types.PendingDocument{
+			DocumentID: row.ID,
+			UploadID:   row.UploadID,
+		}
+	}
+	return documents, nil
 }
 
-// ListDocumentUploadIDs returns the current upload ID of each Document in ids
-// that still exists, keyed by Document ID.
-func (r *documentRepository) ListDocumentUploadIDs(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]uuid.UUID, error) {
-	uploads := make(map[uuid.UUID]uuid.UUID, len(ids))
+// ListDocumentUploads returns the current upload and parse status of each
+// Document in ids that still exists, keyed by Document ID.
+func (r *documentRepository) ListDocumentUploads(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]types.DocumentUpload, error) {
+	uploads := make(map[uuid.UUID]types.DocumentUpload, len(ids))
 	if len(ids) == 0 {
 		return uploads, nil
 	}
-	rows, err := r.store.Querier(ctx).ListDocumentUploadIDs(ctx, ids)
+	rows, err := r.store.Querier(ctx).ListDocumentUploads(ctx, ids)
 	if err != nil {
-		return nil, fmt.Errorf("list document upload IDs: %w", err)
+		return nil, fmt.Errorf("list document uploads: %w", err)
 	}
 	for _, row := range rows {
-		uploads[row.ID] = row.UploadID
+		uploads[row.ID] = types.DocumentUpload{
+			DocumentID:  row.ID,
+			UploadID:    row.UploadID,
+			ParseStatus: row.ParseStatus,
+		}
 	}
 	return uploads, nil
 }

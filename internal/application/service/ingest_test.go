@@ -76,6 +76,10 @@ func (f *fakeIngestDocuments) SetParseStatus(_ context.Context, _ uuid.UUID, sta
 	return nil
 }
 
+func (f *fakeIngestDocuments) GetDocumentUploadID(context.Context, uuid.UUID) (uuid.UUID, error) {
+	return f.doc.UploadID, nil
+}
+
 // fakeSourceFile serves one Source File from memory.
 type fakeSourceFile struct {
 	interfaces.FileService
@@ -161,6 +165,7 @@ func runParseAndChunk(t *testing.T, markdown string, splitter chunker.SplitterCo
 	t.Helper()
 	doc := &types.Document{
 		ID:        uuid.New(),
+		UploadID:  uuid.New(),
 		Title:     "luat-mau",
 		FileName:  "luat_mau.md",
 		FileType:  "md",
@@ -173,7 +178,7 @@ func runParseAndChunk(t *testing.T, markdown string, splitter chunker.SplitterCo
 		&fakeSourceFile{content: []byte("the file's bytes are not the Markdown body here")},
 		&fakeDocumentParser{markdown: markdown}, nil, splitter)
 
-	result, err := svc.ParseAndChunk(context.Background(), doc.ID, attempt)
+	result, err := svc.ParseAndChunk(context.Background(), doc.ID, doc.UploadID, attempt)
 	if err != nil {
 		t.Fatalf("ParseAndChunk: %v", err)
 	}
@@ -379,7 +384,7 @@ func TestCompleteRefusesWhileAChunkHasNoEmbedding(t *testing.T) {
 	// embedder play no part in it.
 	events := repository.NewIngestEventRepository(store)
 	ingest := NewIngestService(store, documents, chunks, events, nil, nil, nil, chunker.DefaultConfig())
-	err = ingest.Complete(ctx, doc.ID)
+	err = ingest.Complete(ctx, doc.ID, doc.UploadID)
 	if err == nil || !strings.Contains(err.Error(), "1") || !strings.Contains(err.Error(), "without an embedding") {
 		t.Fatalf("Complete with one unembedded Chunk = %v, want an error naming the missing count", err)
 	}
@@ -401,7 +406,7 @@ func TestCompleteRefusesWhileAChunkHasNoEmbedding(t *testing.T) {
 	if err := chunks.SetChunkEmbedding(ctx, unembedded[1].ID, []float32{3, 4}, "test-embedding"); err != nil {
 		t.Fatalf("SetChunkEmbedding: %v", err)
 	}
-	if err := ingest.Complete(ctx, doc.ID); err != nil {
+	if err := ingest.Complete(ctx, doc.ID, doc.UploadID); err != nil {
 		t.Fatalf("Complete after every Chunk was embedded: %v", err)
 	}
 	got, err = documents.GetDocumentByID(ctx, doc.ID)
@@ -420,12 +425,12 @@ func TestCompleteRefusesWhileAChunkHasNoEmbedding(t *testing.T) {
 	}
 
 	var missing *types.DocumentNotFoundError
-	if err := ingest.Complete(ctx, uuid.New()); !errors.As(err, &missing) {
+	if err := ingest.Complete(ctx, uuid.New(), uuid.New()); !errors.As(err, &missing) {
 		t.Errorf("Complete(unknown Document) = %v, want *types.DocumentNotFoundError", err)
 	}
 	// There is no row left to mark when the Document is gone, which is not an
 	// error for the workflow that is already ending.
-	if err := ingest.MarkFailed(ctx, uuid.New(), "the Source File could not be parsed"); err != nil {
+	if err := ingest.MarkFailed(ctx, uuid.New(), uuid.New(), "the Source File could not be parsed"); err != nil {
 		t.Errorf("MarkFailed(unknown Document) = %v, want nil", err)
 	}
 }
@@ -485,7 +490,7 @@ func TestAFailedChunkWriteLeavesNoParseFinishedEvent(t *testing.T) {
 	// one; parse_finished is inside the rolled-back transaction and never
 	// appears.
 	for attempt := 1; attempt <= 2; attempt++ {
-		if _, err := ingest.ParseAndChunk(ctx, doc.ID, attempt); err == nil {
+		if _, err := ingest.ParseAndChunk(ctx, doc.ID, doc.UploadID, attempt); err == nil {
 			t.Fatalf("attempt %d: ParseAndChunk = nil, want the Chunk insert error", attempt)
 		}
 	}
@@ -510,6 +515,7 @@ func TestAFailedChunkWriteLeavesNoParseFinishedEvent(t *testing.T) {
 func TestParseAndChunkMapsAMissingEventDocumentToNotFound(t *testing.T) {
 	doc := &types.Document{
 		ID:        uuid.New(),
+		UploadID:  uuid.New(),
 		Title:     "luat-thue.txt",
 		FileName:  "luat-thue.txt",
 		FileType:  "txt",
@@ -520,7 +526,7 @@ func TestParseAndChunkMapsAMissingEventDocumentToNotFound(t *testing.T) {
 		&fakeSourceFile{content: []byte("bytes")},
 		&fakeDocumentParser{markdown: "# Notes\n\nText.\n"}, nil, chunker.DefaultConfig())
 
-	_, err := ingest.ParseAndChunk(context.Background(), doc.ID, 1)
+	_, err := ingest.ParseAndChunk(context.Background(), doc.ID, doc.UploadID, 1)
 	var missing *types.DocumentNotFoundError
 	if !errors.As(err, &missing) {
 		t.Fatalf("ParseAndChunk = %v, want *types.DocumentNotFoundError when the Document row is gone", err)
@@ -552,7 +558,7 @@ func TestEmbedBatchWritesOneFinishedEventPerStoredBatch(t *testing.T) {
 	ingest := NewIngestService(store, repository.NewDocumentRepository(store), chunks, events,
 		nil, nil, embedder, chunker.DefaultConfig())
 
-	embedded, err := ingest.EmbedBatch(ctx, doc.ID, 0, 2)
+	embedded, err := ingest.EmbedBatch(ctx, doc.ID, doc.UploadID, 0, 2)
 	if err != nil || embedded != 2 {
 		t.Fatalf("EmbedBatch = %d, %v; want both Chunks embedded", embedded, err)
 	}
@@ -573,7 +579,7 @@ func TestEmbedBatchWritesOneFinishedEventPerStoredBatch(t *testing.T) {
 
 	// The range is already embedded, so this attempt has nothing to store and
 	// must not write a second finished event.
-	embedded, err = ingest.EmbedBatch(ctx, doc.ID, 0, 2)
+	embedded, err = ingest.EmbedBatch(ctx, doc.ID, doc.UploadID, 0, 2)
 	if err != nil || embedded != 0 {
 		t.Fatalf("EmbedBatch of an embedded range = %d, %v; want a no-op", embedded, err)
 	}
@@ -612,7 +618,7 @@ func TestEmbedBatchAndDocumentDeleteDoNotDeadlock(t *testing.T) {
 
 	batchErr := make(chan error, 1)
 	go func() {
-		_, err := ingest.EmbedBatch(ctx, doc.ID, 0, 2)
+		_, err := ingest.EmbedBatch(ctx, doc.ID, doc.UploadID, 0, 2)
 		batchErr <- err
 	}()
 	select {
@@ -622,7 +628,10 @@ func TestEmbedBatchAndDocumentDeleteDoNotDeadlock(t *testing.T) {
 	}
 
 	deleteErr := make(chan error, 1)
-	go func() { deleteErr <- repository.NewDocumentRepository(store).DeleteDocument(ctx, doc.ID) }()
+	go func() {
+		_, err := repository.NewDocumentRepository(store).DeleteDocument(ctx, doc.ID)
+		deleteErr <- err
+	}()
 	// Let the delete take the Document row and start its cascade before the
 	// embed transaction asks for anything else. With the old order (Chunks
 	// first, event last) the two then wait on each other; with the event
@@ -669,7 +678,7 @@ func TestMarkFailedWritesTheFailedEventWithItsSafeReason(t *testing.T) {
 		nil, nil, nil, chunker.DefaultConfig())
 
 	const reason = "the Source File could not be parsed"
-	if err := ingest.MarkFailed(ctx, doc.ID, reason); err != nil {
+	if err := ingest.MarkFailed(ctx, doc.ID, doc.UploadID, reason); err != nil {
 		t.Fatalf("MarkFailed: %v", err)
 	}
 	written, err := events.ListIngestEventsAfter(ctx, doc.ID, 0)
@@ -696,7 +705,7 @@ func TestMarkFailedWritesTheFailedEventWithItsSafeReason(t *testing.T) {
 
 	// A Document deleted before the failure has no row to mark and gets no
 	// event either.
-	if err := ingest.MarkFailed(ctx, uuid.New(), reason); err != nil {
+	if err := ingest.MarkFailed(ctx, uuid.New(), uuid.New(), reason); err != nil {
 		t.Errorf("MarkFailed(unknown Document) = %v, want nil", err)
 	}
 }

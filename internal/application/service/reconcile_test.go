@@ -27,34 +27,38 @@ import (
 // other DocumentRepository method is left to the embedded nil.
 type fakeReconcileDocuments struct {
 	interfaces.DocumentRepository
-	pending    []uuid.UUID
+	pending    []types.PendingDocument
 	pendingErr error
-	uploads    map[uuid.UUID]uuid.UUID
+	uploads    map[uuid.UUID]types.DocumentUpload
 	uploadsErr error
 	askedIDs   []uuid.UUID
 	uploadRuns int
 }
 
-func (f *fakeReconcileDocuments) ListPendingDocumentIDs(context.Context) ([]uuid.UUID, error) {
+func (f *fakeReconcileDocuments) ListPendingDocuments(context.Context) ([]types.PendingDocument, error) {
 	return f.pending, f.pendingErr
 }
 
-func (f *fakeReconcileDocuments) ListDocumentUploadIDs(_ context.Context, ids []uuid.UUID) (map[uuid.UUID]uuid.UUID, error) {
+func (f *fakeReconcileDocuments) ListDocumentUploads(_ context.Context, ids []uuid.UUID) (map[uuid.UUID]types.DocumentUpload, error) {
 	f.uploadRuns++
 	f.askedIDs = slices.Clone(ids)
 	return f.uploads, f.uploadsErr
 }
 
-// fakeReconcileStarter records the Documents it was asked to submit and fails
-// the ones in fail.
+// fakeReconcileStarter records the Documents and uploads it was asked to
+// submit and fails the Documents in fail.
 type fakeReconcileStarter struct {
-	submitted []uuid.UUID
+	submitted []types.PendingDocument
 	fail      map[uuid.UUID]error
 }
 
-func (f *fakeReconcileStarter) StartIngest(_ context.Context, documentID uuid.UUID) error {
-	f.submitted = append(f.submitted, documentID)
+func (f *fakeReconcileStarter) StartIngest(_ context.Context, documentID, uploadID uuid.UUID) error {
+	f.submitted = append(f.submitted, types.PendingDocument{DocumentID: documentID, UploadID: uploadID})
 	return f.fail[documentID]
+}
+
+func (f *fakeReconcileStarter) TerminateIngest(context.Context, uuid.UUID, uuid.UUID) error {
+	return nil
 }
 
 // failingDeleteFiles is a Memory whose prefix delete always fails.
@@ -111,19 +115,24 @@ func TestReconcileSubmitsOnlyPendingDocuments(t *testing.T) {
 	if err := svc.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if want := []uuid.UUID{pending.ID}; !slices.Equal(starter.submitted, want) {
-		t.Errorf("StartIngest got %v, want only the pending Document %v", starter.submitted, want)
+	want := []types.PendingDocument{{
+		DocumentID: pending.ID,
+		UploadID:   pending.UploadID,
+	}}
+	if !slices.Equal(starter.submitted, want) {
+		t.Errorf("StartIngest got %v, want only the pending Document's upload %v", starter.submitted, want)
 	}
 }
 
 func TestReconcileReportsAFailedSubmissionAndSubmitsTheOthers(t *testing.T) {
-	failing, healthy := uuid.New(), uuid.New()
+	failing, healthy := types.PendingDocument{DocumentID: uuid.New(), UploadID: uuid.New()},
+		types.PendingDocument{DocumentID: uuid.New(), UploadID: uuid.New()}
 	startErr := errors.New("temporal unavailable")
 	documents := &fakeReconcileDocuments{
-		pending: []uuid.UUID{failing, healthy},
-		uploads: map[uuid.UUID]uuid.UUID{},
+		pending: []types.PendingDocument{failing, healthy},
+		uploads: map[uuid.UUID]types.DocumentUpload{},
 	}
-	starter := &fakeReconcileStarter{fail: map[uuid.UUID]error{failing: startErr}}
+	starter := &fakeReconcileStarter{fail: map[uuid.UUID]error{failing.DocumentID: startErr}}
 	ctx, logs := observedContext()
 	svc := testReconciler(documents, filetest.NewMemory(), starter)
 
@@ -132,7 +141,7 @@ func TestReconcileReportsAFailedSubmissionAndSubmitsTheOthers(t *testing.T) {
 		!strings.Contains(err.Error(), startErr.Error()) {
 		t.Fatalf("Reconcile = %v, want one error counting the failure and naming its cause", err)
 	}
-	if want := []uuid.UUID{failing, healthy}; !slices.Equal(starter.submitted, want) {
+	if want := []types.PendingDocument{failing, healthy}; !slices.Equal(starter.submitted, want) {
 		t.Errorf("StartIngest got %v, want both Documents despite the failure %v", starter.submitted, want)
 	}
 	if warns := logs.FilterLevelExact(zapcore.WarnLevel); warns.Len() != 0 {
@@ -148,7 +157,7 @@ func TestReconcileReportsDeleteFailuresAsOneError(t *testing.T) {
 		files.PutObject(key, []byte("orphan"), reconcileNow.Add(-2*time.Hour))
 	}
 	deleteErr := errors.New("s3 unavailable")
-	documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]uuid.UUID{}}
+	documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]types.DocumentUpload{}}
 	ctx, logs := observedContext()
 	svc := testReconciler(documents,
 		&failingDeleteFiles{Memory: files, err: deleteErr}, &fakeReconcileStarter{})
@@ -168,7 +177,7 @@ func TestReconcileDeletesAnOrphanedDocumentPrefix(t *testing.T) {
 	files := filetest.NewMemory()
 	key := file.SourceKey(documentID, uploadID)
 	files.PutObject(key, []byte("orphan"), reconcileNow.Add(-2*time.Hour))
-	documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]uuid.UUID{}}
+	documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]types.DocumentUpload{}}
 	svc := testReconciler(documents, files, &fakeReconcileStarter{})
 
 	if err := svc.Reconcile(context.Background()); err != nil {
@@ -178,7 +187,7 @@ func TestReconcileDeletesAnOrphanedDocumentPrefix(t *testing.T) {
 		t.Errorf("store still holds %v, want the prefix of the missing Document deleted", keys)
 	}
 	if want := []uuid.UUID{documentID}; !slices.Equal(documents.askedIDs, want) {
-		t.Errorf("ListDocumentUploadIDs asked for %v, want %v once", documents.askedIDs, want)
+		t.Errorf("ListDocumentUploads asked for %v, want %v once", documents.askedIDs, want)
 	}
 }
 
@@ -190,7 +199,62 @@ func TestReconcileDeletesAStaleUploadAndKeepsTheCurrentOne(t *testing.T) {
 	// The current upload is old too: only a replaced upload is ever deleted.
 	files.PutObject(currentKey, []byte("current"), reconcileNow.Add(-3*time.Hour))
 	files.PutObject(staleKey, []byte("stale"), reconcileNow.Add(-2*time.Hour))
-	documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]uuid.UUID{documentID: currentUpload}}
+	documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]types.DocumentUpload{documentID: {
+		DocumentID:  documentID,
+		UploadID:    currentUpload,
+		ParseStatus: types.ParseStatusCompleted,
+	}}}
+	svc := testReconciler(documents, files, &fakeReconcileStarter{})
+
+	if err := svc.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if keys := files.Keys(); !slices.Equal(keys, []string{currentKey}) {
+		t.Errorf("store holds %v, want only the current upload %q", keys, currentKey)
+	}
+}
+
+func TestReconcileKeepsAStaleUploadUntilTheNewVersionFinishes(t *testing.T) {
+	for _, status := range []string{types.ParseStatusPending, types.ParseStatusProcessing} {
+		t.Run(status, func(t *testing.T) {
+			documentID, currentUpload, staleUpload := uuid.New(), uuid.New(), uuid.New()
+			files := filetest.NewMemory()
+			currentKey := file.SourceKey(documentID, currentUpload)
+			staleKey := file.SourceKey(documentID, staleUpload)
+			files.PutObject(currentKey, []byte("current"), reconcileNow.Add(-3*time.Hour))
+			files.PutObject(staleKey, []byte("stale"), reconcileNow.Add(-2*time.Hour))
+			documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]types.DocumentUpload{documentID: {
+				DocumentID:  documentID,
+				UploadID:    currentUpload,
+				ParseStatus: status,
+			}}}
+			svc := testReconciler(documents, files, &fakeReconcileStarter{})
+
+			if err := svc.Reconcile(context.Background()); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			want := []string{currentKey, staleKey}
+			slices.Sort(want)
+			if keys := files.Keys(); !slices.Equal(keys, want) {
+				t.Errorf("store holds %v, want the replaced upload kept while the Document is %s %v",
+					keys, status, want)
+			}
+		})
+	}
+}
+
+func TestReconcileDeletesAStaleUploadOnceTheNewVersionFailed(t *testing.T) {
+	documentID, currentUpload, staleUpload := uuid.New(), uuid.New(), uuid.New()
+	files := filetest.NewMemory()
+	currentKey := file.SourceKey(documentID, currentUpload)
+	staleKey := file.SourceKey(documentID, staleUpload)
+	files.PutObject(currentKey, []byte("current"), reconcileNow.Add(-3*time.Hour))
+	files.PutObject(staleKey, []byte("stale"), reconcileNow.Add(-2*time.Hour))
+	documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]types.DocumentUpload{documentID: {
+		DocumentID:  documentID,
+		UploadID:    currentUpload,
+		ParseStatus: types.ParseStatusFailed,
+	}}}
 	svc := testReconciler(documents, files, &fakeReconcileStarter{})
 
 	if err := svc.Reconcile(context.Background()); err != nil {
@@ -210,7 +274,11 @@ func TestReconcileKeepsAnUploadPrefixWithOneFreshObject(t *testing.T) {
 	files.PutObject(currentKey, []byte("current"), reconcileNow.Add(-3*time.Hour))
 	files.PutObject(staleSource, []byte("old source"), reconcileNow.Add(-2*time.Hour))
 	files.PutObject(staleFigure, []byte("fresh figure"), reconcileNow.Add(-10*time.Minute))
-	documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]uuid.UUID{documentID: currentUpload}}
+	documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]types.DocumentUpload{documentID: {
+		DocumentID:  documentID,
+		UploadID:    currentUpload,
+		ParseStatus: types.ParseStatusCompleted,
+	}}}
 	svc := testReconciler(documents, files, &fakeReconcileStarter{})
 
 	if err := svc.Reconcile(context.Background()); err != nil {
@@ -233,7 +301,7 @@ func TestReconcileKeepsAMissingDocumentWithAFreshObjectInASecondUpload(t *testin
 	files.PutObject(firstKey, []byte("old first upload"), reconcileNow.Add(-2*time.Hour))
 	files.PutObject(secondSource, []byte("old second upload"), reconcileNow.Add(-2*time.Hour))
 	files.PutObject(secondFigure, []byte("fresh figure"), reconcileNow.Add(-10*time.Minute))
-	documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]uuid.UUID{}}
+	documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]types.DocumentUpload{}}
 	svc := testReconciler(documents, files, &fakeReconcileStarter{})
 
 	if err := svc.Reconcile(context.Background()); err != nil {
@@ -257,7 +325,11 @@ func TestReconcileKeepsPrefixesYoungerThanTheGracePeriod(t *testing.T) {
 	for _, key := range []string{orphanKey, currentKey, staleKey} {
 		files.PutObject(key, []byte(key), young)
 	}
-	documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]uuid.UUID{documentID: currentUpload}}
+	documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]types.DocumentUpload{documentID: {
+		DocumentID:  documentID,
+		UploadID:    currentUpload,
+		ParseStatus: types.ParseStatusCompleted,
+	}}}
 	svc := testReconciler(documents, files, &fakeReconcileStarter{})
 
 	if err := svc.Reconcile(context.Background()); err != nil {
@@ -274,7 +346,7 @@ func TestReconcileLeavesAKeyItCannotParse(t *testing.T) {
 	files := filetest.NewMemory()
 	key := "documents/not-a-document/not-an-upload/source"
 	files.PutObject(key, []byte("unparseable"), reconcileNow.Add(-2*time.Hour))
-	documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]uuid.UUID{}}
+	documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]types.DocumentUpload{}}
 	svc := testReconciler(documents, files, &fakeReconcileStarter{})
 
 	if err := svc.Reconcile(context.Background()); err != nil {
@@ -284,7 +356,7 @@ func TestReconcileLeavesAKeyItCannotParse(t *testing.T) {
 		t.Errorf("store holds %v, want the unparseable key kept", keys)
 	}
 	if documents.uploadRuns != 0 {
-		t.Errorf("ListDocumentUploadIDs ran %d times for no parsed Document, want none", documents.uploadRuns)
+		t.Errorf("ListDocumentUploads ran %d times for no parsed Document, want none", documents.uploadRuns)
 	}
 }
 
@@ -294,7 +366,7 @@ func TestReconcileLogsOneSummaryForUnrecognisedKeys(t *testing.T) {
 	for _, key := range []string{firstKey, secondKey} {
 		files.PutObject(key, []byte("unparseable"), reconcileNow.Add(-2*time.Hour))
 	}
-	documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]uuid.UUID{}}
+	documents := &fakeReconcileDocuments{uploads: map[uuid.UUID]types.DocumentUpload{}}
 	ctx, logs := observedContext()
 	svc := testReconciler(documents, files, &fakeReconcileStarter{})
 

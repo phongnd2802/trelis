@@ -63,6 +63,22 @@ func (r *chunkRepository) GetReadableChunk(ctx context.Context, principalID, id 
 	}, nil
 }
 
+// DeleteChunks removes every Chunk and Parent Chunk of documentID, deleting
+// the Chunks first because they carry the Parent Chunk links. It starts no
+// transaction of its own: call it inside the service's ExecTx so a re-upload
+// leaves the previous Chunks until its row update commits. An already empty
+// Document is not an error.
+func (r *chunkRepository) DeleteChunks(ctx context.Context, documentID uuid.UUID) error {
+	q := r.store.Querier(ctx)
+	if err := q.DeleteChunksByDocument(ctx, documentID); err != nil {
+		return fmt.Errorf("delete chunks of document %s: %w", documentID, err)
+	}
+	if err := q.DeleteParentChunksByDocument(ctx, documentID); err != nil {
+		return fmt.Errorf("delete Parent Chunks of document %s: %w", documentID, err)
+	}
+	return nil
+}
+
 // ReplaceChunks deletes a Document's Chunks and Parent Chunks and inserts set
 // in order. It starts no transaction of its own: call it inside the service's
 // ExecTx so a failed insert leaves the previous set in place. It deletes the

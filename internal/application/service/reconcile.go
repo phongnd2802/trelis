@@ -13,6 +13,7 @@ import (
 
 	"github.com/phongnd2802/trelis/internal/application/service/file"
 	"github.com/phongnd2802/trelis/internal/logger"
+	"github.com/phongnd2802/trelis/internal/types"
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
 
@@ -59,26 +60,26 @@ func (s *reconcileService) Reconcile(ctx context.Context) error {
 }
 
 // restartPending submits the start of every pending Document's ingest
-// workflow. The workflow ID is the Document ID, so a Document whose run is
-// already open is joined instead of duplicated (ADR-0005) and no check
-// against Temporal is needed here. One Document that will not start is
-// skipped and the rest still run; the returned error counts the failures and
-// carries the first cause.
+// workflow. The workflow ID carries the Document and upload IDs, so a
+// Document whose run is already open is joined instead of duplicated
+// (ADR-0005) and no check against Temporal is needed here. One Document that
+// will not start is skipped and the rest still run; the returned error counts
+// the failures and carries the first cause.
 func (s *reconcileService) restartPending(ctx context.Context) error {
-	ids, err := s.documents.ListPendingDocumentIDs(ctx)
+	pending, err := s.documents.ListPendingDocuments(ctx)
 	if err != nil {
 		return fmt.Errorf("list pending documents: %w", err)
 	}
-	if len(ids) == 0 {
+	if len(pending) == 0 {
 		logger.Ctx(ctx).Debug("reconciler: no pending documents")
 		return nil
 	}
 	submitted, failed := 0, 0
 	var firstErr error
-	for _, id := range ids {
-		if err := s.ingest.StartIngest(ctx, id); err != nil {
+	for _, doc := range pending {
+		if err := s.ingest.StartIngest(ctx, doc.DocumentID, doc.UploadID); err != nil {
 			logger.Ctx(ctx).Debug("reconciler: start ingest failed",
-				zap.Stringer("document", id), zap.Error(err))
+				zap.Stringer("document", doc.DocumentID), zap.Stringer("upload", doc.UploadID), zap.Error(err))
 			failed++
 			if firstErr == nil {
 				firstErr = err
@@ -91,17 +92,20 @@ func (s *reconcileService) restartPending(ctx context.Context) error {
 		logger.Ctx(ctx).Debug("reconciler: submitted pending documents", zap.Int("documents", submitted))
 	}
 	if failed > 0 {
-		return fmt.Errorf("start ingest failed for %d of %d pending documents: %w", failed, len(ids), firstErr)
+		return fmt.Errorf("start ingest failed for %d of %d pending documents: %w", failed, len(pending), firstErr)
 	}
 	return nil
 }
 
 // deleteOrphans deletes every object prefix that no Document or no current
-// upload of one refers to. A prefix is deleted only once every one of its
-// objects is older than orphanObjectGrace, so a young object may be an upload
-// that has not written its row or new upload_id yet. Keys that do not follow
-// the documents/{document_id}/{upload_id}/... layout are left alone and
-// reported together.
+// upload of one refers to. A replaced upload is deleted only once the
+// Document has completed or failed: before that, its new upload's Chunks may
+// not be committed yet, and the ingest workflow's delete_superseded_uploads
+// step removes the previous upload once they are. A prefix is deleted only
+// once every one of its objects is older than orphanObjectGrace, so a young
+// object may be an upload that has not written its row or new upload_id yet.
+// Keys that do not follow the documents/{document_id}/{upload_id}/... layout
+// are left alone and reported together.
 func (s *reconcileService) deleteOrphans(ctx context.Context) error {
 	objects, err := s.files.ListObjects(ctx, file.DocumentsPrefix)
 	if err != nil {
@@ -137,7 +141,7 @@ func (s *reconcileService) deleteOrphans(ctx context.Context) error {
 	}
 
 	documentIDs := slices.Collect(maps.Keys(uploadsByDocument))
-	currentUploads, err := s.documents.ListDocumentUploadIDs(ctx, documentIDs)
+	currentUploads, err := s.documents.ListDocumentUploads(ctx, documentIDs)
 	if err != nil {
 		return fmt.Errorf("list current document uploads: %w", err)
 	}
@@ -170,14 +174,20 @@ func (s *reconcileService) deleteOrphans(ctx context.Context) error {
 			deletePrefix(file.DocumentPrefix(documentID), newestModTime(uploads))
 			continue
 		}
+		// ADR-0006 deletes a previous upload's objects only after the new
+		// version's Chunks are committed. A pending or processing Document
+		// may still be committing them; its ingest workflow's
+		// delete_superseded_uploads step removes the previous upload once
+		// ParseAndChunk has committed. The reconciler is the backstop for a
+		// Document that finished.
+		if currentUpload.ParseStatus != types.ParseStatusCompleted &&
+			currentUpload.ParseStatus != types.ParseStatusFailed {
+			continue
+		}
 		for uploadID, lastModified := range uploads {
-			if uploadID == currentUpload {
+			if uploadID == currentUpload.UploadID {
 				continue
 			}
-			// ADR-0006 deletes a previous upload's objects only after the
-			// new version's Chunks are committed. Re-upload does not exist
-			// yet; whoever adds it must keep an ingest that is still reading
-			// the previous upload out of this branch.
 			deletePrefix(file.UploadPrefix(documentID, uploadID), lastModified)
 		}
 	}

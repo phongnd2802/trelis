@@ -38,15 +38,16 @@ func TestIngestEventsAreListedAfterASeqInSeqOrder(t *testing.T) {
 
 	first, err := events.InsertIngestEvent(ctx, &types.IngestEvent{
 		DocumentID: doc.ID,
+		UploadID:   doc.UploadID,
 		Type:       types.IngestEventParseStarted,
 		Detail:     json.RawMessage(`{"attempt":1}`),
 	})
 	if err != nil {
 		t.Fatalf("insert parse_started: %v", err)
 	}
-	if first.Seq <= 0 || first.DocumentID != doc.ID || first.Type != types.IngestEventParseStarted ||
-		first.CreatedAt.IsZero() {
-		t.Errorf("stored event = %+v, want its seq, Document, type and created_at filled in", first)
+	if first.Seq <= 0 || first.DocumentID != doc.ID || first.UploadID != doc.UploadID ||
+		first.Type != types.IngestEventParseStarted || first.CreatedAt.IsZero() {
+		t.Errorf("stored event = %+v, want its seq, Document, upload, type and created_at filled in", first)
 	}
 	if got := compactJSON(t, first.Detail); got != `{"attempt":1}` {
 		t.Errorf("detail = %s, want {\"attempt\":1}", got)
@@ -54,6 +55,7 @@ func TestIngestEventsAreListedAfterASeqInSeqOrder(t *testing.T) {
 
 	second, err := events.InsertIngestEvent(ctx, &types.IngestEvent{
 		DocumentID: doc.ID,
+		UploadID:   doc.UploadID,
 		Type:       types.IngestEventParseFinished,
 		Detail:     json.RawMessage(`{"chunks":3}`),
 	})
@@ -62,6 +64,7 @@ func TestIngestEventsAreListedAfterASeqInSeqOrder(t *testing.T) {
 	}
 	if _, err := events.InsertIngestEvent(ctx, &types.IngestEvent{
 		DocumentID: other.ID,
+		UploadID:   other.UploadID,
 		Type:       types.IngestEventFailed,
 		Detail:     json.RawMessage(`{"reason":"the Document could not be ingested"}`),
 	}); err != nil {
@@ -69,6 +72,7 @@ func TestIngestEventsAreListedAfterASeqInSeqOrder(t *testing.T) {
 	}
 	third, err := events.InsertIngestEvent(ctx, &types.IngestEvent{
 		DocumentID: doc.ID,
+		UploadID:   doc.UploadID,
 		Type:       types.IngestEventCompleted,
 		Detail:     json.RawMessage(`{}`),
 	})
@@ -130,6 +134,7 @@ func TestIngestEventsTakeTheirSeqsInCommitOrder(t *testing.T) {
 		firstDone <- s.ExecTx(ctx, func(ctx context.Context) error {
 			if _, err := events.InsertIngestEvent(ctx, &types.IngestEvent{
 				DocumentID: doc.ID,
+				UploadID:   doc.UploadID,
 				Type:       types.IngestEventParseStarted,
 				Detail:     json.RawMessage(`{"attempt":1}`),
 			}); err != nil {
@@ -154,6 +159,7 @@ func TestIngestEventsTakeTheirSeqsInCommitOrder(t *testing.T) {
 	go func() {
 		_, err := events.InsertIngestEvent(ctx, &types.IngestEvent{
 			DocumentID: doc.ID,
+			UploadID:   doc.UploadID,
 			Type:       types.IngestEventParseFinished,
 			Detail:     json.RawMessage(`{"chunks":1}`),
 		})
@@ -203,6 +209,7 @@ func TestInsertingAnEventForAMissingDocumentIsNotFound(t *testing.T) {
 	s, _ := seeded(t)
 	_, err := NewIngestEventRepository(s).InsertIngestEvent(context.Background(), &types.IngestEvent{
 		DocumentID: uuid.New(),
+		UploadID:   uuid.New(),
 		Type:       types.IngestEventParseStarted,
 		Detail:     json.RawMessage(`{"attempt":1}`),
 	})
@@ -224,6 +231,7 @@ func TestADeletedDocumentTakesItsIngestEventsWithIt(t *testing.T) {
 	for _, eventType := range []string{types.IngestEventParseStarted, types.IngestEventCompleted} {
 		if _, err := events.InsertIngestEvent(ctx, &types.IngestEvent{
 			DocumentID: doc.ID,
+			UploadID:   doc.UploadID,
 			Type:       eventType,
 			Detail:     json.RawMessage(`{}`),
 		}); err != nil {
@@ -231,7 +239,7 @@ func TestADeletedDocumentTakesItsIngestEventsWithIt(t *testing.T) {
 		}
 	}
 
-	if err := NewDocumentRepository(s).DeleteDocument(ctx, doc.ID); err != nil {
+	if _, err := NewDocumentRepository(s).DeleteDocument(ctx, doc.ID); err != nil {
 		t.Fatalf("DeleteDocument: %v", err)
 	}
 

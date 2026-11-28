@@ -43,3 +43,12 @@ type EmbeddingUnconfiguredError struct{}
 // Error returns the reason shown beside a Document that failed ingest and
 // recorded in the workflow history.
 func (e *EmbeddingUnconfiguredError) Error() string { return "no embedding model is configured" }
+
+// SupersededUploadError means the upload an ingest activity was working for
+// has been replaced by a newer one. Retrying cannot help: the newer upload's
+// workflow owns the Document now, and the stale activity must not write
+// anything or mark the new upload failed.
+type SupersededUploadError struct{}
+
+// Error returns the reason the workflow records in its history.
+func (e *SupersededUploadError) Error() string { return "the upload was superseded by a newer one" }

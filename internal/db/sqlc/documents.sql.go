@@ -72,18 +72,19 @@ func (q *Queries) CreateDocument(ctx context.Context, arg CreateDocumentParams) 
 	return i, err
 }
 
-const deleteDocument = `-- name: DeleteDocument :execrows
-DELETE FROM documents WHERE id = $1
+const deleteDocument = `-- name: DeleteDocument :one
+DELETE FROM documents WHERE id = $1 RETURNING upload_id
 `
 
 // Deleting a Document removes its Chunks, Parent Chunks and Access List by
-// ON DELETE CASCADE. Zero rows means it was already deleted.
-func (q *Queries) DeleteDocument(ctx context.Context, id uuid.UUID) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteDocument, id)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+// ON DELETE CASCADE and returns the upload the row pointed at when it was
+// deleted, so the cleanup cancels that upload's ingest even when a re-upload
+// won the race with the caller's read. Zero rows means it was already deleted.
+func (q *Queries) DeleteDocument(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, deleteDocument, id)
+	var upload_id uuid.UUID
+	err := row.Scan(&upload_id)
+	return upload_id, err
 }
 
 const getDocumentByID = `-- name: GetDocumentByID :one
@@ -143,6 +144,20 @@ func (q *Queries) GetDocumentByOwnerAndHash(ctx context.Context, arg GetDocument
 		&i.IngestEventSeq,
 	)
 	return i, err
+}
+
+const getDocumentUploadID = `-- name: GetDocumentUploadID :one
+SELECT upload_id FROM documents WHERE id = $1
+`
+
+// The Document's current upload ID. It is read after an Ingest Event insert,
+// which already holds the Document row lock, to notice an upload the event's
+// activity no longer belongs to.
+func (q *Queries) GetDocumentUploadID(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getDocumentUploadID, id)
+	var upload_id uuid.UUID
+	err := row.Scan(&upload_id)
+	return upload_id, err
 }
 
 const getReadableDocument = `-- name: GetReadableDocument :one
@@ -265,27 +280,30 @@ func (q *Queries) ListDocumentPrincipals(ctx context.Context, documentID uuid.UU
 	return items, nil
 }
 
-const listDocumentUploadIDs = `-- name: ListDocumentUploadIDs :many
-SELECT id, upload_id FROM documents WHERE id = ANY($1::uuid[])
+const listDocumentUploads = `-- name: ListDocumentUploads :many
+SELECT id, upload_id, parse_status FROM documents WHERE id = ANY($1::uuid[])
 `
 
-type ListDocumentUploadIDsRow struct {
-	ID       uuid.UUID
-	UploadID uuid.UUID
+type ListDocumentUploadsRow struct {
+	ID          uuid.UUID
+	UploadID    uuid.UUID
+	ParseStatus string
 }
 
-// The current upload ID of each of the given Documents. The reconciler
-// treats objects under any other upload ID as a replaced upload (ADR-0006).
-func (q *Queries) ListDocumentUploadIDs(ctx context.Context, documentIds []uuid.UUID) ([]ListDocumentUploadIDsRow, error) {
-	rows, err := q.db.Query(ctx, listDocumentUploadIDs, documentIds)
+// The current upload and parse status of each of the given Documents. The
+// reconciler deletes objects under a replaced upload only once the Document
+// has finished its new upload, because earlier the new upload's Chunks may
+// not be committed yet (ADR-0006).
+func (q *Queries) ListDocumentUploads(ctx context.Context, documentIds []uuid.UUID) ([]ListDocumentUploadsRow, error) {
+	rows, err := q.db.Query(ctx, listDocumentUploads, documentIds)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []ListDocumentUploadIDsRow
+	var items []ListDocumentUploadsRow
 	for rows.Next() {
-		var i ListDocumentUploadIDsRow
-		if err := rows.Scan(&i.ID, &i.UploadID); err != nil {
+		var i ListDocumentUploadsRow
+		if err := rows.Scan(&i.ID, &i.UploadID, &i.ParseStatus); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -296,27 +314,32 @@ func (q *Queries) ListDocumentUploadIDs(ctx context.Context, documentIds []uuid.
 	return items, nil
 }
 
-const listPendingDocumentIDs = `-- name: ListPendingDocumentIDs :many
-SELECT id FROM documents WHERE parse_status = 'pending' ORDER BY id
+const listPendingDocuments = `-- name: ListPendingDocuments :many
+SELECT id, upload_id FROM documents WHERE parse_status = 'pending' ORDER BY id
 `
+
+type ListPendingDocumentsRow struct {
+	ID       uuid.UUID
+	UploadID uuid.UUID
+}
 
 // Every Document whose parse_status is pending: its workflow start failed,
 // or the run is queued and has not set processing yet. Submitting it again is
-// safe because the workflow ID is the Document ID and StartIngest joins an
-// open run (ADR-0005).
-func (q *Queries) ListPendingDocumentIDs(ctx context.Context) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, listPendingDocumentIDs)
+// safe because the workflow ID carries the Document and upload IDs and
+// StartIngest joins an open run (ADR-0005).
+func (q *Queries) ListPendingDocuments(ctx context.Context) ([]ListPendingDocumentsRow, error) {
+	rows, err := q.db.Query(ctx, listPendingDocuments)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []uuid.UUID
+	var items []ListPendingDocumentsRow
 	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
+		var i ListPendingDocumentsRow
+		if err := rows.Scan(&i.ID, &i.UploadID); err != nil {
 			return nil, err
 		}
-		items = append(items, id)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -401,6 +424,88 @@ func (q *Queries) ListReadableDocuments(ctx context.Context, arg ListReadableDoc
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockDocumentUploadID = `-- name: LockDocumentUploadID :one
+SELECT upload_id FROM documents WHERE id = $1 FOR NO KEY UPDATE
+`
+
+// The Document's current upload ID, locking the row so a concurrent re-upload
+// waits. FOR NO KEY UPDATE keeps the lock a Chunk insert's foreign-key check
+// (FOR KEY SHARE) can still take, the same row-lock mode the Ingest Event
+// insert uses.
+func (q *Queries) LockDocumentUploadID(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockDocumentUploadID, id)
+	var upload_id uuid.UUID
+	err := row.Scan(&upload_id)
+	return upload_id, err
+}
+
+const replaceDocumentUpload = `-- name: ReplaceDocumentUpload :one
+UPDATE documents
+SET upload_id = $1,
+    object_key = $2,
+    file_name = $3,
+    file_type = $4,
+    file_size = $5,
+    file_hash = $6,
+    title = $7,
+    parse_status = 'pending',
+    parse_error = NULL,
+    updated_at = now()
+WHERE id = $8 AND upload_id = $9
+RETURNING id, owner_id, title, file_name, file_type, file_size, file_hash, object_key, parse_status, created_at, updated_at, upload_id, parse_error, ingest_event_seq
+`
+
+type ReplaceDocumentUploadParams struct {
+	UploadID         uuid.UUID
+	ObjectKey        string
+	FileName         string
+	FileType         string
+	FileSize         int64
+	FileHash         string
+	Title            string
+	ID               uuid.UUID
+	PreviousUploadID uuid.UUID
+}
+
+// Replacing a Document's Source File applies the new upload's metadata in
+// place and puts the Document back to pending. The upload_id predicate makes
+// the update conditional on the version the caller read: a concurrent
+// re-upload or delete changes no row, so the caller can answer a conflict
+// instead of overwriting the newer upload. The row is locked first, before
+// the caller deletes Chunks, the same order the delete cascade and the
+// ingest transactions use.
+func (q *Queries) ReplaceDocumentUpload(ctx context.Context, arg ReplaceDocumentUploadParams) (Document, error) {
+	row := q.db.QueryRow(ctx, replaceDocumentUpload,
+		arg.UploadID,
+		arg.ObjectKey,
+		arg.FileName,
+		arg.FileType,
+		arg.FileSize,
+		arg.FileHash,
+		arg.Title,
+		arg.ID,
+		arg.PreviousUploadID,
+	)
+	var i Document
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerID,
+		&i.Title,
+		&i.FileName,
+		&i.FileType,
+		&i.FileSize,
+		&i.FileHash,
+		&i.ObjectKey,
+		&i.ParseStatus,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.UploadID,
+		&i.ParseError,
+		&i.IngestEventSeq,
+	)
+	return i, err
 }
 
 const setDocumentParseStatus = `-- name: SetDocumentParseStatus :execrows

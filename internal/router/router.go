@@ -64,6 +64,7 @@ func New(ready Readiness, authn interfaces.AuthService,
 		r.Get("/documents/{id}/events", docs.StreamIngestEvents)
 		r.Delete("/documents/{id}", docs.DeleteDocument)
 		r.Get("/documents/{id}/file", docs.DownloadDocumentFile)
+		r.Put("/documents/{id}/file", docs.ReplaceDocumentFile)
 		r.Post("/retrieve", retrieval.Retrieve)
 		r.Post("/answer", answers.Answer)
 		r.Get("/chunks/{id}", chunks.GetChunk)

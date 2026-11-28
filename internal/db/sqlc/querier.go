@@ -20,13 +20,19 @@ type Querier interface {
 	CreatePrincipal(ctx context.Context, name string) (CreatePrincipalRow, error)
 	DeleteChunksByDocument(ctx context.Context, documentID uuid.UUID) error
 	// Deleting a Document removes its Chunks, Parent Chunks and Access List by
-	// ON DELETE CASCADE. Zero rows means it was already deleted.
-	DeleteDocument(ctx context.Context, id uuid.UUID) (int64, error)
+	// ON DELETE CASCADE and returns the upload the row pointed at when it was
+	// deleted, so the cleanup cancels that upload's ingest even when a re-upload
+	// won the race with the caller's read. Zero rows means it was already deleted.
+	DeleteDocument(ctx context.Context, id uuid.UUID) (uuid.UUID, error)
 	DeleteParentChunksByDocument(ctx context.Context, documentID uuid.UUID) error
 	// The system view of one Document, with no access check: the ingest
 	// activities run with no Principal.
 	GetDocumentByID(ctx context.Context, id uuid.UUID) (Document, error)
 	GetDocumentByOwnerAndHash(ctx context.Context, arg GetDocumentByOwnerAndHashParams) (Document, error)
+	// The Document's current upload ID. It is read after an Ingest Event insert,
+	// which already holds the Document row lock, to notice an upload the event's
+	// activity no longer belongs to.
+	GetDocumentUploadID(ctx context.Context, id uuid.UUID) (uuid.UUID, error)
 	GetGroupByName(ctx context.Context, name string) (GetGroupByNameRow, error)
 	GetPrincipalByKeyHash(ctx context.Context, keyHash []byte) (GetPrincipalByKeyHashRow, error)
 	GetPrincipalByName(ctx context.Context, name string) (GetPrincipalByNameRow, error)
@@ -45,12 +51,13 @@ type Querier interface {
 	// belongs to otherwise. A NULL means a reader falls back to the Chunk itself.
 	InsertChunk(ctx context.Context, arg InsertChunkParams) error
 	// Appends one Ingest Event to its Document's stream and returns it with the
-	// per-Document seq and created_at Postgres assigned. The UPDATE advances the
-	// Document's counter under its row lock, held until this transaction commits:
-	// the next event of that Document cannot take a seq until this one has
-	// committed, so seq order is commit order and a reader that resumes after a
-	// seq never misses an event. Zero rows means the Document is gone; the
-	// repository maps that to ErrDocumentNotFound.
+	// per-Document seq and created_at Postgres assigned, and the upload the
+	// event belongs to. The UPDATE advances the Document's counter under its row
+	// lock, held until this transaction commits: the next event of that Document
+	// cannot take a seq until this one has committed, so seq order is commit
+	// order and a reader that resumes after a seq never misses an event. Zero
+	// rows means the Document is gone; the repository maps that to
+	// ErrDocumentNotFound.
 	//
 	// A caller inside a transaction inserts the event first: the UPDATE locks the
 	// Document row before the transaction touches any Chunk rows, the same order
@@ -61,9 +68,11 @@ type Querier interface {
 	ListAPIKeys(ctx context.Context, principalID uuid.UUID) ([]ListAPIKeysRow, error)
 	ListDocumentGroups(ctx context.Context, documentID uuid.UUID) ([]string, error)
 	ListDocumentPrincipals(ctx context.Context, documentID uuid.UUID) ([]string, error)
-	// The current upload ID of each of the given Documents. The reconciler
-	// treats objects under any other upload ID as a replaced upload (ADR-0006).
-	ListDocumentUploadIDs(ctx context.Context, documentIds []uuid.UUID) ([]ListDocumentUploadIDsRow, error)
+	// The current upload and parse status of each of the given Documents. The
+	// reconciler deletes objects under a replaced upload only once the Document
+	// has finished its new upload, because earlier the new upload's Chunks may
+	// not be committed yet (ADR-0006).
+	ListDocumentUploads(ctx context.Context, documentIds []uuid.UUID) ([]ListDocumentUploadsRow, error)
 	// The events of one Document after the client's Last-Event-ID, in seq order.
 	// The primary-key index on (document_id, seq) serves both the filter and the
 	// order.
@@ -76,9 +85,9 @@ type Querier interface {
 	ListParentChunks(ctx context.Context, arg ListParentChunksParams) ([]ParentChunk, error)
 	// Every Document whose parse_status is pending: its workflow start failed,
 	// or the run is queued and has not set processing yet. Submitting it again is
-	// safe because the workflow ID is the Document ID and StartIngest joins an
-	// open run (ADR-0005).
-	ListPendingDocumentIDs(ctx context.Context) ([]uuid.UUID, error)
+	// safe because the workflow ID carries the Document and upload IDs and
+	// StartIngest joins an open run (ADR-0005).
+	ListPendingDocuments(ctx context.Context) ([]ListPendingDocumentsRow, error)
 	ListPrincipalGroups(ctx context.Context, principalID uuid.UUID) ([]ListPrincipalGroupsRow, error)
 	// The Documents a Principal can read that finished ingest. Retrieval passes
 	// this set into every search; a Document still processing has only part of
@@ -90,6 +99,19 @@ type Querier interface {
 	// activity has not written a vector for yet. Re-running a range, as a retry
 	// does, skips the Chunks already done.
 	ListUnembeddedChunksByDocument(ctx context.Context, arg ListUnembeddedChunksByDocumentParams) ([]ListUnembeddedChunksByDocumentRow, error)
+	// The Document's current upload ID, locking the row so a concurrent re-upload
+	// waits. FOR NO KEY UPDATE keeps the lock a Chunk insert's foreign-key check
+	// (FOR KEY SHARE) can still take, the same row-lock mode the Ingest Event
+	// insert uses.
+	LockDocumentUploadID(ctx context.Context, id uuid.UUID) (uuid.UUID, error)
+	// Replacing a Document's Source File applies the new upload's metadata in
+	// place and puts the Document back to pending. The upload_id predicate makes
+	// the update conditional on the version the caller read: a concurrent
+	// re-upload or delete changes no row, so the caller can answer a conflict
+	// instead of overwriting the newer upload. The row is locked first, before
+	// the caller deletes Chunks, the same order the delete cascade and the
+	// ingest transactions use.
+	ReplaceDocumentUpload(ctx context.Context, arg ReplaceDocumentUploadParams) (Document, error)
 	// Revoking twice keeps the first revocation time.
 	RevokeAPIKey(ctx context.Context, id uuid.UUID) (int64, error)
 	// BM25 retrieval: rank the Chunks of the readable Documents by pg_search's

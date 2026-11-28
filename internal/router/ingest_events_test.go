@@ -68,6 +68,7 @@ func parseSSEFrames(t *testing.T, body string) []sseFrame {
 // streamEventPayload is the data line's shape; the seq lives only in the id.
 type streamEventPayload struct {
 	DocumentID uuid.UUID       `json:"document_id"`
+	UploadID   uuid.UUID       `json:"upload_id"`
 	Type       string          `json:"type"`
 	Detail     json.RawMessage `json:"detail"`
 	CreatedAt  time.Time       `json:"created_at"`
@@ -82,8 +83,14 @@ func decodeStreamEvent(t *testing.T, frame sseFrame) streamEventPayload {
 	return payload
 }
 
-// seedIngestEvent appends one Ingest Event to a Document's stream.
+// seedIngestEvent appends one Ingest Event for the Document's current upload.
 func (c *server) seedIngestEvent(t *testing.T, documentID, eventType string, detail any) *types.IngestEvent {
+	t.Helper()
+	return c.seedIngestEventForUpload(t, documentID, c.documentUploadID(t, documentID), eventType, detail)
+}
+
+// seedIngestEventForUpload appends one Ingest Event for the given upload.
+func (c *server) seedIngestEventForUpload(t *testing.T, documentID string, uploadID uuid.UUID, eventType string, detail any) *types.IngestEvent {
 	t.Helper()
 	id, err := uuid.Parse(documentID)
 	if err != nil {
@@ -95,6 +102,7 @@ func (c *server) seedIngestEvent(t *testing.T, documentID, eventType string, det
 	}
 	event, err := repository.NewIngestEventRepository(c.store).InsertIngestEvent(c.ctx, &types.IngestEvent{
 		DocumentID: id,
+		UploadID:   uploadID,
 		Type:       eventType,
 		Detail:     raw,
 	})
@@ -123,6 +131,7 @@ func TestIngestEventStreamEmitsTheEventsInOrderAndEndsAfterCompleted(t *testing.
 		handler.WithIngestEventPollInterval(time.Millisecond),
 	}, "alice")
 	id := c.uploaded("alice", upFile("luat.txt", "Luật 04/2007"))
+	uploadID := c.documentUploadID(t, id)
 	seeded := []*types.IngestEvent{
 		c.seedIngestEvent(t, id, types.IngestEventParseStarted, types.ParseStartedDetail{Attempt: 1}),
 		c.seedIngestEvent(t, id, types.IngestEventParseFinished, types.ParseFinishedDetail{Chunks: 3}),
@@ -157,8 +166,8 @@ func TestIngestEventStreamEmitsTheEventsInOrderAndEndsAfterCompleted(t *testing.
 			t.Errorf("frame %d event = %q, want %q", i, frame.event, seeded[i].Type)
 		}
 		data := decodeStreamEvent(t, frame)
-		if data.DocumentID.String() != id || data.Type != frame.event || data.CreatedAt.IsZero() {
-			t.Errorf("frame %d data = %+v, want the Document, its type and created_at", i, data)
+		if data.DocumentID.String() != id || data.UploadID != uploadID || data.Type != frame.event || data.CreatedAt.IsZero() {
+			t.Errorf("frame %d data = %+v, want the Document, upload, type and created_at", i, data)
 		}
 	}
 
@@ -178,6 +187,53 @@ func TestIngestEventStreamEmitsTheEventsInOrderAndEndsAfterCompleted(t *testing.
 	}
 	if got := string(decodeStreamEvent(t, frames[3]).Detail); got != "{}" {
 		t.Errorf("completed detail = %s, want {}", got)
+	}
+}
+
+func TestIngestEventStreamPassesAnOldVersionsTerminalEventAndEndsAtTheCurrentOne(t *testing.T) {
+	c := newServerWith(t, []handler.DocumentHandlerOption{
+		handler.WithIngestEventPollInterval(time.Millisecond),
+	}, "alice")
+	id := c.uploaded("alice", upFile("luat.txt", "Luật 04/2007"))
+	oldUpload := c.documentUploadID(t, id)
+	// The old version's stream, completed before the re-upload.
+	c.seedIngestEventForUpload(t, id, oldUpload, types.IngestEventParseStarted,
+		types.ParseStartedDetail{Attempt: 1})
+	c.seedIngestEventForUpload(t, id, oldUpload, types.IngestEventCompleted, struct{}{})
+
+	newUpload := uuid.New()
+	if _, err := c.pool.Exec(c.ctx, "UPDATE documents SET upload_id = $2 WHERE id = $1",
+		uuid.MustParse(id), newUpload); err != nil {
+		t.Fatalf("re-upload the Document row: %v", err)
+	}
+	c.seedIngestEventForUpload(t, id, newUpload, types.IngestEventUploadReplaced,
+		types.UploadReplacedDetail{UploadID: newUpload})
+	c.seedIngestEventForUpload(t, id, newUpload, types.IngestEventCompleted, struct{}{})
+
+	rec := c.streamIngestEvents("alice", id, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET events = %d %s, want 200", rec.Code, rec.Body)
+	}
+	frames := parseSSEFrames(t, rec.Body.String())
+	want := []string{
+		types.IngestEventParseStarted,
+		types.IngestEventCompleted,
+		types.IngestEventUploadReplaced,
+		types.IngestEventCompleted,
+	}
+	if len(frames) != len(want) {
+		t.Fatalf("streamed %d frames, want %d:\n%s", len(frames), len(want), rec.Body)
+	}
+	for i, frame := range frames {
+		if frame.event != want[i] {
+			t.Errorf("frame %d = %q, want %q", i, frame.event, want[i])
+		}
+	}
+	if got := decodeStreamEvent(t, frames[1]).UploadID; got != oldUpload {
+		t.Errorf("old completed event upload = %s, want %s", got, oldUpload)
+	}
+	if got := decodeStreamEvent(t, frames[3]).UploadID; got != newUpload {
+		t.Errorf("current completed event upload = %s, want %s", got, newUpload)
 	}
 }
 

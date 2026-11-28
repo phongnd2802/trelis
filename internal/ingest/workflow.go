@@ -28,6 +28,13 @@ const (
 	markFailedTimeout = time.Minute
 	// markFailedAttempts is how often marking a Document failed is retried.
 	markFailedAttempts = 3
+	// deleteSupersededUploadsTimeout bounds one superseded-upload cleanup
+	// attempt; a previous upload may hold several objects.
+	deleteSupersededUploadsTimeout = 10 * time.Minute
+	// deleteSupersededUploadsAttempts is how often the superseded-upload
+	// cleanup is retried before the workflow gives up on it and leaves the
+	// prefix to the reconciler.
+	deleteSupersededUploadsAttempts = 3
 	// deleteObjectsTimeout bounds one delete-objects attempt; a large prefix
 	// may take several delete requests.
 	deleteObjectsTimeout = 10 * time.Minute
@@ -52,19 +59,27 @@ type IngestWorkflow struct {
 	EmbedBatchSize int
 }
 
-// Run parses and chunks one Document, embeds every Chunk in batches on
-// ModelTaskQueue, then marks the Document completed once no embedding is
-// missing. Parse-and-chunk runs with retries; when it still fails, the
-// workflow marks the Document failed with a short reason and ends. Each batch
-// is scheduled up front and retried alone, so one transient model failure
-// neither re-parses the Document nor repeats the batches that succeeded. A
-// failed batch, or a complete step that still sees an unembedded Chunk, marks
-// the Document failed exactly as a failed parse does. A Document that no
-// longer exists is the exception: there is no row to mark, so the workflow
-// just ends. The input is only the Document ID and the batches pass only seq
-// ranges (ADR-0005). The workflow does no I/O and reads no clock, so it stays
-// deterministic.
-func (w *IngestWorkflow) Run(ctx workflow.Context, documentID string) error {
+// Run parses and chunks one upload of a Document, removes the objects of
+// earlier uploads once the new Chunks are committed, embeds every Chunk in
+// batches on ModelTaskQueue, then marks the Document completed once no
+// embedding is missing. Parse-and-chunk runs with retries; when it still
+// fails, the workflow marks the Document failed with a short reason and ends.
+// Each batch is scheduled up front and retried alone, so one transient model
+// failure neither re-parses the Document nor repeats the batches that
+// succeeded. A failed batch, or a complete step that still sees an unembedded
+// Chunk, marks the Document failed exactly as a failed parse does. A Document
+// that no longer exists, or whose upload a re-upload superseded, is the
+// exception: there is no row of this upload to mark, so the workflow just
+// ends. A failure removing the earlier uploads is logged and does not fail
+// the Document: the #26 reconciler deletes the prefix once the Document
+// completes. The input is only the Document and upload IDs and the batches
+// pass only seq ranges (ADR-0005). The workflow does no I/O and reads no
+// clock, so it stays deterministic.
+//
+// The input and the workflow ID changed for #25 (from the Document ID alone to
+// the Document and upload IDs). Trelis has no production deployment, so no
+// run in flight at deploy can replay against this code.
+func (w *IngestWorkflow) Run(ctx workflow.Context, documentID, uploadID string) error {
 	log := workflow.GetLogger(ctx)
 	// No workflow.GetVersion is needed for the Ingest Events (#23): they are
 	// written inside the existing activities, so the command sequence this
@@ -76,8 +91,24 @@ func (w *IngestWorkflow) Run(ctx workflow.Context, documentID string) error {
 	})
 
 	var chunks int
-	if err := workflow.ExecuteActivity(ctx, ParseAndChunkActivity, documentID).Get(ctx, &chunks); err != nil {
-		return w.fail(ctx, documentID, err)
+	if err := workflow.ExecuteActivity(ctx, ParseAndChunkActivity, documentID, uploadID).Get(ctx, &chunks); err != nil {
+		return w.fail(ctx, documentID, uploadID, err)
+	}
+
+	// The new upload's Chunks are committed, so the previous upload's
+	// objects are no longer needed (ADR-0006). A failure here is not the
+	// Document's failure: the reconciler removes a replaced upload once the
+	// Document has completed. A superseded run, though, must end.
+	deleteCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: deleteSupersededUploadsTimeout,
+		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: deleteSupersededUploadsAttempts},
+	})
+	if err := workflow.ExecuteActivity(deleteCtx, DeleteSupersededUploadsActivity, documentID, uploadID).Get(deleteCtx, nil); err != nil {
+		if applicationErrorType(err) == supersededUploadType {
+			return fmt.Errorf("ingest document %s: %w", documentID, err)
+		}
+		log.Warn("could not delete superseded uploads; the reconciler will retry",
+			"document", documentID, "upload", uploadID, "error", err)
 	}
 
 	// No workflow.GetVersion is needed: #22 has not shipped, so no run of the
@@ -95,7 +126,7 @@ func (w *IngestWorkflow) Run(ctx workflow.Context, documentID string) error {
 	batches := make([]workflow.Future, 0, (chunks+batchSize-1)/batchSize)
 	for from := 0; from < chunks; from += batchSize {
 		to := min(from+batchSize, chunks)
-		batches = append(batches, workflow.ExecuteActivity(batchCtx, EmbedBatchActivity, documentID, from, to))
+		batches = append(batches, workflow.ExecuteActivity(batchCtx, EmbedBatchActivity, documentID, uploadID, from, to))
 	}
 	// Wait for every batch even after one fails: each future has already been
 	// scheduled, and the first error is the one the Document records.
@@ -106,35 +137,40 @@ func (w *IngestWorkflow) Run(ctx workflow.Context, documentID string) error {
 		}
 	}
 	if batchErr != nil {
-		return w.fail(ctx, documentID, batchErr)
+		return w.fail(ctx, documentID, uploadID, batchErr)
 	}
 
-	if err := workflow.ExecuteActivity(ctx, CompleteActivity, documentID).Get(ctx, nil); err != nil {
-		return w.fail(ctx, documentID, err)
+	if err := workflow.ExecuteActivity(ctx, CompleteActivity, documentID, uploadID).Get(ctx, nil); err != nil {
+		return w.fail(ctx, documentID, uploadID, err)
 	}
-	log.Info("ingest finished", "document", documentID)
+	log.Info("ingest finished", "document", documentID, "upload", uploadID)
 	return nil
 }
 
 // DeleteDocumentWorkflow is the cleanup workflow started after a Document
-// row is deleted. It first asks Temporal to cancel the Document's ingest
-// workflow, whose ID is the Document ID. A run that is missing or already
-// closed is fine; any other cancel failure is logged and the workflow carries
-// on, because removing the objects does not depend on the cancel. It then
-// runs the idempotent delete-objects activity. The workflow passes only the
-// Document ID and does no I/O, so it stays deterministic.
+// row is deleted. It first asks Temporal to cancel the current upload's ingest
+// workflow, whose ID carries the Document and upload IDs. A run that is
+// missing or already closed is fine; any other cancel failure is logged and
+// the workflow carries on, because removing the objects does not depend on
+// the cancel. It then runs the idempotent delete-objects activity. The
+// workflow passes only the Document and upload IDs and does no I/O, so it
+// stays deterministic.
+//
+// The input changed for #25 (from the Document ID alone to the Document and
+// upload IDs). Trelis has no production deployment, so no run in flight at
+// deploy can replay against this code.
 type DeleteDocumentWorkflow struct{}
 
-// Run cancels the ingest workflow for documentID, then removes every object
-// under the Document's prefix. A failed delete-objects activity fails the
-// workflow after Temporal has retried it.
-func (w *DeleteDocumentWorkflow) Run(ctx workflow.Context, documentID string) error {
+// Run cancels the current upload's ingest workflow for documentID, then
+// removes every object under the Document's prefix. A failed delete-objects
+// activity fails the workflow after Temporal has retried it.
+func (w *DeleteDocumentWorkflow) Run(ctx workflow.Context, documentID, uploadID string) error {
 	log := workflow.GetLogger(ctx)
-	if err := workflow.RequestCancelExternalWorkflow(ctx, ingestWorkflowID(documentID), "").Get(ctx, nil); err != nil {
+	if err := workflow.RequestCancelExternalWorkflow(ctx, ingestWorkflowID(documentID, uploadID), "").Get(ctx, nil); err != nil {
 		var unknown *temporal.UnknownExternalWorkflowExecutionError
 		if !errors.As(err, &unknown) {
 			log.Warn("document delete: could not cancel the ingest workflow",
-				"document", documentID, "error", err)
+				"document", documentID, "upload", uploadID, "error", err)
 		}
 	}
 	deleteCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
@@ -148,10 +184,11 @@ func (w *DeleteDocumentWorkflow) Run(ctx workflow.Context, documentID string) er
 }
 
 // fail records cause on the Document and returns it, except for a Document
-// that no longer exists: there is no row left to mark. ctx carries the
-// workflow's default activity options, so MarkFailed runs on the ingest queue
-// rather than the model queue.
-func (w *IngestWorkflow) fail(ctx workflow.Context, documentID string, cause error) error {
+// that no longer exists or an upload a re-upload superseded: there is no row
+// of this upload left to mark, and marking the new upload failed would be
+// wrong. ctx carries the workflow's default activity options, so MarkFailed
+// runs on the ingest queue rather than the model queue.
+func (w *IngestWorkflow) fail(ctx workflow.Context, documentID, uploadID string, cause error) error {
 	log := workflow.GetLogger(ctx)
 	// A cancellation means the Document was deleted: its row is gone, and a
 	// MarkFailed run with the cancelled context would fail anyway. Return the
@@ -169,17 +206,23 @@ func (w *IngestWorkflow) fail(ctx workflow.Context, documentID string, cause err
 		log.Info("ingest cancelled; the Document is gone", "document", documentID)
 		return cause
 	}
-	if applicationErrorType(cause) == documentNotFoundType {
+	switch applicationErrorType(cause) {
+	case documentNotFoundType:
 		log.Warn("the Document no longer exists; nothing to mark", "document", documentID)
+		return fmt.Errorf("ingest document %s: %w", documentID, cause)
+	case supersededUploadType:
+		log.Warn("the upload was superseded; nothing to mark",
+			"document", documentID, "upload", uploadID)
 		return fmt.Errorf("ingest document %s: %w", documentID, cause)
 	}
 	reason := failureReason(cause)
-	log.Warn("ingest failed; marking the Document failed", "document", documentID, "reason", reason)
+	log.Warn("ingest failed; marking the Document failed",
+		"document", documentID, "upload", uploadID, "reason", reason)
 	failCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		StartToCloseTimeout: markFailedTimeout,
 		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: markFailedAttempts},
 	})
-	if err := workflow.ExecuteActivity(failCtx, MarkFailedActivity, documentID, reason).Get(failCtx, nil); err != nil {
+	if err := workflow.ExecuteActivity(failCtx, MarkFailedActivity, documentID, uploadID, reason).Get(failCtx, nil); err != nil {
 		return fmt.Errorf("mark document %s failed: %w", documentID, err)
 	}
 	return fmt.Errorf("ingest document %s: %w", documentID, cause)

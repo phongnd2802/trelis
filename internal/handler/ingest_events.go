@@ -39,13 +39,13 @@ const (
 // with Last-Event-ID loses nothing.
 //
 //	@Summary		Stream a Document's ingest progress
-//	@Description	Streams the Document's Ingest Events as Server-Sent Events while the caller can read it. Each frame's id is the event's seq within the Document, event is parse_started, parse_finished, embed_batch_finished, completed or failed, and data is {"document_id","type","detail","created_at"}. detail is {"attempt"} for parse_started, {"chunks"} for parse_finished, {"from","to","chunks"} for embed_batch_finished, {"reason"} for failed, and {} for completed. Reconnecting with Last-Event-ID replays the events after that seq, then carries on live. The stream ends after completed or failed, when the Document is gone or no longer readable, when the client disconnects, when the server shuts down, or after 30 minutes so a Document stuck in processing cannot hold it forever; reconnecting with Last-Event-ID loses nothing.
+//	@Description	Streams the Document's Ingest Events as Server-Sent Events while the caller can read it. Each frame's id is the event's seq within the Document, event is parse_started, parse_finished, embed_batch_finished, upload_replaced, completed or failed, and data is {"document_id","upload_id","type","detail","created_at"}. detail is {"attempt"} for parse_started, {"chunks"} for parse_finished, {"from","to","chunks"} for embed_batch_finished, {"upload_id"} for upload_replaced, {"reason"} for failed, and {} for completed. Reconnecting with Last-Event-ID replays the events after that seq, then carries on live. After a re-upload the stream passes an older upload's completed or failed event, then its upload_replaced event, and ends at the current upload's completed or failed. It also ends when the Document is gone or no longer readable, when the client disconnects, when the server shuts down, or after 30 minutes so a Document stuck in processing cannot hold it forever; reconnecting with Last-Event-ID loses nothing.
 //	@Tags			documents
 //	@Produce		text/event-stream
 //	@Security		bearerAuth
 //	@Param			id				path	string	true	"Document ID"	format(uuid)
 //	@Param			Last-Event-ID	header	string	false	"Per-Document seq of the last event the client saw; only later events are sent"
-//	@Success		200				{string}	string	"Server-Sent Events, one frame per Ingest Event; the stream ends after completed or failed, or after 30 minutes"
+//	@Success		200				{string}	string	"Server-Sent Events, one frame per Ingest Event; the stream ends after the current upload's completed or failed, or after 30 minutes"
 //	@Failure		400				{object}	handler.ErrorResponse	"Invalid Document ID or Last-Event-ID"
 //	@Failure		401				{object}	router.ErrorResponse	"Missing or invalid API key"
 //	@Failure		404				{object}	handler.ErrorResponse	"No readable Document with that ID"
@@ -66,7 +66,7 @@ func (h *DocumentHandler) StreamIngestEvents(w http.ResponseWriter, r *http.Requ
 
 	// The first read also decides access (ADR-0004): a caller who cannot read
 	// the Document gets the ordinary JSON 404 before any SSE header.
-	events, err := h.service.IngestEventsAfter(ctx, id, after)
+	events, currentUpload, err := h.service.IngestEventsAfter(ctx, id, after)
 	if err != nil {
 		writeError(w, r, err)
 		return
@@ -110,10 +110,10 @@ func (h *DocumentHandler) StreamIngestEvents(w http.ResponseWriter, r *http.Requ
 			}
 			after = event.Seq
 			lastFrame = time.Now()
-			if event.IsTerminal() {
-				// #25: a re-ingested Document appends new events after an old
-				// terminal event, and a fresh subscriber stops at the first
-				// terminal event it sees. Re-upload must handle that.
+			if event.IsTerminalFor(currentUpload) {
+				// An older upload's completed or failed event is followed by
+				// upload_replaced and the new upload's events; only the
+				// current upload's terminal event ends the stream.
 				return
 			}
 		}
@@ -134,7 +134,7 @@ func (h *DocumentHandler) StreamIngestEvents(w http.ResponseWriter, r *http.Requ
 			}
 			lastFrame = time.Now()
 		}
-		events, err = h.service.IngestEventsAfter(ctx, id, after)
+		events, currentUpload, err = h.service.IngestEventsAfter(ctx, id, after)
 		if err != nil {
 			if appErr, isApp := errors.IsAppError(err); isApp && appErr.HTTPCode == http.StatusNotFound {
 				// The Document is gone or no longer readable: end quietly.

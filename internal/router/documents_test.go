@@ -3,6 +3,8 @@ package router
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"mime/multipart"
@@ -21,6 +23,7 @@ import (
 	"github.com/phongnd2802/trelis/internal/db"
 	"github.com/phongnd2802/trelis/internal/db/dbtest"
 	"github.com/phongnd2802/trelis/internal/handler"
+	"github.com/phongnd2802/trelis/internal/types"
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
 
@@ -49,44 +52,100 @@ type server struct {
 	ctx    context.Context
 }
 
-// fakeStarter is a workflow starter that records the IDs it was asked to
-// start and can fail either workflow.
-type fakeStarter struct {
-	mu        sync.Mutex
-	started   []uuid.UUID
-	deleted   []uuid.UUID
-	err       error
-	deleteErr error
+// uploadRef is one Document upload a workflow call named.
+type uploadRef struct {
+	DocumentID, UploadID uuid.UUID
 }
 
-func (f *fakeStarter) StartIngest(_ context.Context, documentID uuid.UUID) error {
+// fakeStarter is a workflow starter that records the uploads it was asked to
+// start, terminate and clean up, and can fail any of them.
+type fakeStarter struct {
+	mu           sync.Mutex
+	started      []uploadRef
+	terminated   []uploadRef
+	deleted      []uploadRef
+	calls        []string
+	err          error
+	terminateErr error
+	deleteErr    error
+}
+
+func (f *fakeStarter) StartIngest(_ context.Context, documentID, uploadID uuid.UUID) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.started = append(f.started, documentID)
+	f.started = append(f.started, uploadRef{DocumentID: documentID, UploadID: uploadID})
+	f.calls = append(f.calls, "start "+uploadID.String())
 	return f.err
 }
 
-// StartDocumentDelete records the Document whose cleanup workflow was asked
-// for.
-func (f *fakeStarter) StartDocumentDelete(_ context.Context, documentID uuid.UUID) error {
+// TerminateIngest records the upload whose previous ingest was terminated.
+func (f *fakeStarter) TerminateIngest(_ context.Context, documentID, uploadID uuid.UUID) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.deleted = append(f.deleted, documentID)
+	f.terminated = append(f.terminated, uploadRef{DocumentID: documentID, UploadID: uploadID})
+	f.calls = append(f.calls, "terminate "+uploadID.String())
+	return f.terminateErr
+}
+
+// StartDocumentDelete records the Document and upload whose cleanup workflow
+// was asked for.
+func (f *fakeStarter) StartDocumentDelete(_ context.Context, documentID, uploadID uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleted = append(f.deleted, uploadRef{DocumentID: documentID, UploadID: uploadID})
+	f.calls = append(f.calls, "delete "+uploadID.String())
 	return f.deleteErr
 }
 
-// startedIDs returns the IDs StartIngest was called with, in order.
-func (f *fakeStarter) startedIDs() []uuid.UUID {
+// callLog returns the workflow calls in order.
+func (f *fakeStarter) callLog() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]uuid.UUID(nil), f.started...)
+	return append([]string(nil), f.calls...)
 }
 
-// deletedIDs returns the IDs StartDocumentDelete was called with, in order.
-func (f *fakeStarter) deletedIDs() []uuid.UUID {
+// startedRefs returns the uploads StartIngest was called with, in order.
+func (f *fakeStarter) startedRefs() []uploadRef {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]uuid.UUID(nil), f.deleted...)
+	return append([]uploadRef(nil), f.started...)
+}
+
+// terminatedRefs returns the uploads TerminateIngest was called with, in
+// order.
+func (f *fakeStarter) terminatedRefs() []uploadRef {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]uploadRef(nil), f.terminated...)
+}
+
+// deletedRefs returns the Documents StartDocumentDelete was called with, in
+// order.
+func (f *fakeStarter) deletedRefs() []uploadRef {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]uploadRef(nil), f.deleted...)
+}
+
+// startedIDs returns the Document IDs StartIngest was called with, in order.
+func (f *fakeStarter) startedIDs() []uuid.UUID {
+	refs := f.startedRefs()
+	ids := make([]uuid.UUID, len(refs))
+	for i, ref := range refs {
+		ids[i] = ref.DocumentID
+	}
+	return ids
+}
+
+// deletedIDs returns the Document IDs StartDocumentDelete was called with, in
+// order.
+func (f *fakeStarter) deletedIDs() []uuid.UUID {
+	refs := f.deletedRefs()
+	ids := make([]uuid.UUID, len(refs))
+	for i, ref := range refs {
+		ids[i] = ref.DocumentID
+	}
+	return ids
 }
 
 func newServer(t *testing.T, principals ...string) *server {
@@ -118,7 +177,8 @@ func newServerWith(t *testing.T, docOpts []handler.DocumentHandlerOption, princi
 	c.ingest = &fakeStarter{}
 	docs := service.NewDocumentService(store,
 		repository.NewDocumentRepository(store), principalRepo,
-		repository.NewIngestEventRepository(store), c.files, c.ingest, c.ingest)
+		repository.NewIngestEventRepository(store), repository.NewChunkRepository(store),
+		c.files, c.ingest, c.ingest)
 	c.docs = handler.NewDocumentHandler(docs, testMaxFileSize, docOpts...)
 	c.h = New(Readiness{}, authn, handler.NewPrincipalHandler(principalSvc),
 		c.docs, nil, nil, nil, false)
@@ -185,6 +245,48 @@ func (c *server) upload(as string, fields ...form) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	c.h.ServeHTTP(rec, req)
 	return rec
+}
+
+// replace PUTs /documents/{id}/file as the named Principal.
+func (c *server) replace(as, id string, fields ...form) *httptest.ResponseRecorder {
+	c.t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	for _, f := range fields {
+		var err error
+		if f.filename != "" {
+			w, ferr := mw.CreateFormFile(f.field, f.filename)
+			if ferr != nil {
+				c.t.Fatal(ferr)
+			}
+			_, err = w.Write([]byte(f.value))
+		} else {
+			err = mw.WriteField(f.field, f.value)
+		}
+		if err != nil {
+			c.t.Fatal(err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		c.t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPut, "/documents/"+id+"/file", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Authorization", c.key(as))
+	rec := httptest.NewRecorder()
+	c.h.ServeHTTP(rec, req)
+	return rec
+}
+
+// documentUploadID returns the current upload ID of a Document, read from
+// Postgres.
+func (c *server) documentUploadID(t *testing.T, id string) uuid.UUID {
+	t.Helper()
+	var uploadID uuid.UUID
+	if err := c.pool.QueryRow(c.ctx, "SELECT upload_id FROM documents WHERE id = $1", uuid.MustParse(id)).Scan(&uploadID); err != nil {
+		t.Fatalf("read upload of %s: %v", id, err)
+	}
+	return uploadID
 }
 
 type documentBody struct {
@@ -461,6 +563,196 @@ func TestAFileOverTheLimitIs413(t *testing.T) {
 	}
 	if got := c.list("alice"); len(got) != 0 {
 		t.Errorf("alice lists %v after a rejected upload, want nothing", got)
+	}
+}
+
+func TestTheOwnerReplacesADocumentsFile(t *testing.T) {
+	c := newServer(t, "alice", "bob")
+	id := c.uploaded("alice", upFile("old.txt", "old version"), principals("bob"))
+	oldUpload := c.documentUploadID(t, id)
+	chunks := repository.NewChunkRepository(c.store)
+	set := types.ChunkSet{
+		Parents:  []*types.ParentChunk{{Seq: 0, Content: "old version", StartOffset: 0, EndOffset: 11}},
+		Chunks:   []*types.Chunk{{Seq: 0, Content: "old version", StartOffset: 0, EndOffset: 11}},
+		ParentOf: []int{0},
+	}
+	if err := c.store.ExecTx(c.ctx, func(ctx context.Context) error {
+		return chunks.ReplaceChunks(ctx, uuid.MustParse(id), set)
+	}); err != nil {
+		t.Fatalf("seed the old Chunks: %v", err)
+	}
+
+	rec := c.replace("alice", id, upFile("new.md", "# New version\n\nDifferent text.\n"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT /documents/%s/file = %d %s, want 200", id, rec.Code, rec.Body)
+	}
+	doc := decodeDoc(t, rec)
+	if doc.ID != id || doc.FileName != "new.md" || doc.Title != "new.md" || doc.FileType != "md" ||
+		doc.FileSize != int64(len("# New version\n\nDifferent text.\n")) || doc.ParseStatus != "pending" {
+		t.Errorf("replaced Document = %+v, want the new file metadata and pending status", doc)
+	}
+	wantHash := sha256.Sum256([]byte("# New version\n\nDifferent text.\n"))
+	if doc.FileHash != hex.EncodeToString(wantHash[:]) {
+		t.Errorf("file hash = %q, want the new content's %x", doc.FileHash, wantHash)
+	}
+	newUpload := c.documentUploadID(t, id)
+	if newUpload == oldUpload {
+		t.Error("the re-upload kept the previous upload ID, want a new one")
+	}
+
+	// The Access List is unchanged, and bob still reads the Document.
+	if doc.AccessList == nil || strings.Join(doc.AccessList.Principals, ",") != "alice,bob" {
+		t.Errorf("access list = %+v, want [alice bob] kept", doc.AccessList)
+	}
+	if rec := get(t, c.h, "/documents/"+id, c.key("bob")); rec.Code != http.StatusOK {
+		t.Errorf("bob GET after the replace = %d, want 200", rec.Code)
+	}
+
+	for _, table := range []string{"chunks", "parent_chunks"} {
+		var rows int
+		if err := c.pool.QueryRow(c.ctx, "SELECT count(*) FROM "+table+" WHERE document_id = $1", uuid.MustParse(id)).Scan(&rows); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if rows != 0 {
+			t.Errorf("%s holds %d rows after the replace, want the old version gone", table, rows)
+		}
+	}
+
+	if calls := c.ingest.callLog(); len(calls) < 3 || calls[0] != "start "+oldUpload.String() ||
+		calls[1] != "terminate "+oldUpload.String() || calls[2] != "start "+newUpload.String() {
+		t.Errorf("workflow calls = %v, want the first start, then terminate %s, then start %s",
+			calls, oldUpload, newUpload)
+	}
+	terminated := c.ingest.terminatedRefs()
+	if len(terminated) != 1 || terminated[0] != (uploadRef{DocumentID: uuid.MustParse(id), UploadID: oldUpload}) {
+		t.Errorf("TerminateIngest called with %v, want the previous upload %s", terminated, oldUpload)
+	}
+	started := c.ingest.startedRefs()
+	if len(started) != 2 || started[1] != (uploadRef{DocumentID: uuid.MustParse(id), UploadID: newUpload}) {
+		t.Errorf("StartIngest calls = %v, want the initial upload then %s", started, newUpload)
+	}
+}
+
+func TestAReaderWhoIsNotTheOwnerCannotReplace(t *testing.T) {
+	c := newServer(t, "alice", "bob", "carol")
+	c.group("tax", "carol")
+	id := c.uploaded("alice", upFile("shared.txt", "old version"),
+		principals("bob"), groups("tax"))
+
+	for _, who := range []string{"bob", "carol"} {
+		rec := c.replace(who, id, upFile("new.txt", "new version"))
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("%s PUT = %d %s, want 403", who, rec.Code, rec.Body)
+			continue
+		}
+		if e := decode(t, rec); e.Success || e.Error == nil || e.Error.Code != 1002 {
+			t.Errorf("%s 403 body = %s, want the forbidden error envelope", who, rec.Body)
+		}
+	}
+	if got := c.ingest.terminatedRefs(); len(got) != 0 {
+		t.Errorf("TerminateIngest called with %v after forbidden replaces, want never", got)
+	}
+	// The owner check runs before the body is read, so a bad or oversized
+	// file from a non-owner is 403 rather than 400 or 413.
+	if rec := c.replace("bob", id, upFile("setup.exe", "MZ")); rec.Code != http.StatusForbidden {
+		t.Errorf("bob PUT with an unsupported file = %d, want 403", rec.Code)
+	}
+	oversized := upFile("big.txt", strings.Repeat("x", testMaxFileSize+1))
+	if rec := c.replace("bob", id, oversized); rec.Code != http.StatusForbidden {
+		t.Errorf("bob PUT with an oversized file = %d, want 403", rec.Code)
+	}
+	if rec := get(t, c.h, "/documents/"+id, c.key("alice")); rec.Code != http.StatusOK {
+		t.Errorf("alice GET after forbidden replaces = %d, want the Document still readable", rec.Code)
+	}
+}
+
+func TestReplacingAnUnreadableDocumentIsTheSameNotFoundAsAMissingOne(t *testing.T) {
+	c := newServer(t, "alice", "bob")
+	id := c.uploaded("alice", upFile("luong.txt", "Bảng lương 2024"))
+
+	unreadable := c.replace("bob", id, upFile("new.txt", "new version"))
+	missing := c.replace("bob", "0190d2a8-0000-7000-8000-00000000dead", upFile("new.txt", "new version"))
+	if unreadable.Code != http.StatusNotFound {
+		t.Errorf("bob PUT alice's Document = %d %s, want 404", unreadable.Code, unreadable.Body)
+	}
+	if unreadable.Body.String() != missing.Body.String() {
+		t.Errorf("unreadable body %s differs from missing body %s, which reveals existence",
+			unreadable.Body, missing.Body)
+	}
+	if got := c.ingest.terminatedRefs(); len(got) != 0 {
+		t.Errorf("TerminateIngest called with %v, want never", got)
+	}
+}
+
+func TestReplacingWithTheSameContentIsAConflict(t *testing.T) {
+	c := newServer(t, "alice")
+	id := c.uploaded("alice", upFile("luat.txt", "Luật 04/2007"))
+	other := c.uploaded("alice", upFile("khac.txt", "Nội dung khác"))
+
+	rec := c.replace("alice", id, upFile("copy.txt", "Luật 04/2007"))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("replace with the current content = %d %s, want 409", rec.Code, rec.Body)
+	}
+	if e := decode(t, rec); e.Code != "duplicate_document" || decodeDoc(t, rec).ID != id {
+		t.Errorf("409 body = %s, want code duplicate_document and the current Document %s", rec.Body, id)
+	}
+
+	rec = c.replace("alice", id, upFile("copy.txt", "Nội dung khác"))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("replace with another Document's content = %d %s, want 409", rec.Code, rec.Body)
+	}
+	if e := decode(t, rec); e.Code != "duplicate_document" || decodeDoc(t, rec).ID != other {
+		t.Errorf("409 body = %s, want code duplicate_document and the other Document %s", rec.Body, other)
+	}
+	if got := c.ingest.terminatedRefs(); len(got) != 0 {
+		t.Errorf("TerminateIngest called with %v after duplicate replaces, want never", got)
+	}
+}
+
+func TestMalformedReplacementsAre400(t *testing.T) {
+	c := newServer(t, "alice")
+	id := c.uploaded("alice", upFile("luat.txt", "Luật 04/2007"))
+
+	for name, fields := range map[string][]form{
+		"no file":          {principals("alice")},
+		"empty file":       {upFile("a.txt", "")},
+		"unsupported type": {upFile("setup.exe", "MZ")},
+		"no extension":     {upFile("README", "x")},
+	} {
+		rec := c.replace("alice", id, fields...)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: PUT = %d %s, want 400", name, rec.Code, rec.Body)
+			continue
+		}
+		if e := decode(t, rec); e.Success || e.Error == nil || e.Error.Code != 1000 {
+			t.Errorf("%s: body = %s, want the bad-request error envelope", name, rec.Body)
+		}
+	}
+	if rec := c.replace("alice", "not-a-uuid", upFile("new.txt", "new version")); rec.Code != http.StatusBadRequest {
+		t.Errorf("PUT with a malformed id = %d %s, want 400", rec.Code, rec.Body)
+	}
+	if got := c.ingest.terminatedRefs(); len(got) != 0 {
+		t.Errorf("TerminateIngest called with %v after malformed replaces, want never", got)
+	}
+}
+
+func TestAReplaceSucceedsWhenTheNewWorkflowWillNotStart(t *testing.T) {
+	c := newServer(t, "alice")
+	id := c.uploaded("alice", upFile("old.txt", "old version"))
+	c.ingest.err = errors.New("temporal unreachable")
+
+	rec := c.replace("alice", id, upFile("new.txt", "new version"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT = %d %s, want 200 even when the new workflow did not start", rec.Code, rec.Body)
+	}
+	if doc := decodeDoc(t, rec); doc.ParseStatus != "pending" {
+		t.Errorf("parse_status = %q, want pending", doc.ParseStatus)
+	}
+	if got := c.ingest.terminatedRefs(); len(got) != 1 {
+		t.Errorf("TerminateIngest called %d times, want the previous upload once", len(got))
+	}
+	if got := c.ingest.startedRefs(); len(got) != 2 {
+		t.Errorf("StartIngest called %d times, want the initial upload and the new one", len(got))
 	}
 }
 

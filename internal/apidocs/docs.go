@@ -469,7 +469,7 @@ const docTemplate = `{
                         "bearerAuth": []
                     }
                 ],
-                "description": "Streams the Document's Ingest Events as Server-Sent Events while the caller can read it. Each frame's id is the event's seq within the Document, event is parse_started, parse_finished, embed_batch_finished, completed or failed, and data is {\"document_id\",\"type\",\"detail\",\"created_at\"}. detail is {\"attempt\"} for parse_started, {\"chunks\"} for parse_finished, {\"from\",\"to\",\"chunks\"} for embed_batch_finished, {\"reason\"} for failed, and {} for completed. Reconnecting with Last-Event-ID replays the events after that seq, then carries on live. The stream ends after completed or failed, when the Document is gone or no longer readable, when the client disconnects, when the server shuts down, or after 30 minutes so a Document stuck in processing cannot hold it forever; reconnecting with Last-Event-ID loses nothing.",
+                "description": "Streams the Document's Ingest Events as Server-Sent Events while the caller can read it. Each frame's id is the event's seq within the Document, event is parse_started, parse_finished, embed_batch_finished, upload_replaced, completed or failed, and data is {\"document_id\",\"upload_id\",\"type\",\"detail\",\"created_at\"}. detail is {\"attempt\"} for parse_started, {\"chunks\"} for parse_finished, {\"from\",\"to\",\"chunks\"} for embed_batch_finished, {\"upload_id\"} for upload_replaced, {\"reason\"} for failed, and {} for completed. Reconnecting with Last-Event-ID replays the events after that seq, then carries on live. After a re-upload the stream passes an older upload's completed or failed event, then its upload_replaced event, and ends at the current upload's completed or failed. It also ends when the Document is gone or no longer readable, when the client disconnects, when the server shuts down, or after 30 minutes so a Document stuck in processing cannot hold it forever; reconnecting with Last-Event-ID loses nothing.",
                 "produces": [
                     "text/event-stream"
                 ],
@@ -495,7 +495,7 @@ const docTemplate = `{
                 ],
                 "responses": {
                     "200": {
-                        "description": "Server-Sent Events, one frame per Ingest Event; the stream ends after completed or failed, or after 30 minutes",
+                        "description": "Server-Sent Events, one frame per Ingest Event; the stream ends after the current upload's completed or failed, or after 30 minutes",
                         "schema": {
                             "type": "string"
                         }
@@ -567,6 +567,109 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "No readable Document with that ID",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error; a failed API key check answers the router's error body instead",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "bearerAuth": []
+                    }
+                ],
+                "description": "Replaces the Document's Source File with the uploaded one, under a new upload ID, and starts ingesting the new upload. The Access List is unchanged. Only the owner may replace it; the access and owner checks run before the body is read. Answers 409 with the earlier Document when the caller already has a Document with the same content. A concurrent re-upload answers 412; a concurrent delete answers 404. The old Chunks are removed before this returns.",
+                "consumes": [
+                    "multipart/form-data"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "documents"
+                ],
+                "summary": "Replace a Document's Source File",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Document ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "file",
+                        "description": "The new Source File",
+                        "name": "file",
+                        "in": "formData",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/handler.DataResponse"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/types.Document"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "400": {
+                        "description": "Malformed upload, invalid Document ID or unsupported file type",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Missing or invalid API key",
+                        "schema": {
+                            "$ref": "#/definitions/router.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "The caller can read the Document but is not its owner",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "No readable Document with that ID",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "The caller already has a Document with this content",
+                        "schema": {
+                            "$ref": "#/definitions/handler.DuplicateDocumentResponse"
+                        }
+                    },
+                    "412": {
+                        "description": "A concurrent re-upload changed the Document; retry",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "413": {
+                        "description": "File larger than storage.max_file_size_mb",
                         "schema": {
                             "$ref": "#/definitions/handler.ErrorResponse"
                         }
@@ -767,7 +870,8 @@ const docTemplate = `{
                 1009,
                 1010,
                 1011,
-                1012
+                1012,
+                1013
             ],
             "x-enum-varnames": [
                 "ErrBadRequest",
@@ -782,7 +886,8 @@ const docTemplate = `{
                 "ErrTimeout",
                 "ErrValidation",
                 "ErrRequestEntityTooLarge",
-                "ErrModelProvider"
+                "ErrModelProvider",
+                "ErrPreconditionFailed"
             ]
         },
         "handler.DataResponse": {

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"mime/multipart"
 	"net/http"
 	"strconv"
 	"strings"
@@ -122,32 +123,11 @@ func NewDocumentHandler(service interfaces.DocumentService, maxFileSize int64,
 //	@Failure		500			{object}	handler.ErrorResponse	"Internal server error; a failed API key check answers the router's error body instead"
 //	@Router			/documents [post]
 func (h *DocumentHandler) CreateDocumentFromFile(w http.ResponseWriter, r *http.Request) {
-	tooLarge := errors.NewRequestEntityTooLargeError("File size cannot exceed " + humanSize(h.maxFileSize))
-
-	// Capped before the multipart parse, not after: ParseMultipartForm
-	// buffers the whole body first, so the size check below only ever sees
-	// an upload already accepted.
-	r.Body = http.MaxBytesReader(w, r.Body, h.maxFileSize+uploadEnvelopeSlack)
-	if err := r.ParseMultipartForm(multipartMemory); err != nil {
-		if isRequestBodyTooLarge(err) {
-			writeError(w, r, tooLarge)
-			return
-		}
-		writeError(w, r, errors.NewBadRequestError("File upload failed").WithDetails(err.Error()))
+	file, ok := h.parseSingleFileUpload(w, r)
+	if !ok {
 		return
 	}
 	defer func() { _ = r.MultipartForm.RemoveAll() }()
-
-	files := r.MultipartForm.File["file"]
-	if len(files) != 1 {
-		writeError(w, r, errors.NewBadRequestError(`File upload failed: send exactly one "file" part`))
-		return
-	}
-	file := files[0]
-	if file.Size > h.maxFileSize {
-		writeError(w, r, tooLarge)
-		return
-	}
 
 	accessList := types.AccessList{
 		Principals: parseCommaSeparated(r.FormValue("principals")),
@@ -162,6 +142,93 @@ func (h *DocumentHandler) CreateDocumentFromFile(w http.ResponseWriter, r *http.
 		return
 	}
 	writeData(r.Context(), w, http.StatusOK, doc)
+}
+
+// ReplaceDocumentFile answers PUT /documents/{id}/file: a multipart/form-data
+// body with exactly one "file" part replaces the Document's Source File. Only
+// the owner may replace it; the Access List stays as it is. It answers 200
+// with the pending Document, 409 with the earlier Document when the caller
+// already has the same content, or 409 when a concurrent change won.
+//
+//	@Summary		Replace a Document's Source File
+//	@Description	Replaces the Document's Source File with the uploaded one, under a new upload ID, and starts ingesting the new upload. The Access List is unchanged. Only the owner may replace it; the access and owner checks run before the body is read. Answers 409 with the earlier Document when the caller already has a Document with the same content. A concurrent re-upload answers 412; a concurrent delete answers 404. The old Chunks are removed before this returns.
+//	@Tags			documents
+//	@Accept			multipart/form-data
+//	@Produce		json
+//	@Security		bearerAuth
+//	@Param			id		path		string	true	"Document ID"	format(uuid)
+//	@Param			file	formData	file	true	"The new Source File"
+//	@Success		200		{object}	handler.DataResponse{data=types.Document}
+//	@Failure		400		{object}	handler.ErrorResponse	"Malformed upload, invalid Document ID or unsupported file type"
+//	@Failure		401		{object}	router.ErrorResponse	"Missing or invalid API key"
+//	@Failure		403		{object}	handler.ErrorResponse	"The caller can read the Document but is not its owner"
+//	@Failure		404		{object}	handler.ErrorResponse	"No readable Document with that ID"
+//	@Failure		409		{object}	handler.DuplicateDocumentResponse	"The caller already has a Document with this content"
+//	@Failure		412		{object}	handler.ErrorResponse	"A concurrent re-upload changed the Document; retry"
+//	@Failure		413		{object}	handler.ErrorResponse	"File larger than storage.max_file_size_mb"
+//	@Failure		500		{object}	handler.ErrorResponse	"Internal server error; a failed API key check answers the router's error body instead"
+//	@Router			/documents/{id}/file [put]
+func (h *DocumentHandler) ReplaceDocumentFile(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, r, errors.NewBadRequestError("Invalid Document ID"))
+		return
+	}
+	// Check access and ownership before reading a body the caller may not be
+	// allowed to send, so a non-owner gets 403 rather than 400 or 413. The
+	// service checks again inside ReplaceDocumentFile.
+	if err := h.service.EnsureCanReplace(r.Context(), id); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	file, ok := h.parseSingleFileUpload(w, r)
+	if !ok {
+		return
+	}
+	defer func() { _ = r.MultipartForm.RemoveAll() }()
+
+	doc, err := h.service.ReplaceDocumentFile(r.Context(), id, file)
+	if err != nil {
+		if h.handleDuplicateDocumentError(r.Context(), w, err) {
+			return
+		}
+		writeError(w, r, err)
+		return
+	}
+	writeData(r.Context(), w, http.StatusOK, doc)
+}
+
+// parseSingleFileUpload caps the request body, parses its multipart form and
+// returns its one "file" part. A malformed or oversized request is answered
+// here and reported as false. The caller removes the form's temporary files
+// when it is done.
+func (h *DocumentHandler) parseSingleFileUpload(w http.ResponseWriter, r *http.Request) (*multipart.FileHeader, bool) {
+	tooLarge := errors.NewRequestEntityTooLargeError("File size cannot exceed " + humanSize(h.maxFileSize))
+
+	// Capped before the multipart parse, not after: ParseMultipartForm
+	// buffers the whole body first, so the size check below only ever sees
+	// an upload already accepted.
+	r.Body = http.MaxBytesReader(w, r.Body, h.maxFileSize+uploadEnvelopeSlack)
+	if err := r.ParseMultipartForm(multipartMemory); err != nil {
+		if isRequestBodyTooLarge(err) {
+			writeError(w, r, tooLarge)
+			return nil, false
+		}
+		writeError(w, r, errors.NewBadRequestError("File upload failed").WithDetails(err.Error()))
+		return nil, false
+	}
+
+	files := r.MultipartForm.File["file"]
+	if len(files) != 1 {
+		writeError(w, r, errors.NewBadRequestError(`File upload failed: send exactly one "file" part`))
+		return nil, false
+	}
+	file := files[0]
+	if file.Size > h.maxFileSize {
+		writeError(w, r, tooLarge)
+		return nil, false
+	}
+	return file, true
 }
 
 // DuplicateDocumentResponse is the 409 body when the caller already uploaded

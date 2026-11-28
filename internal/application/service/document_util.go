@@ -44,6 +44,29 @@ func getFileType(filename string) string {
 	return secutils.NormalizeImportExtension(ext[len(ext)-1])
 }
 
+// validateUploadFile applies the checks every upload path shares: a supported
+// extension, a non-empty body, its content hash and a safe file name. It
+// returns the file type, the hash and the safe name, or a client-facing error.
+func validateUploadFile(file *multipart.FileHeader) (fileType, hash, safeName string, err error) {
+	fileName := file.Filename
+	fileType = getFileType(fileName)
+	if err := validateImportFileType(fileType); err != nil {
+		return "", "", "", err
+	}
+	if file.Size == 0 {
+		return "", "", "", werrors.NewBadRequestError("File is empty")
+	}
+	hash, err = calculateFileHash(file)
+	if err != nil {
+		return "", "", "", fmt.Errorf("hash upload: %w", err)
+	}
+	safeName, isValid := secutils.ValidateInput(fileName)
+	if !isValid || safeName == "" {
+		return "", "", "", werrors.NewValidationError("File name contains illegal characters")
+	}
+	return fileType, hash, safeName, nil
+}
+
 // calculateFileHash returns the hex SHA-256 of an uploaded file.
 func calculateFileHash(file *multipart.FileHeader) (string, error) {
 	f, err := file.Open()

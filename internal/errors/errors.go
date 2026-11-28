@@ -3,9 +3,10 @@
 // License, by way of Omnisc. Modified for Trelis: the common code table is
 // kept whole so codes stay stable, the domain codes (tenants, agents, ...)
 // and the constructors Trelis does not call are dropped,
-// ErrRequestEntityTooLarge and ErrModelProvider are added, along with
-// NewForbiddenError, NewModelProviderError and the AppError cause/Unwrap, and
-// IsAppError unwraps. See NOTICE.
+// ErrRequestEntityTooLarge, ErrModelProvider and ErrPreconditionFailed are
+// added, along with NewForbiddenError, NewPreconditionFailedError,
+// NewModelProviderError and the AppError cause/Unwrap, and IsAppError
+// unwraps. See NOTICE.
 
 // Package errors is the application error a handler answers with: a stable
 // numeric code, a message fit for the client, and the HTTP status.
@@ -42,6 +43,10 @@ const (
 	// or rate limit. The failure is the provider's, not the caller's, so it is
 	// a bad gateway.
 	ErrModelProvider ErrorCode = 1012
+	// ErrPreconditionFailed is Trelis's: the state the caller acted on changed
+	// before the request could be applied, so retrying with the new state can
+	// succeed.
+	ErrPreconditionFailed ErrorCode = 1013
 )
 
 // AppError defines the application error structure
@@ -98,6 +103,16 @@ func NewForbiddenError(message string) *AppError {
 		Code:     ErrForbidden,
 		Message:  message,
 		HTTPCode: http.StatusForbidden,
+	}
+}
+
+// NewPreconditionFailedError creates a precondition-failed error: the caller
+// acted on a state that changed before the request could be applied.
+func NewPreconditionFailedError(message string) *AppError {
+	return &AppError{
+		Code:     ErrPreconditionFailed,
+		Message:  message,
+		HTTPCode: http.StatusPreconditionFailed,
 	}
 }
 

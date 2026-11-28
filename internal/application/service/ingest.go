@@ -6,12 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"github.com/phongnd2802/trelis/internal/application/repository"
+	"github.com/phongnd2802/trelis/internal/application/service/file"
 	"github.com/phongnd2802/trelis/internal/chunker"
 	"github.com/phongnd2802/trelis/internal/db"
+	"github.com/phongnd2802/trelis/internal/logger"
 	"github.com/phongnd2802/trelis/internal/types"
 	"github.com/phongnd2802/trelis/internal/types/interfaces"
 )
@@ -47,27 +51,39 @@ func NewIngestService(store db.Store, documents interfaces.DocumentRepository,
 		files: files, parser: parser, embedder: embedder, splitter: splitter}
 }
 
-// ParseAndChunk parses a Document's Source File, splits the Markdown into
-// Chunks and, in one transaction, replaces the Document's Chunks and Parent
-// Chunks. It leaves the Document processing for the embed batches; Complete
-// marks it completed once every Chunk has a vector. It reports what it stored
-// and how the tier chain chose it, and records parse_started for attempt
-// before it starts and parse_finished in the transaction that commits the
-// Chunks. With parent-child mode off only the Chunks are stored; with it on
-// the Parent Chunks are stored as well but never embedded. A
-// *types.UnparseableError means the Source File cannot be turned into text; a
-// *types.DocumentNotFoundError means the row is gone. Neither can be fixed by
-// retrying; a storage or database failure is not, so the activity retries it.
-func (s *ingestService) ParseAndChunk(ctx context.Context, documentID uuid.UUID, attempt int) (types.ChunkingResult, error) {
+// ParseAndChunk parses one upload of a Document's Source File, splits the
+// Markdown into Chunks and, in one transaction, replaces the Document's
+// Chunks and Parent Chunks. It leaves the Document processing for the embed
+// batches; Complete marks it completed once every Chunk has a vector. It
+// reports what it stored and how the tier chain chose it, and records
+// parse_started for attempt before it starts and parse_finished in the
+// transaction that commits the Chunks; each event is committed only while
+// uploadID is still the Document's current upload. With parent-child mode off
+// only the Chunks are stored; with it on the Parent Chunks are stored as well
+// but never embedded. A *types.UnparseableError means the Source File cannot
+// be turned into text, a *types.DocumentNotFoundError means the row is gone
+// and a *types.SupersededUploadError means a newer upload owns it; none can
+// be fixed by retrying. A storage or database failure is not, so the activity
+// retries it.
+func (s *ingestService) ParseAndChunk(ctx context.Context, documentID, uploadID uuid.UUID, attempt int) (types.ChunkingResult, error) {
 	doc, err := s.documents.GetDocumentByID(ctx, documentID)
 	if err != nil {
 		return types.ChunkingResult{}, ingestDocumentError(err)
 	}
-	if err := s.appendEvent(ctx, documentID, types.IngestEventParseStarted,
-		types.ParseStartedDetail{Attempt: attempt}); err != nil {
+	// Checking before reading the Source File avoids a parse for an upload
+	// that a re-upload already replaced. The row can still change after this
+	// read; the commit-time guard is what decides.
+	if err := currentUploadError(doc.UploadID, uploadID); err != nil {
 		return types.ChunkingResult{}, err
 	}
-	if err := s.documents.SetParseStatus(ctx, documentID, types.ParseStatusProcessing, ""); err != nil {
+	err = s.store.ExecTx(ctx, func(ctx context.Context) error {
+		if err := s.appendEvent(ctx, documentID, uploadID, types.IngestEventParseStarted,
+			types.ParseStartedDetail{Attempt: attempt}); err != nil {
+			return err
+		}
+		return s.documents.SetParseStatus(ctx, documentID, types.ParseStatusProcessing, "")
+	})
+	if err != nil {
 		return types.ChunkingResult{}, ingestDocumentError(err)
 	}
 
@@ -103,7 +119,7 @@ func (s *ingestService) ParseAndChunk(ctx context.Context, documentID uuid.UUID,
 	set := chunkSet(documentID, split, withParents)
 
 	err = s.store.ExecTx(ctx, func(ctx context.Context) error {
-		if err := s.appendEvent(ctx, documentID, types.IngestEventParseFinished,
+		if err := s.appendEvent(ctx, documentID, uploadID, types.IngestEventParseFinished,
 			types.ParseFinishedDetail{Chunks: len(set.Chunks)}); err != nil {
 			return err
 		}
@@ -173,19 +189,28 @@ func chunkingResult(split chunker.ParentChildResult, diag *chunker.Diagnostics, 
 	return result
 }
 
-// EmbedBatch embeds the Chunks of a Document whose Seq is in [from, to) and
-// that have no embedding yet, in one embedding call, then stores their vectors
-// in one transaction with an embed_batch_finished Ingest Event. It returns how
-// many Chunks it embedded; a range that is already embedded is a no-op and
-// writes no event, because no batch finished embedding anything.
+// EmbedBatch embeds the Chunks of one upload of a Document whose Seq is in
+// [from, to) and that have no embedding yet, in one embedding call, then
+// stores their vectors in one transaction with an embed_batch_finished Ingest
+// Event. It returns how many Chunks it embedded; a range that is already
+// embedded is a no-op and writes no event, because no batch finished embedding
+// anything. The transaction commits only while uploadID is still the
+// Document's current upload, so a superseded batch writes nothing.
 // The text is the Chunk's ContextHeader, when it has one, followed by its
 // Content, which is what a reader of that Chunk sees. A
 // *types.EmbeddingUnconfiguredError means models.embedding is unset and cannot
-// be fixed by retrying. An embedding provider or database failure is, so the
-// activity retries this batch alone without re-parsing the Document.
-func (s *ingestService) EmbedBatch(ctx context.Context, documentID uuid.UUID, from, to int) (int, error) {
+// be fixed by retrying, and a *types.SupersededUploadError means a newer
+// upload owns the Document and the batch is dropped. An embedding provider or
+// database failure is retryable, so the activity retries this batch alone
+// without re-parsing the Document.
+func (s *ingestService) EmbedBatch(ctx context.Context, documentID, uploadID uuid.UUID, from, to int) (int, error) {
 	if s.embedder == nil {
 		return 0, &types.EmbeddingUnconfiguredError{}
+	}
+	// A stale batch must not spend a model call. The commit-time guard still
+	// decides, because the upload can change during the call.
+	if err := s.ensureCurrentUpload(ctx, documentID, uploadID); err != nil {
+		return 0, err
 	}
 	chunks, err := s.chunks.ListUnembeddedChunks(ctx, documentID, from, to)
 	if err != nil {
@@ -213,7 +238,7 @@ func (s *ingestService) EmbedBatch(ctx context.Context, documentID uuid.UUID, fr
 
 	model := s.embedder.GetModelName()
 	err = s.store.ExecTx(ctx, func(ctx context.Context) error {
-		if err := s.appendEvent(ctx, documentID, types.IngestEventEmbedBatchFinished,
+		if err := s.appendEvent(ctx, documentID, uploadID, types.IngestEventEmbedBatchFinished,
 			types.EmbedBatchFinishedDetail{From: from, To: to, Chunks: len(chunks)}); err != nil {
 			return err
 		}
@@ -230,16 +255,19 @@ func (s *ingestService) EmbedBatch(ctx context.Context, documentID uuid.UUID, fr
 	return len(chunks), nil
 }
 
-// Complete marks a Document completed once every Chunk has an embedding, in
-// one transaction that records the completed Ingest Event, counts the Chunks
-// without one and sets the status. A missing embedding is a retryable error
-// naming the count, so the Document is never completed with part of its
-// Chunks unembedded and the completed event rolls back with it. A
-// *types.DocumentNotFoundError means the Document row is gone and cannot be
+// Complete marks one upload of a Document completed once every Chunk has an
+// embedding, in one transaction that records the completed Ingest Event,
+// counts the Chunks without one and sets the status. The transaction commits
+// only while uploadID is still the current upload, so a superseded run never
+// completes the new upload. A missing embedding is a retryable error naming
+// the count, so the Document is never completed with part of its Chunks
+// unembedded and the completed event rolls back with it. A
+// *types.DocumentNotFoundError means the Document row is gone and a
+// *types.SupersededUploadError means a newer upload owns it; neither can be
 // fixed by retrying.
-func (s *ingestService) Complete(ctx context.Context, documentID uuid.UUID) error {
+func (s *ingestService) Complete(ctx context.Context, documentID, uploadID uuid.UUID) error {
 	err := s.store.ExecTx(ctx, func(ctx context.Context) error {
-		if err := s.appendEvent(ctx, documentID, types.IngestEventCompleted, struct{}{}); err != nil {
+		if err := s.appendEvent(ctx, documentID, uploadID, types.IngestEventCompleted, struct{}{}); err != nil {
 			return err
 		}
 		missing, err := s.chunks.CountChunksWithoutEmbedding(ctx, documentID)
@@ -270,13 +298,15 @@ func chunkText(c *types.Chunk) string {
 	return c.ContextHeader + "\n\n" + c.Content
 }
 
-// MarkFailed records that a Document's ingest failed, with a reason short
-// enough to show beside the Document, in one transaction that also records
-// the failed Ingest Event. A Document deleted since the failure has no row
-// left to mark, so that is not an error and writes no event.
-func (s *ingestService) MarkFailed(ctx context.Context, documentID uuid.UUID, reason string) error {
+// MarkFailed records that one upload of a Document failed, with a reason
+// short enough to show beside the Document, in one transaction that also
+// records the failed Ingest Event. It commits only while uploadID is still
+// the current upload, so a superseded run never marks the new upload failed.
+// A Document deleted since the failure has no row left to mark, so that is
+// not an error and writes no event.
+func (s *ingestService) MarkFailed(ctx context.Context, documentID, uploadID uuid.UUID, reason string) error {
 	err := s.store.ExecTx(ctx, func(ctx context.Context) error {
-		if err := s.appendEvent(ctx, documentID, types.IngestEventFailed,
+		if err := s.appendEvent(ctx, documentID, uploadID, types.IngestEventFailed,
 			types.FailedDetail{Reason: reason}); err != nil {
 			return err
 		}
@@ -292,6 +322,81 @@ func (s *ingestService) MarkFailed(ctx context.Context, documentID uuid.UUID, re
 	return err
 }
 
+// DeleteSupersededUploads removes the objects of a Document's uploads that
+// were replaced before uploadID, after uploadID's Chunks are committed. It
+// first checks, under the Document row lock, that uploadID is still the
+// Document's current upload; a newer upload means this run is superseded and
+// nothing is deleted.
+//
+// An upload is replaced only if its newest object is older than uploadID's
+// oldest object. A prefix with a newer object is a later re-upload, possibly
+// still in flight, and is left for the reconciler. If uploadID has no objects
+// at all, nothing is safe to delete and the mismatch is logged.
+//
+// It is idempotent, so a retry or a second run deletes nothing twice. A
+// missing Document is a *types.DocumentNotFoundError.
+func (s *ingestService) DeleteSupersededUploads(ctx context.Context, documentID, uploadID uuid.UUID) error {
+	err := s.store.ExecTx(ctx, func(ctx context.Context) error {
+		current, err := s.documents.LockDocumentUploadID(ctx, documentID)
+		if err != nil {
+			return ingestDocumentError(err)
+		}
+		return currentUploadError(current, uploadID)
+	})
+	if err != nil {
+		return err
+	}
+
+	objects, err := s.files.ListObjects(ctx, file.DocumentPrefix(documentID))
+	if err != nil {
+		return fmt.Errorf("list objects of document %s: %w", documentID, err)
+	}
+	var (
+		currentOldest time.Time
+		currentCount  int
+		newest        = make(map[uuid.UUID]time.Time)
+	)
+	for _, object := range objects {
+		objectDocument, objectUpload, err := file.ParseKey(object.Key)
+		if err != nil || objectDocument != documentID {
+			// A key outside this Document and upload layout is left to the
+			// reconciler, which reports it; deleting this Document's replaced
+			// uploads does not depend on it.
+			continue
+		}
+		if objectUpload == uploadID {
+			if currentCount == 0 || object.LastModified.Before(currentOldest) {
+				currentOldest = object.LastModified
+			}
+			currentCount++
+			continue
+		}
+		if newestTime, ok := newest[objectUpload]; !ok || object.LastModified.After(newestTime) {
+			newest[objectUpload] = object.LastModified
+		}
+	}
+	if currentCount == 0 {
+		logger.Ctx(ctx).Warn("ingest: current upload has no objects; leaving replaced uploads",
+			zap.Stringer("document", documentID), zap.Stringer("upload", uploadID))
+		return nil
+	}
+	deleted := 0
+	for staleUpload, newestObject := range newest {
+		if !newestObject.Before(currentOldest) {
+			continue
+		}
+		if err := s.files.DeletePrefix(ctx, file.UploadPrefix(documentID, staleUpload)); err != nil {
+			return fmt.Errorf("delete upload %s of document %s: %w", staleUpload, documentID, err)
+		}
+		deleted++
+	}
+	if deleted > 0 {
+		logger.Ctx(ctx).Info("ingest: superseded uploads deleted",
+			zap.Stringer("document", documentID), zap.Int("uploads", deleted))
+	}
+	return nil
+}
+
 // ingestDocumentError maps the repository's missing-Document error to the
 // domain error the activities treat as non-retryable. Other errors pass
 // through, nil included.
@@ -302,22 +407,53 @@ func ingestDocumentError(err error) error {
 	return err
 }
 
-// appendEvent records one Ingest Event in ctx. A caller inside an ExecTx gets
-// the event committed or rolled back with the data it describes, so a step
-// that claims to have finished never leaves an event when its data does not
-// land. It is the first statement of every such transaction: the insert locks
-// the Document row before the transaction touches any Chunk rows, the same
-// order the delete cascade uses, so the two cannot deadlock. The lock is held
-// until commit, which is what orders seq by commit.
-func (s *ingestService) appendEvent(ctx context.Context, documentID uuid.UUID, eventType string, detail any) error {
+// appendEvent records one Ingest Event for uploadID in ctx, then checks, in
+// the same transaction, that the Document still points at that upload. A
+// caller inside an ExecTx gets the event committed or rolled back with the
+// data it describes, so a step that claims to have finished never leaves an
+// event when its data does not land. It is the first statement of every such
+// transaction: the insert locks the Document row before the transaction
+// touches any Chunk rows, the same order the delete cascade uses, so the two
+// cannot deadlock. The lock is held until commit, which is what orders seq by
+// commit and makes the upload check race-free: no re-upload can commit
+// between the insert and the check. A different upload means a newer upload
+// owns the Document, so the transaction rolls back with a
+// *types.SupersededUploadError.
+func (s *ingestService) appendEvent(ctx context.Context, documentID, uploadID uuid.UUID, eventType string, detail any) error {
 	raw, err := json.Marshal(detail)
 	if err != nil {
 		return fmt.Errorf("encode %s event of document %s: %w", eventType, documentID, err)
 	}
 	_, err = s.events.InsertIngestEvent(ctx, &types.IngestEvent{
 		DocumentID: documentID,
+		UploadID:   uploadID,
 		Type:       eventType,
 		Detail:     raw,
 	})
-	return ingestDocumentError(err)
+	if err != nil {
+		return ingestDocumentError(err)
+	}
+	return s.ensureCurrentUpload(ctx, documentID, uploadID)
+}
+
+// ensureCurrentUpload returns a *types.SupersededUploadError unless uploadID
+// is the Document's current upload. The caller either holds the Document row
+// lock already (appendEvent's insert took it) or is only avoiding wasted work
+// (the pre-parse and pre-embed checks); the commit-time guard is what makes a
+// stale activity safe.
+func (s *ingestService) ensureCurrentUpload(ctx context.Context, documentID, uploadID uuid.UUID) error {
+	current, err := s.documents.GetDocumentUploadID(ctx, documentID)
+	if err != nil {
+		return ingestDocumentError(err)
+	}
+	return currentUploadError(current, uploadID)
+}
+
+// currentUploadError returns a *types.SupersededUploadError unless current is
+// uploadID.
+func currentUploadError(current, uploadID uuid.UUID) error {
+	if current != uploadID {
+		return &types.SupersededUploadError{}
+	}
+	return nil
 }
