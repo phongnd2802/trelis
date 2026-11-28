@@ -289,7 +289,7 @@ func TestAnInternalAnswerFailureIs500(t *testing.T) {
 func TestAChatProviderRejectionOnAStreamedAnswerIsJSON502(t *testing.T) {
 	p := modeltest.NewFakeProvider(t)
 	p.FailNext(modeltest.ChatCompletions, http.StatusUnauthorized, 1)
-	c, err := chat.NewChat("chat", config.ChatRole{
+	c, err := chat.NewChat("models.chat", config.ChatRole{
 		Protocol: api.APIOpenAICompletions,
 		Endpoint: config.Endpoint{BaseURL: p.URL(), Model: "test-chat"},
 	})
@@ -329,7 +329,7 @@ func TestAChatProviderRejectionOnAStreamedAnswerIsJSON502(t *testing.T) {
 func TestAChatProviderRejectionIs502WithoutTheVendorBody(t *testing.T) {
 	p := modeltest.NewFakeProvider(t)
 	p.FailNext(modeltest.ChatCompletions, http.StatusUnauthorized, 1)
-	c, err := chat.NewChat("chat", config.ChatRole{
+	c, err := chat.NewChat("models.chat", config.ChatRole{
 		Protocol: api.APIOpenAICompletions,
 		Endpoint: config.Endpoint{BaseURL: p.URL(), Model: "test-chat"},
 	})

@@ -55,11 +55,11 @@ func TestNewChat_EachRoleCallsItsOwnProvider(t *testing.T) {
 	chatSrv := provider(t, "from chat", &chatSeen)
 	judgeSrv := provider(t, "from judge", &judgeSeen)
 
-	chatRole, err := NewChat("chat", role(chatSrv.URL, "gen-model", "key-chat"))
+	chatRole, err := NewChat("models.chat", role(chatSrv.URL, "gen-model", "key-chat"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	judgeRole, err := NewChat("judge", role(judgeSrv.URL, "judge-model", "key-judge"))
+	judgeRole, err := NewChat("models.judge", role(judgeSrv.URL, "judge-model", "key-judge"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestNewChat_SwitchesProtocolWithTheRoleConfig(t *testing.T) {
 	ask := func(protocol api.API) string {
 		r := role(p.URL(), "m", "k")
 		r.Protocol = protocol
-		c, err := NewChat("chat", r)
+		c, err := NewChat("models.chat", r)
 		if err != nil {
 			t.Fatalf("NewChat(%s): %v", protocol, err)
 		}
@@ -140,7 +140,7 @@ func TestNewChat_RejectsIncompleteRole(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			c, err := NewChat("chat", tc.role)
+			c, err := NewChat("models.chat", tc.role)
 			if err == nil {
 				t.Fatalf("NewChat(%+v) = %v, want an error", tc.role, c)
 			}
@@ -164,7 +164,7 @@ func TestChatLogsOneModelCallWithoutTheMessage(t *testing.T) {
 		Text:  "secret answer",
 		Usage: modeltest.Usage{Input: 12, Output: 7},
 	})
-	c, err := NewChat("chat", role(p.URL(), "m", "k"))
+	c, err := NewChat("models.chat", role(p.URL(), "m", "k"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,13 +204,17 @@ func TestFailedChatLogsOneInfoLine(t *testing.T) {
 	t.Cleanup(func() { zap.ReplaceGlobals(previous) })
 
 	p := modeltest.NewFakeProvider(t)
-	p.FailNext(modeltest.ChatCompletions, http.StatusInternalServerError, 1)
-	c, err := NewChat("chat", role(p.URL(), "m", "k"))
+	p.FailNext(modeltest.ChatCompletions, http.StatusUnauthorized, 1)
+	c, err := NewChat("models.chat", role(p.URL(), "m", "k"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "secret prompt"}}, nil); err == nil {
-		t.Fatal("Chat succeeded, want the provider's error")
+	_, err = c.Chat(context.Background(), []Message{{Role: "user", Content: "secret prompt"}}, nil)
+	if err == nil {
+		t.Fatal("Chat succeeded, want the provider's rejection")
+	}
+	if want := "the chat model provider rejected the call (HTTP 401)"; !strings.Contains(err.Error(), want) {
+		t.Errorf("Chat err = %q, want it to contain %q", err, want)
 	}
 
 	entries := logs.FilterMessage("model call").All()
@@ -222,8 +226,11 @@ func TestFailedChatLogsOneInfoLine(t *testing.T) {
 		t.Errorf("level = %v, want INFO", entry.Level)
 	}
 	fields := entry.ContextMap()
-	if fields["status"] != "error" || fields["http_status"] != int64(http.StatusInternalServerError) {
-		t.Errorf("fields = %v, want status error and http_status 500", fields)
+	if fields["role"] != "chat" {
+		t.Errorf("role = %v, want chat", fields["role"])
+	}
+	if fields["status"] != "error" || fields["http_status"] != int64(http.StatusUnauthorized) {
+		t.Errorf("fields = %v, want status error and http_status 401", fields)
 	}
 	if _, ok := fields["error"]; ok {
 		t.Errorf("fields = %v, want no error text in the model-call line", fields)
@@ -244,7 +251,7 @@ func TestChatStreamLogsWhenTheStreamFinishes(t *testing.T) {
 		Text:  "secret answer",
 		Usage: modeltest.Usage{Input: 11, Output: 7},
 	})
-	c, err := NewChat("chat", role(p.URL(), "m", "k"))
+	c, err := NewChat("models.chat", role(p.URL(), "m", "k"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,6 +268,9 @@ func TestChatStreamLogsWhenTheStreamFinishes(t *testing.T) {
 	}
 	entry := entries[0]
 	fields := entry.ContextMap()
+	if fields["role"] != "chat" {
+		t.Errorf("role = %v, want chat", fields["role"])
+	}
 	if got := fields["status"]; got != "ok" {
 		t.Errorf("status = %v, want ok", got)
 	}

@@ -761,7 +761,7 @@ func TestRetrieveWithoutAChatModelCannotDecompose(t *testing.T) {
 // exercises query decomposition through the fake provider.
 func providerChat(t *testing.T, p *modeltest.FakeProvider) interfaces.Generator {
 	t.Helper()
-	c, err := chat.NewChat("chat", config.ChatRole{
+	c, err := chat.NewChat("models.chat", config.ChatRole{
 		Protocol: api.APIOpenAICompletions,
 		Endpoint: config.Endpoint{BaseURL: p.URL(), Model: "test-chat"},
 	})

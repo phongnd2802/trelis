@@ -54,7 +54,8 @@ type Chat interface {
 
 // NewChat builds the protocol client for one configured chat role
 // (models.chat, models.extraction or models.judge). roleKey is that role's
-// config key, used only in the model-call log.
+// config key; the bare role name is what the model-call log and provider
+// errors use.
 func NewChat(roleKey string, role config.ChatRole) (Chat, error) {
 	endpoint, err := role.APIEndpoint("chat")
 	if err != nil {
@@ -76,17 +77,16 @@ func NewChat(roleKey string, role config.ChatRole) (Chat, error) {
 	default:
 		return nil, fmt.Errorf("unsupported chat api %q for model %s", role.Protocol, role.Model)
 	}
-	return &loggingChat{roleKey: roleKey, role: strings.TrimPrefix(roleKey, "models."),
+	return &loggingChat{role: strings.TrimPrefix(roleKey, "models."),
 		protocol: role.Protocol, inner: inner}, nil
 }
 
 // loggingChat is a role's client with the one model-call line around each
 // logical call. A chat send is not retried by the clients, so attempts is 1.
 type loggingChat struct {
-	// roleKey is the role's config key, as the model-call line names it.
-	roleKey string
-	// role names the role in a client-facing error: the key without its
-	// "models." prefix, so "models.chat" reads as "chat".
+	// role names the role in the model-call line and a client-facing error:
+	// the config key without its "models." prefix, so "models.chat" reads
+	// as "chat".
 	role     string
 	protocol api.API
 	inner    Chat
@@ -97,7 +97,7 @@ func (c *loggingChat) GetModelName() string { return c.inner.GetModelName() }
 // call is the metadata every logging point shares.
 func (c *loggingChat) call(start time.Time, failed bool, httpStatus int) logger.ModelCall {
 	return logger.ModelCall{
-		Role:       c.roleKey,
+		Role:       c.role,
 		Model:      c.GetModelName(),
 		Protocol:   string(c.protocol),
 		Duration:   time.Since(start),
