@@ -55,13 +55,23 @@ func TestQueryRewriteIsAKnownStageTechnique(t *testing.T) {
 	}
 }
 
+func TestQueryDecompositionIsAKnownStageTechnique(t *testing.T) {
+	if !RetrievalTechniqueQueryDecomposition.Known() {
+		t.Errorf("%q is not known, want query_decomposition registered as a technique", RetrievalTechniqueQueryDecomposition)
+	}
+	if !RetrievalTechniqueQueryDecomposition.IsStage() {
+		t.Errorf("%q IsStage() = false, want it treated as a stage", RetrievalTechniqueQueryDecomposition)
+	}
+}
+
 func TestOnlyTheStageTechniquesAreStages(t *testing.T) {
 	for technique, want := range map[RetrievalTechnique]bool{
-		RetrievalTechniqueDense:        false,
-		RetrievalTechniqueBM25:         false,
-		RetrievalTechniqueQueryRewrite: true,
-		RetrievalTechniqueRerank:       true,
-		RetrievalTechniqueParentChild:  true,
+		RetrievalTechniqueDense:              false,
+		RetrievalTechniqueBM25:               false,
+		RetrievalTechniqueQueryRewrite:       true,
+		RetrievalTechniqueQueryDecomposition: true,
+		RetrievalTechniqueRerank:             true,
+		RetrievalTechniqueParentChild:        true,
 	} {
 		if got := technique.IsStage(); got != want {
 			t.Errorf("%q IsStage() = %t, want %t", technique, got, want)
@@ -195,6 +205,7 @@ func TestRetrievalConfigValidateRejectsOnlyStageTechniques(t *testing.T) {
 		{RetrievalTechniqueParentChild},
 		{RetrievalTechniqueRerank, RetrievalTechniqueParentChild},
 		{RetrievalTechniqueParentChild, RetrievalTechniqueRerank},
+		{RetrievalTechniqueQueryDecomposition, RetrievalTechniqueRerank},
 	} {
 		config := RetrievalConfig{Techniques: techniques}
 		err := config.Validate()
@@ -208,6 +219,9 @@ func TestRetrievalConfigValidateRejectsOnlyStageTechniques(t *testing.T) {
 		}
 		if strings.Contains(err.Error(), `"parent_child", "dense"`) {
 			t.Errorf("Validate(%v) error %q offers parent_child as a candidate", techniques, err)
+		}
+		if strings.Contains(err.Error(), `"query_decomposition", "dense"`) {
+			t.Errorf("Validate(%v) error %q offers query_decomposition as a candidate", techniques, err)
 		}
 	}
 }
@@ -238,12 +252,60 @@ func TestRetrievalConfigValidateAcceptsQueryRewriteNextToACandidateTechnique(t *
 	}
 }
 
+func TestRetrievalConfigValidateRejectsQueryDecompositionAlone(t *testing.T) {
+	config := RetrievalConfig{Techniques: []RetrievalTechnique{RetrievalTechniqueQueryDecomposition}}
+	err := config.Validate()
+	if err == nil {
+		t.Fatalf("Validate(%v) = nil, want query_decomposition alone rejected", config.Techniques)
+	}
+	for _, want := range []string{
+		"query_decomposition",
+		"splits the question into sub-questions another technique searches for",
+		"at least one",
+		`"dense"`,
+		`"bm25"`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+}
+
+func TestRetrievalConfigValidateAcceptsQueryDecompositionNextToACandidateTechnique(t *testing.T) {
+	for _, techniques := range [][]RetrievalTechnique{
+		{RetrievalTechniqueQueryDecomposition, RetrievalTechniqueBM25},
+		{RetrievalTechniqueDense, RetrievalTechniqueQueryDecomposition},
+		{RetrievalTechniqueQueryRewrite, RetrievalTechniqueQueryDecomposition, RetrievalTechniqueBM25, RetrievalTechniqueRerank},
+	} {
+		config := RetrievalConfig{Techniques: techniques}
+		if err := config.Validate(); err != nil {
+			t.Errorf("Validate(%v) = %v, want query_decomposition accepted as a stage", techniques, err)
+		}
+	}
+}
+
+func TestRetrievalConfigDecomposesQuery(t *testing.T) {
+	for _, tc := range []struct {
+		techniques []RetrievalTechnique
+		want       bool
+	}{
+		{[]RetrievalTechnique{RetrievalTechniqueBM25}, false},
+		{[]RetrievalTechnique{RetrievalTechniqueBM25, RetrievalTechniqueQueryDecomposition}, true},
+	} {
+		config := RetrievalConfig{Techniques: tc.techniques}
+		if got := config.DecomposesQuery(); got != tc.want {
+			t.Errorf("DecomposesQuery() with %v = %t, want %t", tc.techniques, got, tc.want)
+		}
+	}
+}
+
 func TestCandidateTechniquesLeavesOutStageTechniques(t *testing.T) {
 	config := RetrievalConfig{Techniques: []RetrievalTechnique{
 		RetrievalTechniqueDense,
 		RetrievalTechniqueRerank,
 		RetrievalTechniqueParentChild,
 		RetrievalTechniqueQueryRewrite,
+		RetrievalTechniqueQueryDecomposition,
 		RetrievalTechniqueBM25,
 	}}
 	got := config.CandidateTechniques()

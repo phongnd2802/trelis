@@ -533,9 +533,11 @@ func TestStartAnswerStreamReturnsPreGenerationErrors(t *testing.T) {
 	}
 }
 
-func TestAStreamedAnswerRecordsTheTurnAndSumsTheRewriteUsage(t *testing.T) {
+func TestAStreamedAnswerRecordsTheTurnAndSumsTheChatUsage(t *testing.T) {
 	conversationID, principalID := uuid.New(), uuid.New()
 	rewriteUsage := types.TokenUsage{PromptTokens: 10, CompletionTokens: 4, TotalTokens: 14}
+	decomposeUsage := types.TokenUsage{PromptTokens: 5, CompletionTokens: 3, TotalTokens: 8}
+	retrievalChatUsage := types.TokenUsage{PromptTokens: 15, CompletionTokens: 7, TotalTokens: 22}
 	generateUsage := types.TokenUsage{PromptTokens: 3, CompletionTokens: 2, TotalTokens: 5}
 	conversations := &fakeConversations{owned: true}
 	rewritten := "standalone"
@@ -543,11 +545,17 @@ func TestAStreamedAnswerRecordsTheTurnAndSumsTheRewriteUsage(t *testing.T) {
 		Results:        answerResults(),
 		Query:          rewritten,
 		RewrittenQuery: &rewritten,
-		RewriteUsage:   rewriteUsage,
-		Trace: []types.TraceStep{{
-			Step: types.TraceStepRewriteQuery, Technique: types.RetrievalTechniqueQueryRewrite,
-			RewrittenQuery: rewritten, Usage: &rewriteUsage,
-		}},
+		ChatUsage:      retrievalChatUsage,
+		Trace: []types.TraceStep{
+			{
+				Step: types.TraceStepRewriteQuery, Technique: types.RetrievalTechniqueQueryRewrite,
+				RewrittenQuery: rewritten, Usage: &rewriteUsage,
+			},
+			{
+				Step: types.TraceStepDecomposeQuery, Technique: types.RetrievalTechniqueQueryDecomposition,
+				Usage: &decomposeUsage,
+			},
+		},
 	}}
 	gen := &fakeGenerator{chunks: []types.StreamResponse{
 		answerToken("Alpha [1]."),
@@ -567,9 +575,9 @@ func TestAStreamedAnswerRecordsTheTurnAndSumsTheRewriteUsage(t *testing.T) {
 	if !ok || last.Type != types.AnswerEventDone {
 		t.Fatalf("last event = %+v, want done", last)
 	}
-	wantUsage := types.TokenUsage{PromptTokens: 13, CompletionTokens: 6, TotalTokens: 19}
+	wantUsage := types.TokenUsage{PromptTokens: 18, CompletionTokens: 9, TotalTokens: 27}
 	if done.Debug == nil || done.Debug.Usage != wantUsage {
-		t.Errorf("done debug = %+v, want the rewrite and generate usage summed to %+v", done.Debug, wantUsage)
+		t.Errorf("done debug = %+v, want the retrieval chat and generate usage summed to %+v", done.Debug, wantUsage)
 	}
 	if conversations.inserts != 1 {
 		t.Fatalf("recorded %d turns, want exactly one", conversations.inserts)
@@ -652,7 +660,7 @@ func TestANoSourcesStreamRecordsTheTurn(t *testing.T) {
 		Results:        []types.RetrievedChunk{},
 		Query:          rewritten,
 		RewrittenQuery: &rewritten,
-		RewriteUsage:   rewriteUsage,
+		ChatUsage:      rewriteUsage,
 		Trace: []types.TraceStep{{
 			Step: types.TraceStepRewriteQuery, Technique: types.RetrievalTechniqueQueryRewrite,
 			RewrittenQuery: rewritten, Usage: &rewriteUsage,

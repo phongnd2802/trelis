@@ -37,10 +37,11 @@ type retrievalService struct {
 	// reranker is nil when models.rerank is not configured, which makes a
 	// request naming rerank unavailable rather than silently skipping it.
 	reranker interfaces.Reranker
-	// rewriter is nil when models.chat is not configured, which makes a
-	// request naming query_rewrite unavailable rather than searching with the
-	// raw follow-up.
-	rewriter interfaces.Generator
+	// chat is nil when models.chat is not configured, which makes a request
+	// naming query_rewrite or query_decomposition unavailable rather than
+	// searching with the raw follow-up or skipping the split. Both stages
+	// share the one role.
+	chat interfaces.Generator
 	// runners maps every candidate Retrieval Technique this build implements
 	// to the function that runs it. It is built once, so no request has to map
 	// names to implementations again. Rerank has no runner: it reorders the
@@ -52,14 +53,14 @@ type retrievalService struct {
 // when no embedding model is configured; dense retrieval then answers a
 // service-unavailable error, while BM25 still runs. reranker may be nil when
 // no rerank model is configured; a request naming rerank then answers a
-// service-unavailable error. rewriter may be nil when no chat model is
-// configured; a request naming query_rewrite then answers a
-// service-unavailable error.
+// service-unavailable error. chat may be nil when no chat model is
+// configured; a request naming query_rewrite or query_decomposition then
+// answers a service-unavailable error.
 func NewRetrievalService(documents interfaces.DocumentRepository, chunks interfaces.ChunkSearcher,
-	embedder interfaces.Embedder, reranker interfaces.Reranker, rewriter interfaces.Generator,
+	embedder interfaces.Embedder, reranker interfaces.Reranker, chat interfaces.Generator,
 ) interfaces.RetrievalService {
 	s := &retrievalService{documents: documents, chunks: chunks, embedder: embedder, reranker: reranker,
-		rewriter: rewriter}
+		chat: chat}
 	s.runners = map[types.RetrievalTechnique]techniqueRunner{
 		types.RetrievalTechniqueDense: s.runDense,
 		types.RetrievalTechniqueBM25:  s.runBM25,
@@ -70,15 +71,19 @@ func NewRetrievalService(documents interfaces.DocumentRepository, chunks interfa
 // Retrieve validates req, resolves the caller's readable Documents and runs
 // every candidate Retrieval Technique req names over them. One technique
 // answers with its own score and rank; several run concurrently and their
-// ranks are fused with Reciprocal Rank Fusion. When the config also names
-// rerank, the candidate pool (fused when there are several) is reordered by
-// the rerank model. When it names parent_child, the ordered pool is replaced
-// by the Parent Chunks its Chunks link to, siblings collapse into the best
-// child's position, and only then is the answer cut to top_k. Reads only, so
-// no transaction is needed: the readable set is resolved on every request,
-// never cached. A Principal who can read nothing still gets the trace of the
-// steps that ran, with empty results, so the answer has the same shape as one
-// that matched nothing.
+// ranks are fused with Reciprocal Rank Fusion. When the config names
+// query_decomposition, the chat role first splits the query into
+// sub-questions and every technique runs for the original and each
+// sub-question, all of their lists fused into one. When the config also names
+// rerank, the candidate pool (fused when there are several lists) is reordered
+// by the rerank model against the original query. When it names parent_child,
+// the ordered pool is replaced by the Parent Chunks its Chunks link to,
+// several matched Chunks of one Parent Chunk collapse into the position of the
+// best-ranked matched Chunk, and only then is the answer cut to top_k. Reads
+// only, so no transaction is needed: the readable set is resolved on every
+// request, never cached. A Principal who can read nothing still gets the trace
+// of the steps that ran, with empty results, so the answer has the same shape
+// as one that matched nothing.
 func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalRequest) (*types.RetrievalResult, error) {
 	principal, err := caller(ctx)
 	if err != nil {
@@ -94,11 +99,16 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 	}
 	candidateTechniques := req.RetrievalConfig.CandidateTechniques()
 	rewriteOn := req.RetrievalConfig.RewritesQuery()
+	decomposeOn := req.RetrievalConfig.DecomposesQuery()
 	rerankOn := req.RetrievalConfig.Reranks()
 	parentChildOn := req.RetrievalConfig.ExpandsParents()
-	if rewriteOn && s.rewriter == nil {
+	if rewriteOn && s.chat == nil {
 		return nil, apperrors.NewServiceUnavailableError(
 			"query rewrite needs models.chat to be configured")
+	}
+	if decomposeOn && s.chat == nil {
+		return nil, apperrors.NewServiceUnavailableError(
+			"query decomposition needs models.chat to be configured")
 	}
 	if rerankOn && s.reranker == nil {
 		return nil, apperrors.NewServiceUnavailableError(
@@ -120,27 +130,43 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 		if err != nil {
 			return nil, err
 		}
-		result.Trace = append(result.Trace, step)
+		recordChatStep(result, step)
 		result.RewrittenQuery = &rewritten
-		if step.Usage != nil {
-			result.RewriteUsage = *step.Usage
-		}
 		query = rewritten
 	}
 	result.Query = query
+
+	// query_decomposition calls the chat role once, after the rewrite so it
+	// splits the query that will actually be searched. It needs no history,
+	// so POST /retrieve measures it too. Fewer than two usable sub-questions
+	// leaves only the original, but the step still records the call.
+	queries := []string{query}
+	decomposeStep := -1
+	if decomposeOn {
+		subQuestions, step, err := s.decomposeQuery(ctx, query)
+		if err != nil {
+			return nil, err
+		}
+		decomposeStep = recordChatStep(result, step)
+		if len(subQuestions) > 1 {
+			queries = append(queries, subQuestions...)
+		}
+	}
 
 	documentIDs, err := s.documents.ListReadableDocumentIDs(ctx, principal.ID)
 	if err != nil {
 		return nil, fmt.Errorf("list readable documents: %w", err)
 	}
-	// One technique fetches exactly top_k, as it always has. Fusion needs a
-	// deeper pool per list so a Chunk that every list places low can still
-	// reach the fused top_k. Parent-child needs the same depth without rerank,
-	// because collapsing siblings can empty as many places as it merges.
-	// Rerank needs a pool of its own size to score before the cut.
+	// One list fetches exactly top_k, as it always has. Fusion needs a deeper
+	// pool per list so a Chunk that every list places low can still reach the
+	// fused top_k; decomposition makes one technique several lists, so the
+	// rule follows the number of lists, not techniques. Parent-child needs the
+	// same depth without rerank, because collapsing several matched Chunks of
+	// one Parent Chunk can empty as many places as it merges. Rerank needs a
+	// pool of its own size to score before the cut.
 	poolSize := *req.TopK
 	depth := *req.TopK
-	if len(candidateTechniques) > 1 {
+	if len(queries)*len(candidateTechniques) > 1 {
 		depth = max(depth, types.RetrievalFusionCandidates)
 	}
 	if parentChildOn && !rerankOn {
@@ -151,22 +177,45 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 		poolSize = *req.RetrievalConfig.RerankCandidates
 		depth = max(depth, poolSize)
 	}
-	runs, err := s.runTechniques(ctx, candidateTechniques, documentIDs, query, depth)
+	runs, err := s.runTechniques(ctx, candidateTechniques, documentIDs, queries, depth)
 	if err != nil {
 		return nil, err
 	}
 
-	lists := make(map[types.RetrievalTechnique][]*types.ChunkMatch, len(runs))
-	for _, run := range runs {
-		// A technique keeps its own steps; request order, not completion
-		// order, so the trace is deterministic.
+	// One list per (query, technique) run, in query index then request order,
+	// so both the trace and the k-th list of one technique are deterministic
+	// even though the runs finish in any order. perQuery keeps each query's
+	// own lists for its evidence; a decomposed run stamps every search step
+	// with the query index it ran for.
+	lists := make([]techniqueList, 0, len(runs))
+	perQuery := make([][]techniqueList, len(queries))
+	for i := range runs {
+		run := &runs[i]
+		if decomposeOn {
+			queryIndex := run.queryIndex
+			for j := range run.steps {
+				run.steps[j].QueryIndex = &queryIndex
+			}
+		}
+		list := techniqueList{technique: run.technique, matches: run.matches}
+		lists = append(lists, list)
+		perQuery[run.queryIndex] = append(perQuery[run.queryIndex], list)
 		result.Trace = append(result.Trace, run.steps...)
-		lists[run.technique] = run.matches
+	}
+	if decomposeStep >= 0 {
+		evidence := make([]types.QueryEvidence, len(queries))
+		for i, queryText := range queries {
+			evidence[i] = types.QueryEvidence{
+				Query:    queryText,
+				ChunkIDs: queryEvidence(perQuery[i], *req.RetrievalConfig.RRFK, *req.TopK),
+			}
+		}
+		result.Trace[decomposeStep].Queries = &evidence
 	}
 
 	var pool []fusedChunk
-	if len(runs) == 1 {
-		pool = singleTechniqueChunks(runs[0].technique, runs[0].matches)
+	if len(lists) == 1 {
+		pool = singleTechniqueChunks(lists[0].technique, lists[0].matches)
 		if rerankOn && len(pool) > poolSize {
 			pool = pool[:poolSize]
 		}
@@ -208,6 +257,42 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 	return result, nil
 }
 
+// recordChatStep appends a first-stage chat step to result and adds its usage
+// to the result's chat total, returning the step's trace index.
+func recordChatStep(result *types.RetrievalResult, step types.TraceStep) int {
+	result.Trace = append(result.Trace, step)
+	if step.Usage != nil {
+		result.ChatUsage = addUsage(result.ChatUsage, *step.Usage)
+	}
+	return len(result.Trace) - 1
+}
+
+// chatCall makes one non-streaming chat call for a first-stage query
+// technique and returns its reply with the step skeleton that records the
+// call: its step and technique, model, duration and usage. A nil reply is
+// not an error; the caller decides what a missing reply means.
+func (s *retrievalService) chatCall(ctx context.Context, step string, technique types.RetrievalTechnique,
+	turns []types.ChatTurn,
+) (*types.ChatResponse, types.TraceStep, error) {
+	model := s.chat.GetModelName()
+	start := time.Now()
+	reply, err := s.chat.Generate(ctx, turns)
+	if err != nil {
+		return nil, types.TraceStep{}, err
+	}
+	traceStep := types.TraceStep{
+		Step:       step,
+		Technique:  technique,
+		DurationMS: time.Since(start).Milliseconds(),
+		Model:      model,
+	}
+	if reply != nil {
+		usage := reply.Usage
+		traceStep.Usage = &usage
+	}
+	return reply, traceStep, nil
+}
+
 // rewriteQuery turns the latest question into one standalone query with the
 // chat role, using history oldest first, and returns the query to search with
 // and the trace step that records the call. The reply is trimmed; a blank or
@@ -218,9 +303,8 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 func (s *retrievalService) rewriteQuery(ctx context.Context, query string,
 	history []types.ConversationTurn,
 ) (string, types.TraceStep, error) {
-	model := s.rewriter.GetModelName()
-	start := time.Now()
-	reply, err := s.rewriter.Generate(ctx, rewriteTurns(history, query))
+	reply, step, err := s.chatCall(ctx, types.TraceStepRewriteQuery,
+		types.RetrievalTechniqueQueryRewrite, rewriteTurns(history, query))
 	if err != nil {
 		return "", types.TraceStep{}, fmt.Errorf("rewrite query: %w", err)
 	}
@@ -231,51 +315,74 @@ func (s *retrievalService) rewriteQuery(ctx context.Context, query string,
 			rewritten = trimmed
 		}
 	}
-	step := types.TraceStep{
-		Step:           types.TraceStepRewriteQuery,
-		Technique:      types.RetrievalTechniqueQueryRewrite,
-		DurationMS:     time.Since(start).Milliseconds(),
-		Model:          model,
-		RewrittenQuery: rewritten,
-	}
-	if reply != nil {
-		usage := reply.Usage
-		step.Usage = &usage
-	}
+	step.RewrittenQuery = rewritten
 	return rewritten, step, nil
 }
 
-// techniqueRun is one technique's matches and trace steps, kept in request
-// order so the trace is deterministic even though the techniques run
-// concurrently.
-type techniqueRun struct {
-	technique types.RetrievalTechnique
-	matches   []*types.ChunkMatch
-	steps     []types.TraceStep
+// decomposeQuery splits query into sub-questions with the chat role and
+// returns the usable ones with the trace step that records the call. It never
+// returns the original among them: the caller searches the original itself.
+// A nil reply or a reply with no usable entry leaves the list empty, so only
+// the original runs while the step still records the call; a provider
+// failure keeps its own error, mapped like the other model calls.
+func (s *retrievalService) decomposeQuery(ctx context.Context, query string) ([]string, types.TraceStep, error) {
+	reply, step, err := s.chatCall(ctx, types.TraceStepDecomposeQuery,
+		types.RetrievalTechniqueQueryDecomposition, decomposeTurns(query))
+	if err != nil {
+		return nil, types.TraceStep{}, fmt.Errorf("decompose query: %w", err)
+	}
+	var subQuestions []string
+	if reply != nil {
+		subQuestions = parseSubQuestions(reply.Content, query)
+	}
+	return subQuestions, step, nil
 }
 
-// runTechniques runs every technique concurrently over the same readable set
-// and the same candidate depth. Any technique's error fails the request.
+// techniqueRun is one (query, technique) run's matches and trace steps. The
+// returned runs are in query index then request order, so the trace is
+// deterministic even though the runs finish in any order.
+type techniqueRun struct {
+	queryIndex int
+	technique  types.RetrievalTechnique
+	matches    []*types.ChunkMatch
+	steps      []types.TraceStep
+}
+
+// runTechniques runs every (query, technique) pair concurrently over the same
+// readable set and the same candidate depth. The answer is ordered by query
+// index, then the technique's request order. Any run's error fails the
+// request; the caller stamps the query index on a decomposed run's steps.
 func (s *retrievalService) runTechniques(ctx context.Context, techniques []types.RetrievalTechnique,
-	documentIDs []uuid.UUID, query string, depth int,
+	documentIDs []uuid.UUID, queries []string, depth int,
 ) ([]techniqueRun, error) {
-	runs := make([]techniqueRun, len(techniques))
-	runners := make([]techniqueRunner, len(techniques))
 	// Resolve every runner before starting a goroutine, so an unknown
 	// technique fails without leaving goroutines writing to a slice nobody
 	// waits for.
-	for i, technique := range techniques {
+	runners := make(map[types.RetrievalTechnique]techniqueRunner, len(techniques))
+	for _, technique := range techniques {
 		run, ok := s.runners[technique]
 		if !ok {
 			return nil, fmt.Errorf("no runner for retrieval technique %q", technique)
 		}
-		runs[i].technique = technique
-		runners[i] = run
+		runners[technique] = run
+	}
+	type job struct {
+		queryIndex int
+		technique  types.RetrievalTechnique
+		runner     techniqueRunner
+	}
+	jobs := make([]job, 0, len(queries)*len(techniques))
+	runs := make([]techniqueRun, 0, len(queries)*len(techniques))
+	for queryIndex := range queries {
+		for _, technique := range techniques {
+			jobs = append(jobs, job{queryIndex: queryIndex, technique: technique, runner: runners[technique]})
+			runs = append(runs, techniqueRun{queryIndex: queryIndex, technique: technique})
+		}
 	}
 	group, groupCtx := errgroup.WithContext(ctx)
-	for i := range techniques {
+	for i := range jobs {
 		group.Go(func() error {
-			matches, steps, err := runners[i](groupCtx, documentIDs, query, depth)
+			matches, steps, err := jobs[i].runner(groupCtx, documentIDs, queries[jobs[i].queryIndex], depth)
 			if err != nil {
 				return err
 			}
@@ -574,22 +681,26 @@ func (s *retrievalService) rerank(ctx context.Context, query string,
 	return pool, step, nil
 }
 
-// fuseRRF combines technique lists with Reciprocal Rank Fusion: a Chunk's
-// score is the sum over the lists that carry it of 1/(k+rank), with 1-based
-// ranks, so a Chunk missing from a list gets nothing from it. It returns the
-// fused list cut to topK and the number of distinct Chunks fused before the
-// cut. The order is fused score descending, then Chunk ID ascending, so equal
-// scores keep a deterministic order.
-func fuseRRF(lists map[types.RetrievalTechnique][]*types.ChunkMatch, k, topK int) ([]fusedChunk, int) {
-	techniques := make([]types.RetrievalTechnique, 0, len(lists))
-	for technique := range lists {
-		techniques = append(techniques, technique)
-	}
-	slices.Sort(techniques)
+// techniqueList is one ranked list of matches and the technique that produced
+// it. One technique can have several lists when query decomposition searched
+// with several queries.
+type techniqueList struct {
+	technique types.RetrievalTechnique
+	matches   []*types.ChunkMatch
+}
 
+// fuseRRF combines ranked lists with Reciprocal Rank Fusion: a Chunk's score
+// is the sum over every list that carries it of 1/(k+rank), with 1-based
+// ranks, so a Chunk missing from a list gets nothing from it. One technique's
+// score and rank are the best (lowest) rank it gave the Chunk in any list,
+// with that list's score. It returns the fused list cut to topK and the
+// number of distinct Chunks fused before the cut. The order is fused score
+// descending, then Chunk ID ascending, so equal scores keep a deterministic
+// order.
+func fuseRRF(lists []techniqueList, k, topK int) ([]fusedChunk, int) {
 	byChunk := make(map[uuid.UUID]*fusedChunk)
-	for _, technique := range techniques {
-		for i, match := range lists[technique] {
+	for _, list := range lists {
+		for i, match := range list.matches {
 			entry, ok := byChunk[match.Chunk.ID]
 			if !ok {
 				entry = &fusedChunk{
@@ -600,9 +711,12 @@ func fuseRRF(lists map[types.RetrievalTechnique][]*types.ChunkMatch, k, topK int
 				}
 				byChunk[match.Chunk.ID] = entry
 			}
-			entry.scores[technique] = match.Score
-			entry.ranks[technique] = i + 1
-			entry.score += 1 / float64(k+i+1)
+			rank := i + 1
+			if best, ok := entry.ranks[list.technique]; !ok || rank < best {
+				entry.scores[list.technique] = match.Score
+				entry.ranks[list.technique] = rank
+			}
+			entry.score += 1 / float64(k+rank)
 		}
 	}
 
@@ -621,4 +735,28 @@ func fuseRRF(lists map[types.RetrievalTechnique][]*types.ChunkMatch, k, topK int
 		out = out[:topK]
 	}
 	return out, distinct
+}
+
+// queryEvidence returns the IDs of the Chunks one query found on its own: its
+// technique lists fused with Reciprocal Rank Fusion when it ran more than one,
+// otherwise its single list, cut to topK. It is taken before the global
+// fusion, rerank and parent expansion, so a decomposed trace can show what
+// each sub-question contributed.
+func queryEvidence(lists []techniqueList, k, topK int) []uuid.UUID {
+	if len(lists) == 1 {
+		ids := make([]uuid.UUID, 0, min(len(lists[0].matches), topK))
+		for _, match := range lists[0].matches {
+			if len(ids) == topK {
+				break
+			}
+			ids = append(ids, match.Chunk.ID)
+		}
+		return ids
+	}
+	fused, _ := fuseRRF(lists, k, topK)
+	ids := make([]uuid.UUID, 0, len(fused))
+	for _, entry := range fused {
+		ids = append(ids, entry.chunk.ID)
+	}
+	return ids
 }

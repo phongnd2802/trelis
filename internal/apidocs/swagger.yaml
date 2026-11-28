@@ -136,8 +136,9 @@ definitions:
       usage:
         allOf:
         - $ref: '#/definitions/types.TokenUsage'
-        description: Usage is the chat call's token accounting; zeros when no call
-          was made.
+        description: |-
+          Usage is the token accounting of every chat call the answer made,
+          retrieval's rewrite or decomposition included; zeros when none was made.
     type: object
   types.AnswerRequest:
     properties:
@@ -152,7 +153,7 @@ definitions:
       debug:
         description: |-
           Debug asks the answer to carry the retrieved Chunks, the trace and the
-          chat call's token usage; false leaves the debug object out entirely.
+          token usage of every chat call; false leaves the debug object out entirely.
         type: boolean
       query:
         description: Query is the question to find Chunks for.
@@ -351,6 +352,21 @@ definitions:
       name:
         type: string
     type: object
+  types.QueryEvidence:
+    properties:
+      chunk_ids:
+        description: |-
+          ChunkIDs is the matched Chunks that query found: its technique lists
+          fused with Reciprocal Rank Fusion when it ran more than one, otherwise
+          its single list, cut to top_k and before global fusion, rerank and
+          parent expansion. It is never null.
+        items:
+          type: string
+        type: array
+      query:
+        description: Query is the text the candidate techniques searched for.
+        type: string
+    type: object
   types.RetrievalConfig:
     properties:
       rerank_candidates:
@@ -371,9 +387,11 @@ definitions:
           duplicates. More than one candidate technique makes the request a
           fusion: each runs over the readable Documents and their lists are
           combined with Reciprocal Rank Fusion. query_rewrite rewrites the
-          question first when the request carries Conversation History; rerank
-          reorders whatever the candidate techniques found; parent_child then
-          replaces the ordered Chunks with their Parent Chunks.
+          question first when the request carries Conversation History;
+          query_decomposition splits it into sub-questions that every candidate
+          technique searches for alongside the original; rerank reorders whatever
+          the candidate techniques found; parent_child then replaces the ordered
+          Chunks with their Parent Chunks.
         items:
           $ref: '#/definitions/types.RetrievalTechnique'
         type: array
@@ -412,6 +430,7 @@ definitions:
     - dense
     - bm25
     - query_rewrite
+    - query_decomposition
     - rerank
     - parent_child
     - rrf
@@ -420,6 +439,7 @@ definitions:
     - RetrievalTechniqueDense
     - RetrievalTechniqueBM25
     - RetrievalTechniqueQueryRewrite
+    - RetrievalTechniqueQueryDecomposition
     - RetrievalTechniqueRerank
     - RetrievalTechniqueParentChild
     - RetrievalTechniqueRRF
@@ -496,6 +516,21 @@ definitions:
           Model is the embedding, rerank or chat model, on the step that called
           one.
         type: string
+      queries:
+        description: |-
+          Queries is the queries a decompose_query run searched with, one entry
+          per query index: entry 0 is the original question, then one entry per
+          Sub-question. It is a pointer so the step always answers queries while
+          every other step leaves the field out.
+        items:
+          $ref: '#/definitions/types.QueryEvidence'
+        type: array
+      query_index:
+        description: |-
+          QueryIndex is the index into the decompose step's queries an
+          embed_query or search step ran for; it is set only when the config
+          names query_decomposition.
+        type: integer
       rewritten_query:
         description: |-
           RewrittenQuery is the query the techniques searched with, on the
@@ -514,8 +549,9 @@ definitions:
       usage:
         allOf:
         - $ref: '#/definitions/types.TokenUsage'
-        description: Usage is the chat call's token accounting on the rewrite_query
-          step.
+        description: |-
+          Usage is the chat call's token accounting on the rewrite_query or
+          decompose_query step.
     type: object
 info:
   contact: {}
@@ -538,12 +574,14 @@ paths:
         is a fixed sentence in the question''s language and no chat call is made.
         debug adds the retrieved Chunks (exactly as POST /retrieve answers them),
         the trace with a final generate step, and the token usage of every model call,
-        including a query rewrite. With conversation_id, the Conversation''s last
-        five turns are carried into retrieval and this question and the cleaned answer
-        are recorded as its next turn; naming query_rewrite then rewrites a follow-up
-        into one standalone query before any technique searches, and the raw question
-        is still what the no-source answer and the recorded turn keep. The Conversation
-        must belong to the caller: an unknown or foreign id is 404 before any retrieval
+        including a query rewrite or decomposition. With conversation_id, the Conversation''s
+        last five turns are carried into retrieval and this question and the cleaned
+        answer are recorded as its next turn; naming query_rewrite then rewrites a
+        follow-up into one standalone query before any technique searches, and the
+        raw question is still what the no-source answer and the recorded turn keep.
+        Naming query_decomposition splits the question into sub-questions before any
+        technique searches, with or without a conversation_id. The Conversation must
+        belong to the caller: an unknown or foreign id is 404 before any retrieval
         or model call. Without conversation_id the answer has no history and records
         nothing. With Accept: text/event-stream the answer streams Answer Events as
         Server-Sent Events instead: id is the per-answer seq and event is started
@@ -555,11 +593,11 @@ paths:
         with Last-Event-ID. Malformed JSON, unknown fields, invalid values and the
         retrieval rules are 400; a body over 64 KiB is 413; without models.chat the
         route answers 503 before any retrieval, and retrieval''s own 503 (models.embedding
-        for dense, models.rerank for rerank, models.chat for query rewrite) passes
-        through; a model provider''s rejection of a retrieval or opening the chat
-        stream (its credentials, credit, permission or rate limit) is 502 and names
-        the model role in its message, and any other model failure is a generic 500.
-        Every one of these failures answers the JSON error before the SSE headers.'
+        for dense, models.rerank for rerank, models.chat for query rewrite or decomposition)
+        passes through; a model provider''s rejection of a retrieval or opening the
+        chat stream (its credentials, credit, permission or rate limit) is 502 and
+        names the model role in its message, and any other model failure is a generic
+        500. Every one of these failures answers the JSON error before the SSE headers.'
       parameters:
       - description: The query, how many Chunks to retrieve, which Retrieval Techniques
           to run, the Conversation to continue and whether to return the debug object
@@ -618,7 +656,7 @@ paths:
         "503":
           description: models.chat is not configured, or retrieval is unavailable
             (models.embedding for dense, models.rerank for rerank, models.chat for
-            query rewrite)
+            query rewrite or decomposition)
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
       security:
@@ -1259,22 +1297,30 @@ paths:
         into one standalone query and every technique, and rerank, searches with it;
         the trace then starts with rewrite_query carrying rewritten_query and the
         call''s usage. Without history no model call is made, so POST /retrieve accepts
-        query_rewrite and never calls a model. query_rewrite cannot run alone. Every
-        result carries the score and 1-based rank of each technique whose list carried
-        it, plus the rerank score and rank when it ran. A bm25 request needs no embedding
-        model. A caller who can read nothing gets 200 with an empty results list.
-        Malformed JSON, unknown fields, invalid values, an unknown or duplicate technique,
-        a config whose only techniques are stages (query_rewrite, rerank, parent_child),
-        an out-of-range rrf_k or rerank_candidates are 400; a body over 64 KiB is
-        413; without models.embedding, a dense request is 503, without models.rerank
-        a request naming rerank is 503, and without models.chat a request naming query_rewrite
+        query_rewrite and never calls a model. query_rewrite cannot run alone. Naming
+        query_decomposition adds a first stage that needs no history: the chat role
+        splits the query into 2 to 4 self-contained sub-questions and every candidate
+        technique runs for the original and each sub-question, all of their lists
+        fused with one Reciprocal Rank Fusion; the trace''s decompose_query step carries
+        queries with each query''s own chunk_ids and every embed_query and search
+        step carries query_index, rerank still scores against the original query,
+        and fewer than 2 usable sub-questions runs only the original. query_decomposition
+        cannot run alone. Every result carries the score and 1-based rank of each
+        technique whose list carried it, plus the rerank score and rank when it ran.
+        A bm25 request needs no embedding model. A caller who can read nothing gets
+        200 with an empty results list. Malformed JSON, unknown fields, invalid values,
+        an unknown or duplicate technique, a config whose only techniques are stages
+        (query_rewrite, query_decomposition, rerank, parent_child), an out-of-range
+        rrf_k or rerank_candidates are 400; a body over 64 KiB is 413; without models.embedding,
+        a dense request is 503, without models.rerank a request naming rerank is 503,
+        and without models.chat a request naming query_rewrite or query_decomposition
         is 503. A model provider''s rejection of the call (its credentials, credit,
         permission or rate limit) is 502 and names the model role in its message;
         any other model failure is a generic 500.'
       parameters:
       - description: The query, how many Chunks to return, which Retrieval Techniques
-          to run (dense, bm25, query_rewrite, rerank, parent_child), the RRF constant
-          and the rerank candidate pool
+          to run (dense, bm25, query_rewrite, query_decomposition, rerank, parent_child),
+          the RRF constant and the rerank candidate pool
         in: body
         name: request
         required: true
@@ -1296,8 +1342,9 @@ paths:
           description: Body that is not one JSON object, an unknown field or wrong
             value type, a blank or too-long query, an out-of-range top_k or an invalid
             retrieval_config (an unknown or duplicate technique, only stage techniques
-            such as query_rewrite, rerank or parent_child, an rrf_k outside 1..1000,
-            or a rerank_candidates outside 1..100 or below top_k)
+            such as query_rewrite, query_decomposition, rerank or parent_child, an
+            rrf_k outside 1..1000, or a rerank_candidates outside 1..100 or below
+            top_k)
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
         "401":
@@ -1322,7 +1369,7 @@ paths:
         "503":
           description: models.embedding is not configured so dense cannot run, models.rerank
             is not configured so rerank cannot run, or models.chat is not configured
-            so query_rewrite cannot run (bm25 alone still works)
+            so query_rewrite or query_decomposition cannot run (bm25 alone still works)
           schema:
             $ref: '#/definitions/handler.ErrorResponse'
       security:

@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -37,16 +38,22 @@ func (f *fakeReadableDocuments) ListReadableDocumentIDs(_ context.Context, princ
 }
 
 // fakeChunkSearch records each technique's search arguments and answers
-// fixed matches. The two techniques run concurrently, so each records into
-// its own fields instead of sharing them.
+// fixed matches. The techniques and the decomposed queries run concurrently,
+// so every record is guarded and each query's matches can be pinned
+// separately.
 type fakeChunkSearch struct {
 	interfaces.ChunkSearcher
+	mu sync.Mutex
+
 	denseMatches []*types.ChunkMatch
 	bm25Matches  []*types.ChunkMatch
-	denseErr     error
-	bm25Err      error
-	denseCalls   int
-	bm25Calls    int
+	// bm25MatchesByQuery answers the matches pinned to one query; a query
+	// with no entry gets bm25Matches.
+	bm25MatchesByQuery map[string][]*types.ChunkMatch
+	denseErr           error
+	bm25Err            error
+	denseCalls         int
+	bm25Calls          int
 
 	denseDocumentIDs []uuid.UUID
 	denseVector      []float32
@@ -55,7 +62,9 @@ type fakeChunkSearch struct {
 
 	bm25DocumentIDs []uuid.UUID
 	bm25Query       string
+	bm25Queries     []string
 	bm25TopK        int
+	bm25TopKs       []int
 
 	parentChunks      []*types.ParentChunk
 	parentErr         error
@@ -65,6 +74,8 @@ type fakeChunkSearch struct {
 }
 
 func (f *fakeChunkSearch) SearchDense(_ context.Context, documentIDs []uuid.UUID, queryVector []float32, model string, topK int) ([]*types.ChunkMatch, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.denseCalls++
 	f.denseDocumentIDs = append([]uuid.UUID(nil), documentIDs...)
 	f.denseVector = append([]float32(nil), queryVector...)
@@ -73,13 +84,23 @@ func (f *fakeChunkSearch) SearchDense(_ context.Context, documentIDs []uuid.UUID
 }
 
 func (f *fakeChunkSearch) SearchBM25(_ context.Context, documentIDs []uuid.UUID, query string, topK int) ([]*types.ChunkMatch, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.bm25Calls++
 	f.bm25DocumentIDs = append([]uuid.UUID(nil), documentIDs...)
 	f.bm25Query, f.bm25TopK = query, topK
-	return f.bm25Matches, f.bm25Err
+	f.bm25Queries = append(f.bm25Queries, query)
+	f.bm25TopKs = append(f.bm25TopKs, topK)
+	matches, ok := f.bm25MatchesByQuery[query]
+	if !ok {
+		matches = f.bm25Matches
+	}
+	return matches, f.bm25Err
 }
 
 func (f *fakeChunkSearch) ListParentChunks(_ context.Context, documentIDs, parentIDs []uuid.UUID) ([]*types.ParentChunk, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.parentCalls++
 	f.parentDocumentIDs = append([]uuid.UUID(nil), documentIDs...)
 	f.parentIDs = append([]uuid.UUID(nil), parentIDs...)
@@ -87,22 +108,39 @@ func (f *fakeChunkSearch) ListParentChunks(_ context.Context, documentIDs, paren
 }
 
 // fakeEmbedder answers one vector per text and records what it was asked to
-// embed.
+// embed, every call in order.
 type fakeEmbedder struct {
 	vectors [][]float32
 	err     error
 	model   string
+	mu      sync.Mutex
 	calls   int
 	got     []string
+	inputs  [][]string
 }
 
 func (f *fakeEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls++
 	f.got = append([]string(nil), texts...)
+	f.inputs = append(f.inputs, append([]string(nil), texts...))
 	return f.vectors, f.err
 }
 
 func (f *fakeEmbedder) GetModelName() string { return f.model }
+
+// embeddedTexts returns every text the embedder was asked for, flattened
+// across calls, so a concurrent decomposed run can be compared as a set.
+func (f *fakeEmbedder) embeddedTexts() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var texts []string
+	for _, input := range f.inputs {
+		texts = append(texts, input...)
+	}
+	return texts
+}
 
 // fakeReranker answers fixed scores in the texts' order and records what it
 // was asked to score. It runs once, after the candidate techniques, so its
@@ -464,15 +502,15 @@ func TestFuseRRFCombinesRanks(t *testing.T) {
 	chunkA := &types.Chunk{ID: uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")}
 	chunkB := &types.Chunk{ID: uuid.MustParse("0190d2a8-0000-7000-8000-000000000002")}
 	chunkC := &types.Chunk{ID: uuid.MustParse("0190d2a8-0000-7000-8000-000000000003")}
-	lists := map[types.RetrievalTechnique][]*types.ChunkMatch{
-		types.RetrievalTechniqueBM25: {
+	lists := []techniqueList{
+		{technique: types.RetrievalTechniqueBM25, matches: []*types.ChunkMatch{
 			{Chunk: chunkA, Score: 5},
 			{Chunk: chunkB, Score: 3},
-		},
-		types.RetrievalTechniqueDense: {
+		}},
+		{technique: types.RetrievalTechniqueDense, matches: []*types.ChunkMatch{
 			{Chunk: chunkB, Score: 0.9},
 			{Chunk: chunkC, Score: 0.8},
-		},
+		}},
 	}
 	for _, tc := range []struct {
 		name string
@@ -538,9 +576,9 @@ func TestFuseRRFOrdersTiesByChunkID(t *testing.T) {
 	// must still order by Chunk ID.
 	chunkA := &types.Chunk{ID: uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")}
 	chunkB := &types.Chunk{ID: uuid.MustParse("0190d2a8-0000-7000-8000-000000000002")}
-	got, _ := fuseRRF(map[types.RetrievalTechnique][]*types.ChunkMatch{
-		types.RetrievalTechniqueBM25:  {{Chunk: chunkB, Score: 4}},
-		types.RetrievalTechniqueDense: {{Chunk: chunkA, Score: 0.9}},
+	got, _ := fuseRRF([]techniqueList{
+		{technique: types.RetrievalTechniqueBM25, matches: []*types.ChunkMatch{{Chunk: chunkB, Score: 4}}},
+		{technique: types.RetrievalTechniqueDense, matches: []*types.ChunkMatch{{Chunk: chunkA, Score: 0.9}}},
 	}, 60, 10)
 	if len(got) != 2 || got[0].chunk.ID != chunkA.ID || got[1].chunk.ID != chunkB.ID {
 		t.Fatalf("fused order = %+v, want the smaller Chunk ID first on a score tie", got)
@@ -553,12 +591,12 @@ func TestFuseRRFCutsToTopK(t *testing.T) {
 		{ID: uuid.MustParse("0190d2a8-0000-7000-8000-000000000002")},
 		{ID: uuid.MustParse("0190d2a8-0000-7000-8000-000000000003")},
 	}
-	got, distinct := fuseRRF(map[types.RetrievalTechnique][]*types.ChunkMatch{
-		types.RetrievalTechniqueBM25: {
+	got, distinct := fuseRRF([]techniqueList{
+		{technique: types.RetrievalTechniqueBM25, matches: []*types.ChunkMatch{
 			{Chunk: chunks[0], Score: 4},
 			{Chunk: chunks[1], Score: 3},
 			{Chunk: chunks[2], Score: 2},
-		},
+		}},
 	}, 60, 2)
 	if distinct != 3 {
 		t.Errorf("distinct = %d, want the 3 Chunks fused before the cut", distinct)
@@ -568,6 +606,48 @@ func TestFuseRRFCutsToTopK(t *testing.T) {
 	}
 	if got[0].chunk.ID != chunks[0].ID || got[1].chunk.ID != chunks[1].ID {
 		t.Errorf("fused order = %s, %s; want the two highest-ranked", got[0].chunk.ID, got[1].chunk.ID)
+	}
+}
+
+func TestFuseRRFSumsOneTechniqueAcrossListsAndKeepsItsBestRank(t *testing.T) {
+	chunkA := &types.Chunk{ID: uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")}
+	chunkB := &types.Chunk{ID: uuid.MustParse("0190d2a8-0000-7000-8000-000000000002")}
+	// One technique with two lists, as a decomposed run produces. A leads
+	// the first list and B the second, so both sum rank 1 and rank 2: equal
+	// fused scores, ordered by Chunk ID.
+	got, distinct := fuseRRF([]techniqueList{
+		{technique: types.RetrievalTechniqueBM25, matches: []*types.ChunkMatch{
+			{Chunk: chunkA, Score: 5},
+			{Chunk: chunkB, Score: 3},
+		}},
+		{technique: types.RetrievalTechniqueBM25, matches: []*types.ChunkMatch{
+			{Chunk: chunkB, Score: 8},
+			{Chunk: chunkA, Score: 2},
+		}},
+	}, 60, 10)
+	if distinct != 2 || len(got) != 2 {
+		t.Fatalf("fused %d entries (%d distinct), want both Chunks", len(got), distinct)
+	}
+	if got[0].chunk.ID != chunkA.ID || got[1].chunk.ID != chunkB.ID {
+		t.Errorf("fused order = %s, %s; want the smaller Chunk ID first on an equal score",
+			got[0].chunk.ID, got[1].chunk.ID)
+	}
+	wantScore := 1.0/61 + 1.0/62
+	for _, entry := range got {
+		if diff := math.Abs(entry.score - wantScore); diff > 1e-12 {
+			t.Errorf("%s score = %v, want both lists' contributions summed to %v", entry.chunk.ID, entry.score, wantScore)
+		}
+		if entry.ranks[types.RetrievalTechniqueBM25] != 1 {
+			t.Errorf("%s bm25 rank = %d, want the best rank 1 across the lists",
+				entry.chunk.ID, entry.ranks[types.RetrievalTechniqueBM25])
+		}
+	}
+	// Each keeps the score of the list that gave it its best rank.
+	if got[0].scores[types.RetrievalTechniqueBM25] != 5 {
+		t.Errorf("A bm25 score = %v, want 5 from its best-ranked list", got[0].scores[types.RetrievalTechniqueBM25])
+	}
+	if got[1].scores[types.RetrievalTechniqueBM25] != 8 {
+		t.Errorf("B bm25 score = %v, want 8 from its best-ranked list", got[1].scores[types.RetrievalTechniqueBM25])
 	}
 }
 
@@ -1537,8 +1617,8 @@ func TestRetrieveRewritesAFollowUpBeforeSearchingWithIt(t *testing.T) {
 	if got.RewrittenQuery == nil || *got.RewrittenQuery != "Thuế TNCN năm 2024" {
 		t.Errorf("result rewritten query = %v, want the trimmed rewritten query", got.RewrittenQuery)
 	}
-	if got.RewriteUsage != usage {
-		t.Errorf("result rewrite usage = %+v, want %+v", got.RewriteUsage, usage)
+	if got.ChatUsage != usage {
+		t.Errorf("result rewrite usage = %+v, want %+v", got.ChatUsage, usage)
 	}
 	if len(got.Trace) != 2 {
 		t.Fatalf("trace = %+v, want the rewrite step then the bm25 search step", got.Trace)
@@ -1625,8 +1705,8 @@ func TestRetrieveWithoutQueryRewriteSearchesTheRawQuestion(t *testing.T) {
 	if got.Query != "và năm 2024 thì sao?" {
 		t.Errorf("result query = %q, want the raw question", got.Query)
 	}
-	if got.RewrittenQuery != nil || got.RewriteUsage != (types.TokenUsage{}) {
-		t.Errorf("result rewrite = %v, %+v; want none without query_rewrite", got.RewrittenQuery, got.RewriteUsage)
+	if got.RewrittenQuery != nil || got.ChatUsage != (types.TokenUsage{}) {
+		t.Errorf("result rewrite = %v, %+v; want none without query_rewrite", got.RewrittenQuery, got.ChatUsage)
 	}
 	if len(got.Trace) != 1 || got.Trace[0].Step != types.TraceStepSearch {
 		t.Errorf("trace = %+v, want only the search step", got.Trace)
@@ -1647,8 +1727,8 @@ func TestRetrieveWithoutHistoryMakesNoRewriteCall(t *testing.T) {
 	if got.Query != "Thuế TNCN là gì?" {
 		t.Errorf("result query = %q, want the raw question", got.Query)
 	}
-	if got.RewrittenQuery != nil || got.RewriteUsage != (types.TokenUsage{}) {
-		t.Errorf("result rewrite = %v, %+v; want none without history", got.RewrittenQuery, got.RewriteUsage)
+	if got.RewrittenQuery != nil || got.ChatUsage != (types.TokenUsage{}) {
+		t.Errorf("result rewrite = %v, %+v; want none without history", got.RewrittenQuery, got.ChatUsage)
 	}
 	if len(got.Trace) != 1 || got.Trace[0].Step != types.TraceStepSearch {
 		t.Errorf("trace = %+v, want only the search step, no rewrite_query step", got.Trace)
@@ -1695,8 +1775,8 @@ func TestRetrieveFallsBackToTheRawQuestionForABlankRewrite(t *testing.T) {
 	if got.RewrittenQuery == nil || *got.RewrittenQuery != "và năm 2024 thì sao?" {
 		t.Errorf("result rewritten query = %v, want the raw question after a blank reply", got.RewrittenQuery)
 	}
-	if got.RewriteUsage != usage {
-		t.Errorf("result rewrite usage = %+v, want the call's usage %+v even when it fell back", got.RewriteUsage, usage)
+	if got.ChatUsage != usage {
+		t.Errorf("result rewrite usage = %+v, want the call's usage %+v even when it fell back", got.ChatUsage, usage)
 	}
 	step := got.Trace[0]
 	if step.RewrittenQuery != "và năm 2024 thì sao?" {
@@ -1769,5 +1849,494 @@ func TestRetrieveKeepsAProviderRejectionOfARewrite(t *testing.T) {
 	}
 	if docs.calls != 0 {
 		t.Errorf("readable Documents asked %d times after a failed rewrite, want none", docs.calls)
+	}
+}
+
+func TestParseSubQuestionsKeepsTheUsableEntries(t *testing.T) {
+	long := strings.Repeat("a", types.RetrievalQueryMaxRunes+1)
+	for name, tc := range map[string]struct {
+		reply string
+		query string
+		want  []string
+	}{
+		"json array": {
+			reply: `["Who wrote the plan?", "When was it approved?"]`,
+			query: "Who wrote the plan and when was it approved?",
+			want:  []string{"Who wrote the plan?", "When was it approved?"},
+		},
+		"fenced json array": {
+			reply: "```json\n[\"Who wrote the plan?\", \"When was it approved?\"]\n```",
+			query: "Who wrote the plan and when was it approved?",
+			want:  []string{"Who wrote the plan?", "When was it approved?"},
+		},
+		"numbered lines": {
+			reply: "1. Who wrote the plan?\n2) When was it approved?",
+			query: "Who wrote the plan and when was it approved?",
+			want:  []string{"Who wrote the plan?", "When was it approved?"},
+		},
+		"bulleted lines": {
+			reply: "- Who wrote the plan?\n* When was it approved?",
+			query: "Who wrote the plan and when was it approved?",
+			want:  []string{"Who wrote the plan?", "When was it approved?"},
+		},
+		"blank, over-long and duplicate entries dropped": {
+			reply: `["  Who wrote the plan?  ", "", "` + long + `", "who WROTE the plan?", "When was it approved?", "When was it approved?"]`,
+			query: "Who wrote the plan and when was it approved?",
+			want:  []string{"Who wrote the plan?", "When was it approved?"},
+		},
+		"entry equal to the original dropped": {
+			reply: `["  who won?  ", "Who came second?"]`,
+			query: "who won?",
+			want:  []string{"Who came second?"},
+		},
+		"capped at four": {
+			reply: `["One?", "Two?", "Three?", "Four?", "Five?"]`,
+			query: "original",
+			want:  []string{"One?", "Two?", "Three?", "Four?"},
+		},
+		"one usable entry stays below two": {
+			reply: `["Only one?", "only ONE?", "  "]`,
+			query: "original",
+			want:  []string{"Only one?"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := parseSubQuestions(tc.reply, tc.query)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("parseSubQuestions(%q) = %q, want %q", tc.reply, got, tc.want)
+			}
+		})
+	}
+
+	// The over-long entry really is over the limit, so the case above tests
+	// the drop rather than a shorter string.
+	if len(long) <= types.RetrievalQueryMaxRunes {
+		t.Fatalf("test setup: %q has %d runes, want over %d", long, len(long), types.RetrievalQueryMaxRunes)
+	}
+}
+
+func TestParseSubQuestionsAnswersNoEntryForAnUnusableReply(t *testing.T) {
+	for name, reply := range map[string]string{
+		"blank":       "   \n\t",
+		"empty array": `[]`,
+	} {
+		if got := parseSubQuestions(reply, "original"); len(got) != 0 {
+			t.Errorf("%s: parseSubQuestions(%q) = %q, want no sub-question", name, reply, got)
+		}
+	}
+}
+
+// decompositionReply is the chat reply a decompose prompt asks for: a JSON
+// array of sub-questions.
+func decompositionReply(t *testing.T, subQuestions ...string) *types.ChatResponse {
+	t.Helper()
+	body, err := json.Marshal(subQuestions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &types.ChatResponse{Content: string(body)}
+}
+
+// decomposeRequest runs the named candidate techniques with
+// query_decomposition switched on.
+func decomposeRequest(query string, techniques ...types.RetrievalTechnique) *types.RetrievalRequest {
+	return &types.RetrievalRequest{
+		Query: query,
+		TopK:  intPointer(5),
+		RetrievalConfig: &types.RetrievalConfig{
+			Techniques: append(slices.Clone(techniques), types.RetrievalTechniqueQueryDecomposition),
+		},
+	}
+}
+
+// chunkMatch is one Chunk a fake technique found, for a per-query list.
+func chunkMatch(chunkID, documentID uuid.UUID, content string, score float64) *types.ChunkMatch {
+	return &types.ChunkMatch{
+		Chunk: &types.Chunk{ID: chunkID, DocumentID: documentID, Content: content},
+		Score: score,
+	}
+}
+
+func TestRetrieveDecomposesTheQueryForEveryTechnique(t *testing.T) {
+	principalID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000a1")
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	chunkOriginal := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+	chunkFirst := uuid.MustParse("0190d2a8-0000-7000-8000-000000000002")
+	chunkSecond := uuid.MustParse("0190d2a8-0000-7000-8000-000000000003")
+	chunkDense := uuid.MustParse("0190d2a8-0000-7000-8000-000000000004")
+
+	const (
+		query  = "Who wrote the plan and when was it approved?"
+		first  = "Who wrote the plan?"
+		second = "When was it approved?"
+	)
+	docs := &fakeReadableDocuments{readable: []uuid.UUID{docID}}
+	chunks := &fakeChunkSearch{
+		denseMatches: []*types.ChunkMatch{chunkMatch(chunkDense, docID, "dense match", 0.9)},
+		bm25MatchesByQuery: map[string][]*types.ChunkMatch{
+			query:  {chunkMatch(chunkOriginal, docID, "original match", 3)},
+			first:  {chunkMatch(chunkFirst, docID, "first match", 2)},
+			second: {chunkMatch(chunkSecond, docID, "second match", 1)},
+		},
+	}
+	embedder := &fakeEmbedder{vectors: [][]float32{{0.1, 0.2}}, model: "test-embedding"}
+	chat := &fakeGenerator{model: "test-chat", reply: decompositionReply(t, first, second)}
+	retrieval := NewRetrievalService(docs, chunks, embedder, nil, chat)
+
+	got, err := retrieval.Retrieve(callerContext(principalID),
+		decomposeRequest(query, types.RetrievalTechniqueDense, types.RetrievalTechniqueBM25))
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+
+	if chat.calls != 1 {
+		t.Fatalf("chat called %d times, want one decomposition", chat.calls)
+	}
+	if len(chat.gotTurns) != 2 || chat.gotTurns[0].Role != types.ChatRoleSystem ||
+		chat.gotTurns[1].Content != query {
+		t.Errorf("decompose turns = %+v, want the system prompt and the original question", chat.gotTurns)
+	}
+
+	// The original and both sub-questions reach the searcher and the
+	// embedder, in any order because the runs are concurrent.
+	wantQueries := []string{query, first, second}
+	bm25Queries := slices.Clone(chunks.bm25Queries)
+	slices.Sort(bm25Queries)
+	slices.Sort(wantQueries)
+	if !slices.Equal(bm25Queries, wantQueries) {
+		t.Errorf("bm25 searched %q, want the original and both sub-questions %q", bm25Queries, wantQueries)
+	}
+	embedded := embedder.embeddedTexts()
+	slices.Sort(embedded)
+	if !slices.Equal(embedded, wantQueries) {
+		t.Errorf("dense embedded %q, want the original and both sub-questions %q", embedded, wantQueries)
+	}
+	if chunks.bm25Calls != 3 || chunks.denseCalls != 3 || embedder.calls != 3 {
+		t.Errorf("bm25/dense/embed calls = %d/%d/%d, want 3 each for three queries",
+			chunks.bm25Calls, chunks.denseCalls, embedder.calls)
+	}
+
+	// The trace starts with the decomposition, then the steps in query index
+	// order and technique request order, then one fuse.
+	wantSteps := []struct {
+		step       string
+		technique  types.RetrievalTechnique
+		queryIndex int
+	}{
+		{types.TraceStepEmbedQuery, types.RetrievalTechniqueDense, 0},
+		{types.TraceStepSearch, types.RetrievalTechniqueDense, 0},
+		{types.TraceStepSearch, types.RetrievalTechniqueBM25, 0},
+		{types.TraceStepEmbedQuery, types.RetrievalTechniqueDense, 1},
+		{types.TraceStepSearch, types.RetrievalTechniqueDense, 1},
+		{types.TraceStepSearch, types.RetrievalTechniqueBM25, 1},
+		{types.TraceStepEmbedQuery, types.RetrievalTechniqueDense, 2},
+		{types.TraceStepSearch, types.RetrievalTechniqueDense, 2},
+		{types.TraceStepSearch, types.RetrievalTechniqueBM25, 2},
+	}
+	if len(got.Trace) != len(wantSteps)+2 {
+		t.Fatalf("trace = %+v, want the decompose step, %d search steps and the fuse", got.Trace, len(wantSteps))
+	}
+	decompose := got.Trace[0]
+	if decompose.Step != types.TraceStepDecomposeQuery ||
+		decompose.Technique != types.RetrievalTechniqueQueryDecomposition ||
+		decompose.Model != "test-chat" || decompose.Queries == nil || decompose.DurationMS < 0 {
+		t.Errorf("trace[0] = %+v, want the decompose_query step naming test-chat with its queries", decompose)
+	}
+	for i, want := range wantSteps {
+		step := got.Trace[i+1]
+		if step.Step != want.step || step.Technique != want.technique ||
+			step.QueryIndex == nil || *step.QueryIndex != want.queryIndex {
+			t.Errorf("trace[%d] = %+v, want %s/%s with query_index %d",
+				i+1, step, want.step, want.technique, want.queryIndex)
+		}
+	}
+	if last := got.Trace[len(got.Trace)-1]; last.Step != types.TraceStepFuse {
+		t.Errorf("trace ends with %+v, want the fuse step", last)
+	}
+	if got.Query != query {
+		t.Errorf("result query = %q, want the original question that generation answers", got.Query)
+	}
+}
+
+func TestRetrieveRecordsEachQueryEvidenceInTheDecomposeStep(t *testing.T) {
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	chunkOne := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+	chunkTwo := uuid.MustParse("0190d2a8-0000-7000-8000-000000000002")
+	chunkThree := uuid.MustParse("0190d2a8-0000-7000-8000-000000000003")
+	chunkFour := uuid.MustParse("0190d2a8-0000-7000-8000-000000000004")
+
+	const (
+		query  = "original question"
+		first  = "first part?"
+		second = "second part?"
+	)
+	chunks := &fakeChunkSearch{bm25MatchesByQuery: map[string][]*types.ChunkMatch{
+		query: {
+			chunkMatch(chunkOne, docID, "one", 3),
+			chunkMatch(chunkTwo, docID, "two", 2),
+			chunkMatch(chunkThree, docID, "three", 1),
+		},
+		first: {chunkMatch(chunkFour, docID, "four", 1)},
+	}}
+	chat := &fakeGenerator{reply: decompositionReply(t, first, second)}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{}, chunks, nil, nil, chat)
+
+	req := decomposeRequest(query, types.RetrievalTechniqueBM25)
+	req.TopK = intPointer(2)
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), req)
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+
+	if got.Trace[0].Queries == nil {
+		t.Fatal("decompose step left queries out, want one entry per query")
+	}
+	want := []types.QueryEvidence{
+		{Query: query, ChunkIDs: []uuid.UUID{chunkOne, chunkTwo}},
+		{Query: first, ChunkIDs: []uuid.UUID{chunkFour}},
+		{Query: second, ChunkIDs: []uuid.UUID{}},
+	}
+	if evidence := *got.Trace[0].Queries; !reflect.DeepEqual(evidence, want) {
+		t.Errorf("queries = %+v, want each query's own matches cut to top_k %+v", evidence, want)
+	}
+
+	// More than one list makes every technique search the fusion depth, even
+	// the one technique this request names.
+	wantDepth := max(*req.TopK, types.RetrievalFusionCandidates)
+	if len(chunks.bm25TopKs) != len(want) {
+		t.Fatalf("bm25 searched %d times, want one per query", len(chunks.bm25TopKs))
+	}
+	for i, depth := range chunks.bm25TopKs {
+		if depth != wantDepth {
+			t.Errorf("bm25 search %d depth = %d, want the fusion depth %d with more than one list",
+				i, depth, wantDepth)
+		}
+	}
+
+	wantCandidates := []int{3, 1, 0}
+	if len(got.Trace) != 1+len(wantCandidates)+1 {
+		t.Fatalf("trace = %+v, want the decompose step, three searches and the fuse", got.Trace)
+	}
+	for i, candidates := range wantCandidates {
+		step := got.Trace[i+1]
+		if step.Step != types.TraceStepSearch || step.Technique != types.RetrievalTechniqueBM25 ||
+			step.QueryIndex == nil || *step.QueryIndex != i || step.Candidates == nil || *step.Candidates != candidates {
+			t.Errorf("trace[%d] = %+v, want the bm25 search for query_index %d with %d candidates",
+				i+1, step, i, candidates)
+		}
+	}
+
+	body, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"chunk_ids":[]`) {
+		t.Errorf("JSON = %s, want the query with no match to carry chunk_ids: []", body)
+	}
+	if !strings.Contains(string(body), `"query_index":0`) {
+		t.Errorf("JSON = %s, want the search steps to carry their query index", body)
+	}
+}
+
+func TestRetrieveSearchesOnlyTheOriginalWhenFewerThanTwoSubQuestionsRemain(t *testing.T) {
+	const query = "original question"
+	chunkID := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	chunks := &fakeChunkSearch{bm25Matches: []*types.ChunkMatch{chunkMatch(chunkID, docID, "only", 1)}}
+	chat := &fakeGenerator{reply: decompositionReply(t, "  Only one?  ", "only ONE?", "")}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{}, chunks, nil, nil, chat)
+
+	req := decomposeRequest(query, types.RetrievalTechniqueBM25)
+	req.TopK = intPointer(2)
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), req)
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+
+	if !slices.Equal(chunks.bm25Queries, []string{query}) {
+		t.Errorf("bm25 searched %q, want only the original", chunks.bm25Queries)
+	}
+	// One list keeps the plain top_k depth, not the fusion depth.
+	if !slices.Equal(chunks.bm25TopKs, []int{*req.TopK}) {
+		t.Errorf("bm25 searched %v deep, want exactly top_k %d with a single list", chunks.bm25TopKs, *req.TopK)
+	}
+	if len(got.Trace) != 2 {
+		t.Fatalf("trace = %+v, want the decompose step then the original's search", got.Trace)
+	}
+	decompose := got.Trace[0]
+	if decompose.Step != types.TraceStepDecomposeQuery || decompose.Queries == nil {
+		t.Fatalf("trace[0] = %+v, want the decompose step even when only the original runs", decompose)
+	}
+	want := []types.QueryEvidence{{Query: query, ChunkIDs: []uuid.UUID{chunkID}}}
+	if evidence := *decompose.Queries; !reflect.DeepEqual(evidence, want) {
+		t.Errorf("queries = %+v, want only the original %+v", evidence, want)
+	}
+	step := got.Trace[1]
+	if step.Step != types.TraceStepSearch || step.QueryIndex == nil || *step.QueryIndex != 0 {
+		t.Errorf("trace[1] = %+v, want the original's search carrying query_index 0", step)
+	}
+	for _, step := range got.Trace {
+		if step.Step == types.TraceStepFuse {
+			t.Errorf("trace has a fuse step %+v with a single list", step)
+		}
+	}
+}
+
+func TestRetrieveWithoutDecompositionMakesNoCallAndLeavesQueryIndexOut(t *testing.T) {
+	chat := &fakeGenerator{reply: decompositionReply(t, "must not be used?")}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{}, &fakeChunkSearch{}, nil, nil, chat)
+
+	req := &types.RetrievalRequest{
+		Query:           "who won?",
+		RetrievalConfig: &types.RetrievalConfig{Techniques: []types.RetrievalTechnique{types.RetrievalTechniqueBM25}},
+	}
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), req)
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+
+	if chat.calls != 0 {
+		t.Errorf("chat called %d times without query_decomposition, want none", chat.calls)
+	}
+	if len(got.Trace) != 1 || got.Trace[0].Step != types.TraceStepSearch || got.Trace[0].QueryIndex != nil {
+		t.Errorf("trace = %+v, want the search step alone without a query_index", got.Trace)
+	}
+	body, err := json.Marshal(got.Trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "query_index") || strings.Contains(string(body), `"queries"`) ||
+		strings.Contains(string(body), "decompose_query") {
+		t.Errorf("JSON = %s, want today's trace unchanged", body)
+	}
+}
+
+func TestRetrieveWithoutAChatModelCannotDecompose(t *testing.T) {
+	docs := &fakeReadableDocuments{err: errors.New("must not be reached")}
+	retrieval := NewRetrievalService(docs, &fakeChunkSearch{}, nil, nil, nil)
+
+	_, err := retrieval.Retrieve(callerContext(uuid.New()),
+		decomposeRequest("who won and when?", types.RetrievalTechniqueBM25))
+	appErr, ok := apperrors.IsAppError(err)
+	if !ok {
+		t.Fatalf("Retrieve = %v, want an AppError", err)
+	}
+	if appErr.Code != apperrors.ErrServiceUnavailable || appErr.HTTPCode != http.StatusServiceUnavailable {
+		t.Errorf("error code/status = %d/%d, want %d/503",
+			appErr.Code, appErr.HTTPCode, apperrors.ErrServiceUnavailable)
+	}
+	if !strings.Contains(appErr.Message, "query decomposition") || !strings.Contains(appErr.Message, "models.chat") {
+		t.Errorf("message %q does not name query decomposition and models.chat", appErr.Message)
+	}
+	if docs.calls != 0 {
+		t.Errorf("readable Documents asked %d times without a chat model, want none", docs.calls)
+	}
+}
+
+func TestRetrieveReranksAgainstTheOriginalQueryNotASubQuestion(t *testing.T) {
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	chunkOriginal := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+	chunkFirst := uuid.MustParse("0190d2a8-0000-7000-8000-000000000002")
+	chunkSecond := uuid.MustParse("0190d2a8-0000-7000-8000-000000000003")
+
+	const (
+		query  = "original question"
+		first  = "first part?"
+		second = "second part?"
+	)
+	chunks := &fakeChunkSearch{bm25MatchesByQuery: map[string][]*types.ChunkMatch{
+		query:  {chunkMatch(chunkOriginal, docID, "original", 3)},
+		first:  {chunkMatch(chunkFirst, docID, "first", 2)},
+		second: {chunkMatch(chunkSecond, docID, "second", 1)},
+	}}
+	reranker := &fakeReranker{scores: []float64{0.1, 0.9, 0.5}, model: "test-rerank"}
+	chat := &fakeGenerator{reply: decompositionReply(t, first, second)}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{}, chunks, nil, reranker, chat)
+
+	got, err := retrieval.Retrieve(callerContext(uuid.New()),
+		decomposeRequest(query, types.RetrievalTechniqueBM25, types.RetrievalTechniqueRerank))
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+
+	if reranker.calls != 1 {
+		t.Fatalf("reranker called %d times, want once", reranker.calls)
+	}
+	if reranker.gotQuery != query {
+		t.Errorf("rerank scored against %q, want the original query", reranker.gotQuery)
+	}
+	if len(reranker.gotTexts) != 3 {
+		t.Errorf("rerank scored %d texts, want one per distinct matched Chunk", len(reranker.gotTexts))
+	}
+	if last := got.Trace[len(got.Trace)-1]; last.Step != types.TraceStepRerank {
+		t.Errorf("trace ends with %+v, want the rerank step", last)
+	}
+	if got.Query != query {
+		t.Errorf("result query = %q, want the original question", got.Query)
+	}
+}
+
+func TestRetrieveDecomposesTheRewrittenQueryAndSumsTheChatUsage(t *testing.T) {
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	chunkID := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+	rewriteUsage := types.TokenUsage{PromptTokens: 10, CompletionTokens: 4, TotalTokens: 14}
+	decomposeUsage := types.TokenUsage{PromptTokens: 20, CompletionTokens: 5, TotalTokens: 25}
+	const (
+		rewritten = "standalone query"
+		first     = "part one?"
+		second    = "part two?"
+	)
+	chat := &fakeGenerator{model: "test-chat", replies: []*types.ChatResponse{
+		{Content: "  " + rewritten + "  ", Usage: rewriteUsage},
+		{Content: `["part one?", "part two?"]`, Usage: decomposeUsage},
+	}}
+	chunks := &fakeChunkSearch{
+		bm25MatchesByQuery: map[string][]*types.ChunkMatch{
+			rewritten: {chunkMatch(chunkID, docID, "rewritten match", 1)},
+		},
+	}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{}, chunks, nil, nil, chat)
+
+	req := rewriteRequest("và năm 2024 thì sao?", oneRewriteHistory())
+	req.RetrievalConfig.Techniques = append(req.RetrievalConfig.Techniques,
+		types.RetrievalTechniqueQueryDecomposition)
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), req)
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+
+	if chat.calls != 2 {
+		t.Fatalf("chat called %d times, want the rewrite then the decomposition", chat.calls)
+	}
+	if len(chat.allTurns) != 2 || len(chat.allTurns[1]) != 2 || chat.allTurns[1][1].Content != rewritten {
+		t.Errorf("decompose turns = %+v, want the rewritten query %q", chat.allTurns, rewritten)
+	}
+	wantQueries := []string{first, rewritten, second}
+	queries := slices.Clone(chunks.bm25Queries)
+	slices.Sort(queries)
+	slices.Sort(wantQueries)
+	if !slices.Equal(queries, wantQueries) {
+		t.Errorf("bm25 searched %q, want the rewritten query and both sub-questions %q", queries, wantQueries)
+	}
+	if len(got.Trace) < 2 || got.Trace[0].Step != types.TraceStepRewriteQuery ||
+		got.Trace[1].Step != types.TraceStepDecomposeQuery {
+		t.Fatalf("trace = %+v, want the rewrite then the decompose step", got.Trace)
+	}
+	if got.Trace[0].Usage == nil || *got.Trace[0].Usage != rewriteUsage {
+		t.Errorf("rewrite usage = %v, want %+v", got.Trace[0].Usage, rewriteUsage)
+	}
+	if got.Trace[1].Usage == nil || *got.Trace[1].Usage != decomposeUsage {
+		t.Errorf("decompose usage = %v, want %+v", got.Trace[1].Usage, decomposeUsage)
+	}
+	decompose := got.Trace[1]
+	if decompose.Queries == nil || (*decompose.Queries)[0].Query != rewritten {
+		t.Errorf("queries = %+v, want entry 0 to be the rewritten query %q", decompose.Queries, rewritten)
+	}
+	if got.Query != rewritten || got.RewrittenQuery == nil || *got.RewrittenQuery != rewritten {
+		t.Errorf("result query/rewritten = %q/%v, want the rewritten query", got.Query, got.RewrittenQuery)
+	}
+	wantUsage := types.TokenUsage{PromptTokens: 30, CompletionTokens: 9, TotalTokens: 39}
+	if got.ChatUsage != wantUsage {
+		t.Errorf("chat usage = %+v, want the rewrite and decompose calls summed to %+v", got.ChatUsage, wantUsage)
 	}
 }

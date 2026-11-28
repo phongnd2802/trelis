@@ -118,11 +118,16 @@ func (f *forbiddenAnswerRetrieval) Retrieve(context.Context, *types.RetrievalReq
 // fakeGenerator records the turns it was sent and answers a fixed reply,
 // streamed when the answer service asks for chunks.
 type fakeGenerator struct {
-	reply    *types.ChatResponse
+	reply *types.ChatResponse
+	// replies, when set, answers one call each in order before reply is used,
+	// so a test can script a rewrite then a decomposition.
+	replies  []*types.ChatResponse
 	err      error
 	model    string
 	calls    int
 	gotTurns []types.ChatTurn
+	// allTurns records every call's turns, not only the last.
+	allTurns [][]types.ChatTurn
 
 	streamErr   error
 	stream      func(context.Context) (<-chan types.StreamResponse, error)
@@ -133,6 +138,12 @@ type fakeGenerator struct {
 func (f *fakeGenerator) Generate(_ context.Context, turns []types.ChatTurn) (*types.ChatResponse, error) {
 	f.calls++
 	f.gotTurns = append([]types.ChatTurn(nil), turns...)
+	f.allTurns = append(f.allTurns, append([]types.ChatTurn(nil), turns...))
+	if len(f.replies) > 0 {
+		reply := f.replies[0]
+		f.replies = f.replies[1:]
+		return reply, f.err
+	}
 	return f.reply, f.err
 }
 
@@ -733,9 +744,11 @@ func TestAnAnswerWithoutAConversationLoadsAndRecordsNothing(t *testing.T) {
 	}
 }
 
-func TestDebugUsageSumsTheRewriteAndGenerateCalls(t *testing.T) {
+func TestDebugUsageSumsTheRetrievalChatAndGenerateCalls(t *testing.T) {
 	conversationID := uuid.New()
 	rewriteUsage := types.TokenUsage{PromptTokens: 10, CompletionTokens: 4, TotalTokens: 14}
+	decomposeUsage := types.TokenUsage{PromptTokens: 5, CompletionTokens: 3, TotalTokens: 8}
+	retrievalChatUsage := types.TokenUsage{PromptTokens: 15, CompletionTokens: 7, TotalTokens: 22}
 	generateUsage := types.TokenUsage{PromptTokens: 11, CompletionTokens: 7, TotalTokens: 18}
 	conversations := &fakeConversations{owned: true}
 	rewritten := "standalone"
@@ -743,11 +756,17 @@ func TestDebugUsageSumsTheRewriteAndGenerateCalls(t *testing.T) {
 		Results:        answerResults(),
 		Query:          rewritten,
 		RewrittenQuery: &rewritten,
-		RewriteUsage:   rewriteUsage,
-		Trace: []types.TraceStep{{
-			Step: types.TraceStepRewriteQuery, Technique: types.RetrievalTechniqueQueryRewrite,
-			RewrittenQuery: rewritten, Usage: &rewriteUsage,
-		}},
+		ChatUsage:      retrievalChatUsage,
+		Trace: []types.TraceStep{
+			{
+				Step: types.TraceStepRewriteQuery, Technique: types.RetrievalTechniqueQueryRewrite,
+				RewrittenQuery: rewritten, Usage: &rewriteUsage,
+			},
+			{
+				Step: types.TraceStepDecomposeQuery, Technique: types.RetrievalTechniqueQueryDecomposition,
+				Usage: &decomposeUsage,
+			},
+		},
 	}}
 	svc := NewAnswerService(retrieval, &fakeGenerator{reply: &types.ChatResponse{Content: "Answer [1].", Usage: generateUsage}}, conversations, &fakeReadableDocuments{})
 
@@ -758,29 +777,29 @@ func TestDebugUsageSumsTheRewriteAndGenerateCalls(t *testing.T) {
 	if got.Debug == nil {
 		t.Fatal("debug = nil, want the summed usage")
 	}
-	want := types.TokenUsage{PromptTokens: 21, CompletionTokens: 11, TotalTokens: 32}
+	want := types.TokenUsage{PromptTokens: 26, CompletionTokens: 14, TotalTokens: 40}
 	if got.Debug.Usage != want {
-		t.Errorf("debug usage = %+v, want the rewrite and generate calls summed to %+v", got.Debug.Usage, want)
+		t.Errorf("debug usage = %+v, want retrieval's chat calls and generate summed to %+v", got.Debug.Usage, want)
 	}
 
 	// The no-source answer makes no generate call but still carries the
-	// rewrite call's usage.
+	// retrieval chat calls' usage.
 	noSources := NewAnswerService(&stubAnswerRetrieval{result: &types.RetrievalResult{
 		Results:        []types.RetrievedChunk{},
 		RewrittenQuery: &rewritten,
-		RewriteUsage:   rewriteUsage,
-		Trace: []types.TraceStep{{
-			Step: types.TraceStepRewriteQuery, Technique: types.RetrievalTechniqueQueryRewrite,
-			Usage: &rewriteUsage,
-		}},
+		ChatUsage:      retrievalChatUsage,
+		Trace: []types.TraceStep{
+			{Step: types.TraceStepRewriteQuery, Technique: types.RetrievalTechniqueQueryRewrite, Usage: &rewriteUsage},
+			{Step: types.TraceStepDecomposeQuery, Technique: types.RetrievalTechniqueQueryDecomposition, Usage: &decomposeUsage},
+		},
 	}}, &forbiddenAnswerGenerator{t}, conversations, &fakeReadableDocuments{})
 
 	got, err = noSources.Answer(callerContext(uuid.New()), answerRequest("who won?", true))
 	if err != nil {
 		t.Fatalf("Answer without sources: %v", err)
 	}
-	if got.Debug == nil || got.Debug.Usage != rewriteUsage {
-		t.Errorf("no-source debug = %+v, want the rewrite call's usage %+v", got.Debug, rewriteUsage)
+	if got.Debug == nil || got.Debug.Usage != retrievalChatUsage {
+		t.Errorf("no-source debug = %+v, want retrieval's chat usage %+v", got.Debug, retrievalChatUsage)
 	}
 }
 

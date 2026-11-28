@@ -252,13 +252,13 @@ func turnSourceDocumentIDs(retrieved *types.RetrievalResult, history []types.Con
 	return ids
 }
 
-// usageWithRewrite adds the rewrite call's token usage to another call's, so
-// debug accounting covers every model call the answer made.
-func usageWithRewrite(usage, rewrite types.TokenUsage) types.TokenUsage {
-	usage.PromptTokens += rewrite.PromptTokens
-	usage.CompletionTokens += rewrite.CompletionTokens
-	usage.TotalTokens += rewrite.TotalTokens
-	return usage
+// addUsage returns a plus b, so a debug object can sum the token usage of
+// every chat call an answer made, retrieval's and its own.
+func addUsage(a, b types.TokenUsage) types.TokenUsage {
+	a.PromptTokens += b.PromptTokens
+	a.CompletionTokens += b.CompletionTokens
+	a.TotalTokens += b.TotalTokens
+	return a
 }
 
 // Answer validates req, retrieves through the retrieval service (whose errors
@@ -269,7 +269,7 @@ func usageWithRewrite(usage, rewrite types.TokenUsage) types.TokenUsage {
 // question's language and makes no chat call. When req.Debug is set the
 // result also carries the retrieved Chunks, the trace ending with the
 // generate step, and the token usage of every model call the answer made,
-// including a query rewrite.
+// including a query rewrite or decomposition.
 func (s *answerService) Answer(ctx context.Context, req *types.AnswerRequest) (*types.AnswerResult, error) {
 	principal, retrieved, err := s.prepare(ctx, req)
 	if err != nil {
@@ -317,7 +317,7 @@ func (s *answerService) Answer(ctx context.Context, req *types.AnswerRequest) (*
 		result.Debug = &types.AnswerDebug{
 			Results: retrieved.Results,
 			Trace:   trace,
-			Usage:   usageWithRewrite(usage, retrieved.RewriteUsage),
+			Usage:   addUsage(usage, retrieved.ChatUsage),
 		}
 	}
 	return result, nil

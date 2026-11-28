@@ -15,7 +15,7 @@ type AnswerRequest struct {
 	// retrieval or model call.
 	ConversationID *uuid.UUID `json:"conversation_id,omitempty"`
 	// Debug asks the answer to carry the retrieved Chunks, the trace and the
-	// chat call's token usage; false leaves the debug object out entirely.
+	// token usage of every chat call; false leaves the debug object out entirely.
 	Debug bool `json:"debug"`
 }
 
@@ -36,11 +36,12 @@ type Citation struct {
 
 // AnswerDebug is what a POST /answer with debug: true adds to the answer: the
 // retrieved Chunks exactly as POST /retrieve would answer them, the trace of
-// the retrieval steps plus the generate step, and what the chat call cost.
+// the retrieval steps plus the generate step, and what its chat calls cost.
 type AnswerDebug struct {
 	Results []RetrievedChunk `json:"results"`
 	Trace   []TraceStep      `json:"trace"`
-	// Usage is the chat call's token accounting; zeros when no call was made.
+	// Usage is the token accounting of every chat call the answer made,
+	// retrieval's rewrite or decomposition included; zeros when none was made.
 	Usage TokenUsage `json:"usage"`
 }
 

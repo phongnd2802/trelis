@@ -22,7 +22,7 @@ const docTemplate = `{
                         "bearerAuth": []
                     }
                 ],
-                "description": "Retrieves the Documents the caller can read, then asks models.chat for one answer that cites the retrieved Chunks. Sources are numbered [1]..[n] in retrieval order; each claim is cited with its source numbers in square brackets, the answer text keeps the valid markers, and citations lists each cited source once in order of first appearance. A marker outside 1..n is removed from the text and never cited; a marker inside Markdown code or a Markdown link is left untouched and never cited. When retrieval finds nothing the answer is a fixed sentence in the question's language and no chat call is made. debug adds the retrieved Chunks (exactly as POST /retrieve answers them), the trace with a final generate step, and the token usage of every model call, including a query rewrite. With conversation_id, the Conversation's last five turns are carried into retrieval and this question and the cleaned answer are recorded as its next turn; naming query_rewrite then rewrites a follow-up into one standalone query before any technique searches, and the raw question is still what the no-source answer and the recorded turn keep. The Conversation must belong to the caller: an unknown or foreign id is 404 before any retrieval or model call. Without conversation_id the answer has no history and records nothing. With Accept: text/event-stream the answer streams Answer Events as Server-Sent Events instead: id is the per-answer seq and event is started {\"answer_id\"}, token {\"text\"} per model delta, citation {\"marker\",\"chunk_id\",\"document_id\"} after the text, then done {\"answer\",\"finish_reason\",\"debug\"?}; an error {\"message\"} replaces done when generation fails or the turn cannot be recorded, and both are terminal. The chat stream is opened before the SSE response, so a provider rejection is the same JSON 502. A dropped client resumes at GET /answers/{answer_id}/events with Last-Event-ID. Malformed JSON, unknown fields, invalid values and the retrieval rules are 400; a body over 64 KiB is 413; without models.chat the route answers 503 before any retrieval, and retrieval's own 503 (models.embedding for dense, models.rerank for rerank, models.chat for query rewrite) passes through; a model provider's rejection of a retrieval or opening the chat stream (its credentials, credit, permission or rate limit) is 502 and names the model role in its message, and any other model failure is a generic 500. Every one of these failures answers the JSON error before the SSE headers.",
+                "description": "Retrieves the Documents the caller can read, then asks models.chat for one answer that cites the retrieved Chunks. Sources are numbered [1]..[n] in retrieval order; each claim is cited with its source numbers in square brackets, the answer text keeps the valid markers, and citations lists each cited source once in order of first appearance. A marker outside 1..n is removed from the text and never cited; a marker inside Markdown code or a Markdown link is left untouched and never cited. When retrieval finds nothing the answer is a fixed sentence in the question's language and no chat call is made. debug adds the retrieved Chunks (exactly as POST /retrieve answers them), the trace with a final generate step, and the token usage of every model call, including a query rewrite or decomposition. With conversation_id, the Conversation's last five turns are carried into retrieval and this question and the cleaned answer are recorded as its next turn; naming query_rewrite then rewrites a follow-up into one standalone query before any technique searches, and the raw question is still what the no-source answer and the recorded turn keep. Naming query_decomposition splits the question into sub-questions before any technique searches, with or without a conversation_id. The Conversation must belong to the caller: an unknown or foreign id is 404 before any retrieval or model call. Without conversation_id the answer has no history and records nothing. With Accept: text/event-stream the answer streams Answer Events as Server-Sent Events instead: id is the per-answer seq and event is started {\"answer_id\"}, token {\"text\"} per model delta, citation {\"marker\",\"chunk_id\",\"document_id\"} after the text, then done {\"answer\",\"finish_reason\",\"debug\"?}; an error {\"message\"} replaces done when generation fails or the turn cannot be recorded, and both are terminal. The chat stream is opened before the SSE response, so a provider rejection is the same JSON 502. A dropped client resumes at GET /answers/{answer_id}/events with Last-Event-ID. Malformed JSON, unknown fields, invalid values and the retrieval rules are 400; a body over 64 KiB is 413; without models.chat the route answers 503 before any retrieval, and retrieval's own 503 (models.embedding for dense, models.rerank for rerank, models.chat for query rewrite or decomposition) passes through; a model provider's rejection of a retrieval or opening the chat stream (its credentials, credit, permission or rate limit) is 502 and names the model role in its message, and any other model failure is a generic 500. Every one of these failures answers the JSON error before the SSE headers.",
                 "consumes": [
                     "application/json"
                 ],
@@ -101,7 +101,7 @@ const docTemplate = `{
                         }
                     },
                     "503": {
-                        "description": "models.chat is not configured, or retrieval is unavailable (models.embedding for dense, models.rerank for rerank, models.chat for query rewrite)",
+                        "description": "models.chat is not configured, or retrieval is unavailable (models.embedding for dense, models.rerank for rerank, models.chat for query rewrite or decomposition)",
                         "schema": {
                             "$ref": "#/definitions/handler.ErrorResponse"
                         }
@@ -973,7 +973,7 @@ const docTemplate = `{
                         "bearerAuth": []
                     }
                 ],
-                "description": "Runs every candidate Retrieval Technique named in retrieval_config (dense and/or bm25) over the Documents the caller can read. One technique answers in its own order with its own score; several run concurrently over max(top_k, 50) candidates each and are fused with Reciprocal Rank Fusion, score = the sum of 1/(rrf_k + rank) over the lists that carry the Chunk, then cut to top_k with equal fused scores ordered by chunk_id. rrf_k defaults to 60 and must be between 1 and 1000; it has no effect with one technique. Naming rerank adds a second stage: the candidate pool (the single list or the fused list, cut to rerank_candidates) is scored once by the rerank model, ordered by that score with ties by chunk_id; rerank cannot run alone. rerank_candidates defaults to 50, must be between 1 and 100 and at least top_k, and has no effect without rerank. Naming parent_child adds a final stage: each matched Chunk is replaced by its Parent Chunk, several matched Chunks of one Parent Chunk collapse into the position of the best-ranked matched Chunk, and a Chunk with no Parent Chunk stands alone; chunk_id, document_id, seq, score, scores and ranks stay the best-ranked matched Chunk's, content and context_header become the Parent Chunk's, and parent_chunk_id names it (absent for a standalone Chunk). Without rerank parent_child searches max(top_k, 50) deep; with rerank the pool stays rerank_candidates and the cut to top_k happens after the collapse. Naming query_rewrite adds a first stage: when the request carries Conversation History, which POST /answer fills, the chat role rewrites the latest question into one standalone query and every technique, and rerank, searches with it; the trace then starts with rewrite_query carrying rewritten_query and the call's usage. Without history no model call is made, so POST /retrieve accepts query_rewrite and never calls a model. query_rewrite cannot run alone. Every result carries the score and 1-based rank of each technique whose list carried it, plus the rerank score and rank when it ran. A bm25 request needs no embedding model. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values, an unknown or duplicate technique, a config whose only techniques are stages (query_rewrite, rerank, parent_child), an out-of-range rrf_k or rerank_candidates are 400; a body over 64 KiB is 413; without models.embedding, a dense request is 503, without models.rerank a request naming rerank is 503, and without models.chat a request naming query_rewrite is 503. A model provider's rejection of the call (its credentials, credit, permission or rate limit) is 502 and names the model role in its message; any other model failure is a generic 500.",
+                "description": "Runs every candidate Retrieval Technique named in retrieval_config (dense and/or bm25) over the Documents the caller can read. One technique answers in its own order with its own score; several run concurrently over max(top_k, 50) candidates each and are fused with Reciprocal Rank Fusion, score = the sum of 1/(rrf_k + rank) over the lists that carry the Chunk, then cut to top_k with equal fused scores ordered by chunk_id. rrf_k defaults to 60 and must be between 1 and 1000; it has no effect with one technique. Naming rerank adds a second stage: the candidate pool (the single list or the fused list, cut to rerank_candidates) is scored once by the rerank model, ordered by that score with ties by chunk_id; rerank cannot run alone. rerank_candidates defaults to 50, must be between 1 and 100 and at least top_k, and has no effect without rerank. Naming parent_child adds a final stage: each matched Chunk is replaced by its Parent Chunk, several matched Chunks of one Parent Chunk collapse into the position of the best-ranked matched Chunk, and a Chunk with no Parent Chunk stands alone; chunk_id, document_id, seq, score, scores and ranks stay the best-ranked matched Chunk's, content and context_header become the Parent Chunk's, and parent_chunk_id names it (absent for a standalone Chunk). Without rerank parent_child searches max(top_k, 50) deep; with rerank the pool stays rerank_candidates and the cut to top_k happens after the collapse. Naming query_rewrite adds a first stage: when the request carries Conversation History, which POST /answer fills, the chat role rewrites the latest question into one standalone query and every technique, and rerank, searches with it; the trace then starts with rewrite_query carrying rewritten_query and the call's usage. Without history no model call is made, so POST /retrieve accepts query_rewrite and never calls a model. query_rewrite cannot run alone. Naming query_decomposition adds a first stage that needs no history: the chat role splits the query into 2 to 4 self-contained sub-questions and every candidate technique runs for the original and each sub-question, all of their lists fused with one Reciprocal Rank Fusion; the trace's decompose_query step carries queries with each query's own chunk_ids and every embed_query and search step carries query_index, rerank still scores against the original query, and fewer than 2 usable sub-questions runs only the original. query_decomposition cannot run alone. Every result carries the score and 1-based rank of each technique whose list carried it, plus the rerank score and rank when it ran. A bm25 request needs no embedding model. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values, an unknown or duplicate technique, a config whose only techniques are stages (query_rewrite, query_decomposition, rerank, parent_child), an out-of-range rrf_k or rerank_candidates are 400; a body over 64 KiB is 413; without models.embedding, a dense request is 503, without models.rerank a request naming rerank is 503, and without models.chat a request naming query_rewrite or query_decomposition is 503. A model provider's rejection of the call (its credentials, credit, permission or rate limit) is 502 and names the model role in its message; any other model failure is a generic 500.",
                 "consumes": [
                     "application/json"
                 ],
@@ -986,7 +986,7 @@ const docTemplate = `{
                 "summary": "Retrieve Chunks for a query",
                 "parameters": [
                     {
-                        "description": "The query, how many Chunks to return, which Retrieval Techniques to run (dense, bm25, query_rewrite, rerank, parent_child), the RRF constant and the rerank candidate pool",
+                        "description": "The query, how many Chunks to return, which Retrieval Techniques to run (dense, bm25, query_rewrite, query_decomposition, rerank, parent_child), the RRF constant and the rerank candidate pool",
                         "name": "request",
                         "in": "body",
                         "required": true,
@@ -1015,7 +1015,7 @@ const docTemplate = `{
                         }
                     },
                     "400": {
-                        "description": "Body that is not one JSON object, an unknown field or wrong value type, a blank or too-long query, an out-of-range top_k or an invalid retrieval_config (an unknown or duplicate technique, only stage techniques such as query_rewrite, rerank or parent_child, an rrf_k outside 1..1000, or a rerank_candidates outside 1..100 or below top_k)",
+                        "description": "Body that is not one JSON object, an unknown field or wrong value type, a blank or too-long query, an out-of-range top_k or an invalid retrieval_config (an unknown or duplicate technique, only stage techniques such as query_rewrite, query_decomposition, rerank or parent_child, an rrf_k outside 1..1000, or a rerank_candidates outside 1..100 or below top_k)",
                         "schema": {
                             "$ref": "#/definitions/handler.ErrorResponse"
                         }
@@ -1045,7 +1045,7 @@ const docTemplate = `{
                         }
                     },
                     "503": {
-                        "description": "models.embedding is not configured so dense cannot run, models.rerank is not configured so rerank cannot run, or models.chat is not configured so query_rewrite cannot run (bm25 alone still works)",
+                        "description": "models.embedding is not configured so dense cannot run, models.rerank is not configured so rerank cannot run, or models.chat is not configured so query_rewrite or query_decomposition cannot run (bm25 alone still works)",
                         "schema": {
                             "$ref": "#/definitions/handler.ErrorResponse"
                         }
@@ -1246,7 +1246,7 @@ const docTemplate = `{
                     }
                 },
                 "usage": {
-                    "description": "Usage is the chat call's token accounting; zeros when no call was made.",
+                    "description": "Usage is the token accounting of every chat call the answer made,\nretrieval's rewrite or decomposition included; zeros when none was made.",
                     "allOf": [
                         {
                             "$ref": "#/definitions/types.TokenUsage"
@@ -1263,7 +1263,7 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "debug": {
-                    "description": "Debug asks the answer to carry the retrieved Chunks, the trace and the\nchat call's token usage; false leaves the debug object out entirely.",
+                    "description": "Debug asks the answer to carry the retrieved Chunks, the trace and the\ntoken usage of every chat call; false leaves the debug object out entirely.",
                     "type": "boolean"
                 },
                 "query": {
@@ -1514,6 +1514,22 @@ const docTemplate = `{
                 }
             }
         },
+        "types.QueryEvidence": {
+            "type": "object",
+            "properties": {
+                "chunk_ids": {
+                    "description": "ChunkIDs is the matched Chunks that query found: its technique lists\nfused with Reciprocal Rank Fusion when it ran more than one, otherwise\nits single list, cut to top_k and before global fusion, rerank and\nparent expansion. It is never null.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "query": {
+                    "description": "Query is the text the candidate techniques searched for.",
+                    "type": "string"
+                }
+            }
+        },
         "types.RetrievalConfig": {
             "type": "object",
             "properties": {
@@ -1526,7 +1542,7 @@ const docTemplate = `{
                     "type": "integer"
                 },
                 "techniques": {
-                    "description": "Techniques is the set of Retrieval Techniques to run, without\nduplicates. More than one candidate technique makes the request a\nfusion: each runs over the readable Documents and their lists are\ncombined with Reciprocal Rank Fusion. query_rewrite rewrites the\nquestion first when the request carries Conversation History; rerank\nreorders whatever the candidate techniques found; parent_child then\nreplaces the ordered Chunks with their Parent Chunks.",
+                    "description": "Techniques is the set of Retrieval Techniques to run, without\nduplicates. More than one candidate technique makes the request a\nfusion: each runs over the readable Documents and their lists are\ncombined with Reciprocal Rank Fusion. query_rewrite rewrites the\nquestion first when the request carries Conversation History;\nquery_decomposition splits it into sub-questions that every candidate\ntechnique searches for alongside the original; rerank reorders whatever\nthe candidate techniques found; parent_child then replaces the ordered\nChunks with their Parent Chunks.",
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/types.RetrievalTechnique"
@@ -1578,6 +1594,7 @@ const docTemplate = `{
                 "dense",
                 "bm25",
                 "query_rewrite",
+                "query_decomposition",
                 "rerank",
                 "parent_child",
                 "rrf"
@@ -1586,6 +1603,7 @@ const docTemplate = `{
                 "RetrievalTechniqueDense",
                 "RetrievalTechniqueBM25",
                 "RetrievalTechniqueQueryRewrite",
+                "RetrievalTechniqueQueryDecomposition",
                 "RetrievalTechniqueRerank",
                 "RetrievalTechniqueParentChild",
                 "RetrievalTechniqueRRF"
@@ -1669,6 +1687,17 @@ const docTemplate = `{
                     "description": "Model is the embedding, rerank or chat model, on the step that called\none.",
                     "type": "string"
                 },
+                "queries": {
+                    "description": "Queries is the queries a decompose_query run searched with, one entry\nper query index: entry 0 is the original question, then one entry per\nSub-question. It is a pointer so the step always answers queries while\nevery other step leaves the field out.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/types.QueryEvidence"
+                    }
+                },
+                "query_index": {
+                    "description": "QueryIndex is the index into the decompose step's queries an\nembed_query or search step ran for; it is set only when the config\nnames query_decomposition.",
+                    "type": "integer"
+                },
                 "rewritten_query": {
                     "description": "RewrittenQuery is the query the techniques searched with, on the\nrewrite_query step: the model's reply, or the raw question when the\nreply was blank or too long.",
                     "type": "string"
@@ -1686,7 +1715,7 @@ const docTemplate = `{
                     ]
                 },
                 "usage": {
-                    "description": "Usage is the chat call's token accounting on the rewrite_query step.",
+                    "description": "Usage is the chat call's token accounting on the rewrite_query or\ndecompose_query step.",
                     "allOf": [
                         {
                             "$ref": "#/definitions/types.TokenUsage"
