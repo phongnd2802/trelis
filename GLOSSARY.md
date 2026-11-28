@@ -147,12 +147,16 @@ A fixed list of questions, each with its expected answer and the evidence that s
 _Avoid_: Test set, QA pairs
 
 **Retrieval Technique**:
-One way of finding evidence (e.g. BM25, dense, hybrid fusion, rerank, query rewrite, graph search, agentic search) that can be switched on or off on its own.
+One way of finding evidence (e.g. BM25, dense, hybrid fusion, rerank, query rewrite, query decomposition, graph search, agentic search) that can be switched on or off on its own.
 _Avoid_: Strategy, mode, feature
 
 **Retrieval Config**:
 A named combination of Retrieval Techniques that is switched on together.
 _Avoid_: Pipeline, preset
+
+**Sub-question**:
+One self-contained question that query decomposition splits a multi-hop question into, retrieved for on its own.
+_Avoid_: Sub-query, decomposed query
 
 **Reciprocal Rank Fusion (RRF)**:
 The way several Retrieval Techniques' ranked lists become one: a Chunk scores the sum of 1/(k + rank) over the lists that carry it, with 1-based ranks and k a per-request constant (default 60).

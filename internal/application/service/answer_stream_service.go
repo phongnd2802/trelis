@@ -256,7 +256,7 @@ func answerDebug(retrieved *types.RetrievalResult, generate types.TraceStep,
 	if generate.Step != "" {
 		trace = append(trace[:len(trace):len(trace)], generate)
 	}
-	return &types.AnswerDebug{Results: retrieved.Results, Trace: trace, Usage: usageWithRewrite(usage, retrieved.RewriteUsage)}
+	return &types.AnswerDebug{Results: retrieved.Results, Trace: trace, Usage: addUsage(usage, retrieved.ChatUsage)}
 }
 
 // watchShutdown cancels a generation when the server begins shutting down,

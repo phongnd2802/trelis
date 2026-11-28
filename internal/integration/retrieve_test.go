@@ -51,9 +51,15 @@ type traceStep struct {
 	Model      string                `json:"model"`
 	Candidates int                   `json:"candidates"`
 	Expanded   []parentExpansionView `json:"expanded"`
-	// RewrittenQuery and Usage are on the rewrite_query step.
+	// RewrittenQuery, Queries and Usage are on the query stages.
 	RewrittenQuery string `json:"rewritten_query"`
-	Usage          *struct {
+	Queries        []struct {
+		Query    string   `json:"query"`
+		ChunkIDs []string `json:"chunk_ids"`
+	} `json:"queries"`
+	// QueryIndex is the query an embed_query or search step ran for.
+	QueryIndex *int `json:"query_index"`
+	Usage      *struct {
 		PromptTokens     int `json:"prompt_tokens"`
 		CompletionTokens int `json:"completion_tokens"`
 		TotalTokens      int `json:"total_tokens"`
@@ -871,5 +877,75 @@ func TestRetrieveRerankFollowsTheRerankScoresAndKeepsRestrictedChunksOut(t *test
 		if strings.Contains(text, "1234") {
 			t.Errorf("the rerank provider received Alice's Restricted Chunk text %q", text)
 		}
+	}
+}
+
+// TestRetrieveDecompositionSplitsTheQuestionAndShowsEachQuerysEvidence is the
+// acceptance case for query_decomposition through POST /retrieve: the chat
+// role answers a JSON array, every sub-question is searched, and the trace
+// names each query's evidence. Without the technique the chat role is never
+// called.
+func TestRetrieveDecompositionSplitsTheQuestionAndShowsEachQuerysEvidence(t *testing.T) {
+	tr := start(t)
+	alice := tr.principalKey(t, "alice")
+
+	docID := tr.upload(t, alice, "plan.md",
+		"# Kế hoạch\n\nLan viết kế hoạch.\n\nKế hoạch được duyệt vào năm 2024.\n")
+	if got := tr.waitForIngest(t, alice, docID); got.ParseStatus != "completed" {
+		t.Fatalf("Document parse_status = %q (%q), want completed", got.ParseStatus, got.ParseError)
+	}
+
+	const (
+		query  = "Ai viết kế hoạch và khi nào nó được duyệt?"
+		first  = "Ai viết kế hoạch?"
+		second = "Khi nào kế hoạch được duyệt?"
+	)
+	tr.provider.Reply(modeltest.Contains("self-contained sub-questions"),
+		modeltest.Text(`["Ai viết kế hoạch?","Khi nào kế hoạch được duyệt?"]`))
+
+	answer := tr.retrieveConfig(t, alice, query, 5, map[string]any{
+		"techniques": []string{"bm25", "query_decomposition"},
+	})
+	if calls := tr.provider.CallCount(modeltest.ChatCompletions); calls != 1 {
+		t.Fatalf("chat provider received %d calls, want one decomposition", calls)
+	}
+	if len(answer.Data.Trace) < 2 {
+		t.Fatalf("trace = %+v, want the decompose step and the searches", answer.Data.Trace)
+	}
+	decompose := answer.Data.Trace[0]
+	if decompose.Step != "decompose_query" || decompose.Technique != "query_decomposition" ||
+		decompose.Model != chatModel || decompose.Usage == nil || decompose.Usage.TotalTokens <= 0 {
+		t.Fatalf("trace[0] = %+v, want the decompose_query step with its model and usage", decompose)
+	}
+	if len(decompose.Queries) != 3 {
+		t.Fatalf("queries = %+v, want the original and both Sub-questions", decompose.Queries)
+	}
+	for i, want := range []string{query, first, second} {
+		if got := decompose.Queries[i].Query; got != want {
+			t.Errorf("queries[%d].query = %q, want %q", i, got, want)
+		}
+		if len(decompose.Queries[i].ChunkIDs) == 0 {
+			t.Errorf("queries[%d].chunk_ids is empty, want the evidence its query found", i)
+		}
+	}
+	var searches int
+	for _, step := range answer.Data.Trace {
+		if step.Step != "search" {
+			continue
+		}
+		searches++
+		if step.QueryIndex == nil {
+			t.Errorf("search step %+v has no query_index, want the query it ran for", step)
+		}
+	}
+	if searches != len(decompose.Queries) {
+		t.Errorf("%d search steps for %d queries, want one bm25 search each", searches, len(decompose.Queries))
+	}
+
+	// Without query_decomposition the same question makes no chat call.
+	before := tr.provider.CallCount(modeltest.ChatCompletions)
+	tr.retrieve(t, alice, query, "bm25", 5)
+	if after := tr.provider.CallCount(modeltest.ChatCompletions); after != before {
+		t.Errorf("bm25 alone made %d chat calls, want none", after-before)
 	}
 }

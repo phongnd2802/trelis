@@ -16,6 +16,7 @@ import (
 	apperrors "github.com/phongnd2802/trelis/internal/errors"
 	"github.com/phongnd2802/trelis/internal/handler"
 	"github.com/phongnd2802/trelis/internal/models/api"
+	"github.com/phongnd2802/trelis/internal/models/chat"
 	"github.com/phongnd2802/trelis/internal/models/embedding"
 	"github.com/phongnd2802/trelis/internal/models/modeltest"
 	"github.com/phongnd2802/trelis/internal/models/rerank"
@@ -60,6 +61,17 @@ type readableChunkSearch struct {
 func (f *readableChunkSearch) SearchDense(_ context.Context, documentIDs []uuid.UUID,
 	_ []float32, _ string, _ int,
 ) ([]*types.ChunkMatch, error) {
+	return f.readableMatches(documentIDs), nil
+}
+
+func (f *readableChunkSearch) SearchBM25(_ context.Context, documentIDs []uuid.UUID,
+	_ string, _ int,
+) ([]*types.ChunkMatch, error) {
+	return f.readableMatches(documentIDs), nil
+}
+
+// readableMatches filters the fixed matches down to the readable Documents.
+func (f *readableChunkSearch) readableMatches(documentIDs []uuid.UUID) []*types.ChunkMatch {
 	readable := make(map[uuid.UUID]bool, len(documentIDs))
 	for _, id := range documentIDs {
 		readable[id] = true
@@ -70,7 +82,7 @@ func (f *readableChunkSearch) SearchDense(_ context.Context, documentIDs []uuid.
 			out = append(out, match)
 		}
 	}
-	return out, nil
+	return out
 }
 
 // fixedEmbedder answers one fixed vector for any text.
@@ -192,6 +204,15 @@ func TestAnInvalidRequestIsValidation(t *testing.T) {
 		"query_rewrite alone": {
 			body:    `{"query":"who won?","retrieval_config":{"techniques":["query_rewrite"]}}`,
 			wantMsg: []string{"query_rewrite", "rewrites the query another technique searches with", "at least one", "dense"},
+		},
+		"query_decomposition alone": {
+			body: `{"query":"who won?","retrieval_config":{"techniques":["query_decomposition"]}}`,
+			wantMsg: []string{
+				"query_decomposition",
+				"splits the question into sub-questions another technique searches for",
+				"at least one",
+				"dense",
+			},
 		},
 		"parent_child alone": {
 			body:    `{"query":"who won?","retrieval_config":{"techniques":["parent_child"]}}`,
@@ -618,5 +639,225 @@ func TestAnotherPrincipalNeverReceivesAChunkAtTheRouterSeam(t *testing.T) {
 	}
 	if len(aliceGot.Results) != 1 || aliceGot.Results[0].DocumentID != aliceDoc {
 		t.Errorf("alice's results = %+v, want only her own Document %s", aliceGot.Results, aliceDoc)
+	}
+}
+
+// TestAnotherPrincipalNeverReceivesAChunkFromQueryDecomposition is the
+// leakage test for the queries evidence: a caller who can read nothing gets
+// no Chunk ID from any query the decomposition searched with, while a caller
+// who can read the Document gets it back.
+func TestAnotherPrincipalNeverReceivesAChunkFromQueryDecomposition(t *testing.T) {
+	alice := types.Principal{ID: uuid.MustParse("0190d2a8-0000-7000-8000-000000000001"), Name: "alice"}
+	bob := types.Principal{ID: uuid.MustParse("0190d2a8-0000-7000-8000-000000000002"), Name: "bob"}
+	aliceDoc := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	aliceChunkID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000c1")
+
+	p := modeltest.NewFakeProvider(t)
+	p.Reply(modeltest.Contains("self-contained sub-questions"),
+		modeltest.Text(`["Who wrote the plan?","When was it approved?"]`))
+	svc := service.NewRetrievalService(
+		&callerReadableDocuments{readable: map[uuid.UUID][]uuid.UUID{alice.ID: {aliceDoc}}},
+		&readableChunkSearch{matches: []*types.ChunkMatch{{
+			Chunk: &types.Chunk{ID: aliceChunkID, DocumentID: aliceDoc, Content: "Alice's secret"},
+			Score: 1,
+		}}},
+		nil, nil, providerChat(t, p))
+
+	me := handler.NewPrincipalHandler(service.NewPrincipalService(nil, nil, nil))
+	h := New(Readiness{}, keyring{"trelis_alice": alice, "trelis_bob": bob}, me, nil,
+		handler.NewRetrievalHandler(svc), nil, nil,
+		nil, false)
+
+	const body = `{"query":"Who wrote the plan and when was it approved?","retrieval_config":{"techniques":["bm25","query_decomposition"]}}`
+	bobRec := postJSON(t, h, "/retrieve", body, "Bearer trelis_bob")
+	if bobRec.Code != http.StatusOK {
+		t.Fatalf("bob's POST /retrieve = %d %s, want 200", bobRec.Code, bobRec.Body)
+	}
+	var bobGot types.RetrievalResult
+	if err := json.Unmarshal(decode(t, bobRec).Data, &bobGot); err != nil {
+		t.Fatal(err)
+	}
+	if len(bobGot.Results) != 0 {
+		t.Errorf("bob's results = %+v, want none from a Document he cannot read", bobGot.Results)
+	}
+	bobQueries := decomposeQueries(bobGot.Trace)
+	if bobQueries == nil {
+		t.Fatal("bob's trace has no decompose_query step with queries")
+	}
+	if len(*bobQueries) != 3 {
+		t.Fatalf("bob's queries = %+v, want the original and both Sub-questions", *bobQueries)
+	}
+	for i, evidence := range *bobQueries {
+		if evidence.ChunkIDs == nil {
+			t.Errorf("bob's queries[%d].chunk_ids = null, want []", i)
+		}
+		if len(evidence.ChunkIDs) != 0 {
+			t.Errorf("bob's queries[%d].chunk_ids = %v, want no Chunk he cannot read", i, evidence.ChunkIDs)
+		}
+	}
+	if strings.Contains(bobRec.Body.String(), aliceChunkID.String()) {
+		t.Errorf("bob's body names Alice's Chunk %s", aliceChunkID)
+	}
+
+	aliceRec := postJSON(t, h, "/retrieve", body, "Bearer trelis_alice")
+	if aliceRec.Code != http.StatusOK {
+		t.Fatalf("alice's POST /retrieve = %d %s, want 200", aliceRec.Code, aliceRec.Body)
+	}
+	var aliceGot types.RetrievalResult
+	if err := json.Unmarshal(decode(t, aliceRec).Data, &aliceGot); err != nil {
+		t.Fatal(err)
+	}
+	if len(aliceGot.Results) == 0 {
+		t.Fatal("alice's results are empty, want her readable Chunk")
+	}
+	aliceQueries := decomposeQueries(aliceGot.Trace)
+	if aliceQueries == nil {
+		t.Fatal("alice's trace has no decompose_query step with queries")
+	}
+	sawEvidence := false
+	for _, evidence := range *aliceQueries {
+		for _, chunkID := range evidence.ChunkIDs {
+			if chunkID == aliceChunkID {
+				sawEvidence = true
+			}
+		}
+	}
+	if !sawEvidence {
+		t.Errorf("alice's queries = %+v, want her Chunk %s among the evidence", *aliceQueries, aliceChunkID)
+	}
+}
+
+// decomposeQueries returns the queries a trace's decompose_query step
+// recorded, or nil when the trace has no such step.
+func decomposeQueries(trace []types.TraceStep) *[]types.QueryEvidence {
+	for i := range trace {
+		if trace[i].Step == types.TraceStepDecomposeQuery {
+			return trace[i].Queries
+		}
+	}
+	return nil
+}
+
+func TestRetrieveWithoutAChatModelCannotDecompose(t *testing.T) {
+	// The check runs before any repository or model call, so no dependency is
+	// needed behind it.
+	h := newRetrieveRouter(service.NewRetrievalService(nil, nil, nil, nil, nil))
+
+	rec := postJSON(t, h, "/retrieve",
+		`{"query":"who won?","retrieval_config":{"techniques":["bm25","query_decomposition"]}}`,
+		"Bearer trelis_alice")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("POST /retrieve = %d %s, want 503", rec.Code, rec.Body)
+	}
+	e := decode(t, rec)
+	if e.Success || e.Error == nil || e.Error.Code != 1008 ||
+		!strings.Contains(e.Error.Message, "models.chat") ||
+		!strings.Contains(e.Error.Message, "query decomposition") {
+		t.Errorf("body = %s, want a 1008 error naming query decomposition and models.chat", rec.Body)
+	}
+}
+
+// providerChat returns the models.chat role wired to p, so a retrieval test
+// exercises query decomposition through the fake provider.
+func providerChat(t *testing.T, p *modeltest.FakeProvider) interfaces.Generator {
+	t.Helper()
+	c, err := chat.NewChat("chat", config.ChatRole{
+		Protocol: api.APIOpenAICompletions,
+		Endpoint: config.Endpoint{BaseURL: p.URL(), Model: "test-chat"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return chat.Generator(c)
+}
+
+// newProviderDecompositionRouter wires the real chat client to p beside a
+// fake readable Chunk search, so a test can see how query decomposition
+// reaches the provider through POST /retrieve.
+func newProviderDecompositionRouter(t *testing.T, p *modeltest.FakeProvider) http.Handler {
+	t.Helper()
+	documentID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	chunkID := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+	svc := service.NewRetrievalService(
+		&callerReadableDocuments{readable: map[uuid.UUID][]uuid.UUID{alice.ID: {documentID}}},
+		&readableChunkSearch{matches: []*types.ChunkMatch{{
+			Chunk: &types.Chunk{ID: chunkID, DocumentID: documentID, Content: "Alice's readable Chunk"},
+			Score: 1,
+		}}},
+		nil, nil, providerChat(t, p))
+
+	return newRetrieveRouter(svc)
+}
+
+func TestRetrieveDecomposesThroughTheChatProvider(t *testing.T) {
+	p := modeltest.NewFakeProvider(t)
+	p.Reply(modeltest.Contains("self-contained sub-questions"),
+		modeltest.Text(`["Who wrote the plan?","When was it approved?"]`))
+	h := newProviderDecompositionRouter(t, p)
+
+	rec := postJSON(t, h, "/retrieve",
+		`{"query":"Who wrote the plan and when was it approved?","retrieval_config":{"techniques":["bm25","query_decomposition"]}}`,
+		"Bearer trelis_alice")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /retrieve = %d %s, want 200", rec.Code, rec.Body)
+	}
+	var got types.RetrievalResult
+	if err := json.Unmarshal(decode(t, rec).Data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Trace) == 0 || got.Trace[0].Step != types.TraceStepDecomposeQuery {
+		t.Fatalf("trace = %+v, want the decompose_query step first", got.Trace)
+	}
+	decompose := got.Trace[0]
+	if decompose.Technique != types.RetrievalTechniqueQueryDecomposition || decompose.Model != "test-chat" ||
+		decompose.Usage == nil || decompose.Queries == nil {
+		t.Fatalf("trace[0] = %+v, want the decompose step with its model, usage and queries", decompose)
+	}
+	evidence := *decompose.Queries
+	if len(evidence) != 3 {
+		t.Fatalf("queries = %+v, want the original and both Sub-questions", evidence)
+	}
+	for i, want := range []string{
+		"Who wrote the plan and when was it approved?",
+		"Who wrote the plan?",
+		"When was it approved?",
+	} {
+		if evidence[i].Query != want {
+			t.Errorf("queries[%d].query = %q, want %q", i, evidence[i].Query, want)
+		}
+		if len(evidence[i].ChunkIDs) == 0 {
+			t.Errorf("queries[%d].chunk_ids is empty, want the evidence its query found", i)
+		}
+	}
+	var searches int
+	for _, step := range got.Trace {
+		if step.Step != types.TraceStepSearch && step.Step != types.TraceStepEmbedQuery {
+			continue
+		}
+		searches++
+		if step.QueryIndex == nil {
+			t.Errorf("step %+v has no query_index, want the query it ran for", step)
+		}
+	}
+	if searches != len(evidence) {
+		t.Errorf("%d search/embed steps for %d queries, want one bm25 search each", searches, len(evidence))
+	}
+	if p.CallCount(modeltest.ChatCompletions) != 1 {
+		t.Errorf("provider received %d chat calls, want one decomposition", p.CallCount(modeltest.ChatCompletions))
+	}
+}
+
+func TestRetrieveWithoutDecompositionMakesNoChatCall(t *testing.T) {
+	p := modeltest.NewFakeProvider(t)
+	h := newProviderDecompositionRouter(t, p)
+
+	rec := postJSON(t, h, "/retrieve",
+		`{"query":"Who wrote the plan?","retrieval_config":{"techniques":["bm25"]}}`,
+		"Bearer trelis_alice")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /retrieve = %d %s, want 200", rec.Code, rec.Body)
+	}
+	if calls := p.CallCount(modeltest.ChatCompletions); calls != 0 {
+		t.Errorf("provider received %d chat calls without query_decomposition, want none", calls)
 	}
 }
