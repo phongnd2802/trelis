@@ -286,10 +286,11 @@ and [Failure Attribution](docs/metrics.md#failure-attribution).
 
 ### Fill in the price table
 
-`eval/prices.toml` is committed as a template with a currency and no model
-entries, so Cost per Correct Answer starts as `—` for every answer row. Add
-one table per model, keyed by the `model` of the answer's `generate` trace
-step exactly as Trelis reports it:
+`eval/prices.toml` is committed with a currency and the price of the chat
+model this repo's eval stack uses (`deepseek-v4-flash-0731`, with its source
+and date). An answer whose model is not in the table makes Cost per Correct
+Answer `—` for that row. Add one table per model, keyed by the `model` of the
+answer's `generate` trace step exactly as Trelis reports it:
 
 ```toml
 currency = "USD"

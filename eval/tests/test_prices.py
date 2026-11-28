@@ -92,13 +92,13 @@ output_per_million = 1
         load_prices(path)
 
 
-def test_the_committed_template_loads_with_no_models():
-    template = Path(__file__).parent.parent / "prices.toml"
+def test_the_committed_price_table_loads():
+    table = Path(__file__).parent.parent / "prices.toml"
 
-    prices = load_prices(template)
+    prices = load_prices(table)
 
     assert prices.currency == "USD"
-    assert prices.models == {}
+    assert "deepseek-v4-flash-0731" in prices.models
 
 
 def test_generate_model_reads_the_generate_trace_step():

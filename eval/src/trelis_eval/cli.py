@@ -66,7 +66,7 @@ from .report import build_matrix, render_html, render_markdown
 DEFAULT_DATA_DIR = Path("eval/data/multihop-rag")
 DEFAULT_BASE_URL = "http://localhost:8080"
 DEFAULT_PRICES = Path(__file__).resolve().parents[2] / "prices.toml"
-"""The committed price table template, resolved from the eval project directory."""
+"""The committed price table, resolved from the eval project directory."""
 
 MODEL_MODE_ENV = "TRELIS_EVAL_MODEL_MODE"
 """The environment variable a run reads its model mode from."""

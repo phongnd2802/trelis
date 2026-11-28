@@ -1,8 +1,8 @@
 """The price table that prices an answer's generate call.
 
-Prices are configuration, not code: ``eval/prices.toml`` is committed as an
-empty template, and the operator fills in the provider's per-million-token
-prices for the models Trelis reports in a question's ``generate`` trace step.
+Prices are configuration, not code: ``eval/prices.toml`` holds the provider's
+per-million-token prices for the models Trelis reports in a question's
+``generate`` trace step, each with its source and the date it was read.
 ``eval/docs/metrics.md`` defines Cost per Correct Answer.
 """
 

@@ -342,10 +342,10 @@ A retrieval run, or an answer run with no `ok` correctness Grade, simply
 shows `—` without a note, because there is no cost to explain.
 
 The currency is part of the header, `Cost per Correct Answer (USD)`, and comes
-from the price table. `eval/prices.toml` is the committed template: a
+from the price table. `eval/prices.toml` is the committed table: a
 `currency` and one `[models."<name>"]` table per model, whose key must equal
-the `generate` step's `model` exactly. Prices are configuration, not code, and
-the template commits no model entries.
+the `generate` step's `model` exactly. Prices are configuration, not code;
+each committed entry names its source and the date it was read.
 
 Cost covers **only the generate call**, because Trelis's debug object reports
 only the chat call's usage. Embedding, rerank and the judge are not included;
