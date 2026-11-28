@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -41,7 +42,7 @@ func TestParseAndChunkActivityLogsTheChunkingReport(t *testing.T) {
 			{Tier: string(chunker.TierHeading), Reason: "chunk 0 at [0,12) cuts a protected span"},
 		},
 	}
-	activity := NewActivities(&fakeIngestService{result: result})
+	activity := NewActivities(&fakeIngestService{result: result}, nil)
 
 	got, err := activity.ParseAndChunk(ctx, documentID.String())
 	if err != nil {
@@ -83,5 +84,39 @@ func TestParseAndChunkActivityLogsTheChunkingReport(t *testing.T) {
 	}
 	if line := fmt.Sprint(entry); strings.Contains(line, "context_header") || strings.Contains(line, "content") {
 		t.Errorf("the Chunks stored line carries Chunk content: %s", line)
+	}
+}
+
+// fakeCleanupService records the Documents whose objects it was asked to
+// delete.
+type fakeCleanupService struct {
+	interfaces.DocumentCleanupService
+	deleted []uuid.UUID
+}
+
+func (f *fakeCleanupService) DeleteDocumentObjects(_ context.Context, documentID uuid.UUID) error {
+	f.deleted = append(f.deleted, documentID)
+	return nil
+}
+
+func TestDeleteObjectsActivityCallsTheCleanupServiceWithTheDocumentID(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	ctx := logger.WithContext(context.Background(), zap.New(core))
+	documentID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000d2")
+	cleanup := &fakeCleanupService{}
+	activity := NewActivities(nil, cleanup)
+
+	if err := activity.DeleteObjects(ctx, documentID.String()); err != nil {
+		t.Fatalf("DeleteObjects: %v", err)
+	}
+	if !slices.Equal(cleanup.deleted, []uuid.UUID{documentID}) {
+		t.Errorf("DeleteDocumentObjects called with %v, want once with %s", cleanup.deleted, documentID)
+	}
+	entries := logs.FilterMessage("document delete: objects removed").All()
+	if len(entries) != 1 {
+		t.Fatalf("logger saw %d objects removed lines, want one: %v", len(entries), logs.All())
+	}
+	if got := entries[0].ContextMap()["document"]; got != documentID.String() {
+		t.Errorf("document = %v, want %s", got, documentID)
 	}
 }

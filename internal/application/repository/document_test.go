@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"slices"
 	"strings"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/phongnd2802/trelis/internal/db"
+	"github.com/phongnd2802/trelis/internal/db/dbtest"
 	"github.com/phongnd2802/trelis/internal/types"
 )
 
@@ -102,5 +105,63 @@ func TestListDocumentUploadIDsReturnsTheCurrentUploadOfEachDocument(t *testing.T
 	got, err = docs.ListDocumentUploadIDs(ctx, nil)
 	if err != nil || len(got) != 0 {
 		t.Errorf("ListDocumentUploadIDs(nil) = %v, %v; want an empty map and no error", got, err)
+	}
+}
+
+func TestDeleteDocumentRemovesItsChunksParentChunksAndAccessList(t *testing.T) {
+	ctx := context.Background()
+	pool := dbtest.Migrated(t)
+	s := db.NewStore(pool)
+	owner, err := s.Querier(ctx).CreatePrincipal(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := s.Querier(ctx).CreatePrincipal(ctx, "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group, err := s.Querier(ctx).CreateGroup(ctx, "legal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := documentGranted(t, s, owner.ID, types.AccessGrants{
+		PrincipalIDs: []uuid.UUID{reader.ID},
+		GroupIDs:     []uuid.UUID{group.ID},
+	})
+	set := types.ChunkSet{
+		Parents: []*types.ParentChunk{
+			{Seq: 0, Content: "Điều 1. Phạm vi\nĐiều 2. Đối tượng", StartOffset: 0, EndOffset: 35},
+		},
+		Chunks: []*types.Chunk{
+			{Seq: 0, Content: "Điều 1. Phạm vi", StartOffset: 0, EndOffset: 16},
+			{Seq: 1, Content: "Điều 2. Đối tượng", StartOffset: 17, EndOffset: 35},
+		},
+		ParentOf: []int{0, 0},
+	}
+	if err := s.ExecTx(ctx, func(ctx context.Context) error {
+		return NewChunkRepository(s).ReplaceChunks(ctx, doc.ID, set)
+	}); err != nil {
+		t.Fatalf("ReplaceChunks: %v", err)
+	}
+
+	docs := NewDocumentRepository(s)
+	if err := docs.DeleteDocument(ctx, doc.ID); err != nil {
+		t.Fatalf("DeleteDocument: %v", err)
+	}
+
+	if _, err := docs.GetDocumentByID(ctx, doc.ID); !errors.Is(err, ErrDocumentNotFound) {
+		t.Errorf("GetDocumentByID after delete = %v, want ErrDocumentNotFound", err)
+	}
+	for _, table := range []string{"chunks", "parent_chunks", "document_principals", "document_groups"} {
+		var rows int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM "+table+" WHERE document_id = $1", doc.ID).Scan(&rows); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if rows != 0 {
+			t.Errorf("%s holds %d rows for the deleted Document, want 0 by cascade", table, rows)
+		}
+	}
+	if err := docs.DeleteDocument(ctx, uuid.New()); !errors.Is(err, ErrDocumentNotFound) {
+		t.Errorf("DeleteDocument(unknown) = %v, want ErrDocumentNotFound", err)
 	}
 }

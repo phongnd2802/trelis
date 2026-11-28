@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/phongnd2802/trelis/internal/models/modeltest"
 )
@@ -73,6 +74,20 @@ func chatBody(user string) map[string]any {
 	return map[string]any{
 		"model":    "gpt-test",
 		"messages": []map[string]any{{"role": "system", "content": "be brief"}, {"role": "user", "content": user}},
+	}
+}
+
+func TestDelayHoldsARequest(t *testing.T) {
+	p := modeltest.NewFakeProvider(t)
+	p.Delay(modeltest.Embeddings, 100*time.Millisecond)
+
+	start := time.Now()
+	status, raw := post(t, p, "/embeddings", map[string]any{"model": "m", "input": []string{"a"}})
+	if status != http.StatusOK {
+		t.Fatalf("status = %d %s", status, raw)
+	}
+	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+		t.Errorf("embeddings answered after %v, want at least the 100ms delay", elapsed)
 	}
 }
 

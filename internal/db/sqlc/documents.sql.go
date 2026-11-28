@@ -71,6 +71,20 @@ func (q *Queries) CreateDocument(ctx context.Context, arg CreateDocumentParams) 
 	return i, err
 }
 
+const deleteDocument = `-- name: DeleteDocument :execrows
+DELETE FROM documents WHERE id = $1
+`
+
+// Deleting a Document removes its Chunks, Parent Chunks and Access List by
+// ON DELETE CASCADE. Zero rows means it was already deleted.
+func (q *Queries) DeleteDocument(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteDocument, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getDocumentByID = `-- name: GetDocumentByID :one
 SELECT id, owner_id, title, file_name, file_type, file_size, file_hash, object_key, parse_status, created_at, updated_at, upload_id, parse_error FROM documents WHERE id = $1
 `

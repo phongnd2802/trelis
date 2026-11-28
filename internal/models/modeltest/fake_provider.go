@@ -25,7 +25,8 @@
 // scriptedTemplateChatModel, Copyright (C) 2026 Tencent, MIT license; see
 // NOTICE.) Embeddings and rerank need no script: they answer from the
 // input text ([FakeProvider.EmbedAs] and [FakeProvider.ScoreAs] pin values).
-// [FakeProvider.FailNext] makes an endpoint return errors for a while, and
+// [FakeProvider.FailNext] makes an endpoint return errors for a while,
+// [FakeProvider.Delay] holds a request in flight, and
 // [FakeProvider.CallCount] and [FakeProvider.Requests] report what each
 // endpoint received.
 package modeltest
@@ -39,6 +40,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // Endpoint is a path under the provider's [FakeProvider.URL].
@@ -62,6 +64,7 @@ type FakeProvider struct {
 	scripts  []script
 	rules    []rule
 	failures map[Endpoint][]failure
+	delays   map[Endpoint]time.Duration
 	requests map[Endpoint][]Request
 	vectors  map[string][]float32
 	scores   map[[2]string]float64
@@ -104,6 +107,7 @@ func NewFakeProvider(t testing.TB) *FakeProvider {
 	p := &FakeProvider{
 		t:        t,
 		failures: map[Endpoint][]failure{},
+		delays:   map[Endpoint]time.Duration{},
 		requests: map[Endpoint][]Request{},
 		vectors:  map[string][]float32{},
 		scores:   map[[2]string]float64{},
@@ -151,6 +155,15 @@ func (p *FakeProvider) FailNext(e Endpoint, status, n int) {
 	p.failures[e] = append(p.failures[e], failure{status: status, n: n})
 }
 
+// Delay makes every request to e wait d before it is answered, so a test can
+// catch a call in flight. A request whose client cancels stops the wait and
+// gets no answer. Zero removes the delay.
+func (p *FakeProvider) Delay(e Endpoint, d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.delays[e] = d
+}
+
 // CallCount is how many requests e received, failed ones included.
 func (p *FakeProvider) CallCount(e Endpoint) int {
 	p.mu.Lock()
@@ -179,10 +192,18 @@ func (p *FakeProvider) serve(e Endpoint, h func(w http.ResponseWriter, body []by
 		p.mu.Lock()
 		p.requests[e] = append(p.requests[e], Request{Header: req.Header.Clone(), Body: body})
 		status := p.takeFailure(e)
+		delay := p.delays[e]
 		p.mu.Unlock()
 		if status != 0 {
 			writeError(w, status, fmt.Sprintf("modeltest: scripted failure %d", status))
 			return
+		}
+		if delay > 0 {
+			select {
+			case <-req.Context().Done():
+				return
+			case <-time.After(delay):
+			}
 		}
 		if !json.Valid(body) {
 			writeError(w, http.StatusBadRequest, "modeltest: body is not JSON")

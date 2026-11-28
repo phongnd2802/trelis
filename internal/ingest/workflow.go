@@ -28,6 +28,12 @@ const (
 	markFailedTimeout = time.Minute
 	// markFailedAttempts is how often marking a Document failed is retried.
 	markFailedAttempts = 3
+	// deleteObjectsTimeout bounds one delete-objects attempt; a large prefix
+	// may take several delete requests.
+	deleteObjectsTimeout = 10 * time.Minute
+	// deleteObjectsAttempts is how often the delete-objects activity is
+	// retried before the cleanup workflow fails.
+	deleteObjectsAttempts = 5
 	// maxReasonLength keeps a stored failure reason short enough to show
 	// beside the Document.
 	maxReasonLength = 500
@@ -106,12 +112,59 @@ func (w *IngestWorkflow) Run(ctx workflow.Context, documentID string) error {
 	return nil
 }
 
+// DeleteDocumentWorkflow is the cleanup workflow started after a Document
+// row is deleted. It first asks Temporal to cancel the Document's ingest
+// workflow, whose ID is the Document ID. A run that is missing or already
+// closed is fine; any other cancel failure is logged and the workflow carries
+// on, because removing the objects does not depend on the cancel. It then
+// runs the idempotent delete-objects activity. The workflow passes only the
+// Document ID and does no I/O, so it stays deterministic.
+type DeleteDocumentWorkflow struct{}
+
+// Run cancels the ingest workflow for documentID, then removes every object
+// under the Document's prefix. A failed delete-objects activity fails the
+// workflow after Temporal has retried it.
+func (w *DeleteDocumentWorkflow) Run(ctx workflow.Context, documentID string) error {
+	log := workflow.GetLogger(ctx)
+	if err := workflow.RequestCancelExternalWorkflow(ctx, ingestWorkflowID(documentID), "").Get(ctx, nil); err != nil {
+		var unknown *temporal.UnknownExternalWorkflowExecutionError
+		if !errors.As(err, &unknown) {
+			log.Warn("document delete: could not cancel the ingest workflow",
+				"document", documentID, "error", err)
+		}
+	}
+	deleteCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: deleteObjectsTimeout,
+		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: deleteObjectsAttempts},
+	})
+	if err := workflow.ExecuteActivity(deleteCtx, DeleteObjectsActivity, documentID).Get(deleteCtx, nil); err != nil {
+		return fmt.Errorf("delete objects of document %s: %w", documentID, err)
+	}
+	return nil
+}
+
 // fail records cause on the Document and returns it, except for a Document
 // that no longer exists: there is no row left to mark. ctx carries the
 // workflow's default activity options, so MarkFailed runs on the ingest queue
 // rather than the model queue.
 func (w *IngestWorkflow) fail(ctx workflow.Context, documentID string, cause error) error {
 	log := workflow.GetLogger(ctx)
+	// A cancellation means the Document was deleted: its row is gone, and a
+	// MarkFailed run with the cancelled context would fail anyway. Return the
+	// cancellation without marking anything. The context is checked as well as
+	// the cause: a batch that failed for real before the cancel arrived still
+	// calls fail with its own error, and that run must close cancelled too. No
+	// workflow.GetVersion is needed: nothing before #24 cancelled an ingest, so
+	// no run in flight has a cancellation in its history to replay against this
+	// branch.
+	if err := ctx.Err(); errors.Is(err, workflow.ErrCanceled) {
+		log.Info("ingest cancelled; the Document is gone", "document", documentID)
+		return err
+	}
+	if temporal.IsCanceledError(cause) {
+		log.Info("ingest cancelled; the Document is gone", "document", documentID)
+		return cause
+	}
 	if applicationErrorType(cause) == documentNotFoundType {
 		log.Warn("the Document no longer exists; nothing to mark", "document", documentID)
 		return fmt.Errorf("ingest document %s: %w", documentID, cause)

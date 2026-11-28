@@ -19,6 +19,17 @@ type IngestStarter interface {
 	StartIngest(ctx context.Context, documentID uuid.UUID) error
 }
 
+// DocumentDeleteStarter starts the workflow that cleans up after a deleted
+// Document (ADR-0006): it cancels the Document's ingest and removes every
+// object under documents/{document_id}/. Its workflow ID is
+// document-delete/{document_id}, so a repeated start joins an open run.
+type DocumentDeleteStarter interface {
+	// StartDocumentDelete starts the cleanup workflow for documentID. It
+	// returns once Temporal has accepted the start and does not wait for the
+	// workflow.
+	StartDocumentDelete(ctx context.Context, documentID uuid.UUID) error
+}
+
 // IngestService is the use cases the ingest activities call. Activities are a
 // boundary like HTTP handlers: they call the service, and only the service
 // starts transactions (ADR-0007).

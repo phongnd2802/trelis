@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/phongnd2802/trelis/internal/application/repository"
+	"github.com/phongnd2802/trelis/internal/application/service/file"
 	"github.com/phongnd2802/trelis/internal/db"
 	werrors "github.com/phongnd2802/trelis/internal/errors"
 	"github.com/phongnd2802/trelis/internal/logger"
@@ -31,14 +32,16 @@ type documentService struct {
 	principals interfaces.PrincipalRepository
 	fileSvc    interfaces.FileService
 	ingest     interfaces.IngestStarter
+	cleanup    interfaces.DocumentDeleteStarter
 }
 
 // NewDocumentService returns the Document use cases.
 func NewDocumentService(store db.Store, repo interfaces.DocumentRepository,
 	principals interfaces.PrincipalRepository, fileSvc interfaces.FileService,
-	ingest interfaces.IngestStarter,
-) interfaces.DocumentService {
-	return &documentService{store: store, repo: repo, principals: principals, fileSvc: fileSvc, ingest: ingest}
+	ingest interfaces.IngestStarter, cleanup interfaces.DocumentDeleteStarter,
+) interfaces.DocumentUseCases {
+	return &documentService{store: store, repo: repo, principals: principals, fileSvc: fileSvc,
+		ingest: ingest, cleanup: cleanup}
 }
 
 // CreateDocumentFromFile creates a pending Document from an uploaded file and
@@ -202,6 +205,51 @@ func (s *documentService) GetDocumentFile(ctx context.Context, id uuid.UUID) (*t
 		return nil, nil, fmt.Errorf("open source file of document %s: %w", doc.ID, err)
 	}
 	return doc, body, nil
+}
+
+// DeleteDocument removes a Document the caller owns; its Chunks, Parent
+// Chunks and Access List go with the row by ON DELETE CASCADE. The Access
+// List grants reading, but deleting is a write, so only the uploader may
+// delete: a reader who is not the owner gets a forbidden error, and a caller
+// who cannot read the Document gets the same not-found error as for a missing
+// one. Once the row is gone it starts the cleanup workflow that removes every
+// object under the Document's prefix (ADR-0006). A failed start is a warning,
+// not a failed delete: the #26 reconciler deletes a prefix whose Document row
+// is gone after its one-hour grace (orphanObjectGrace). An ingest that was not
+// cancelled also ends on its own: its activities find no Document, and any
+// Chunk insert fails on the foreign key.
+func (s *documentService) DeleteDocument(ctx context.Context, id uuid.UUID) error {
+	p, doc, err := s.readableDocument(ctx, id)
+	if err != nil {
+		return err
+	}
+	if doc.OwnerID != p.ID {
+		return werrors.NewForbiddenError("Only the owner can delete the Document")
+	}
+	if err := s.repo.DeleteDocument(ctx, id); err != nil {
+		if errors.Is(err, repository.ErrDocumentNotFound) {
+			return errDocumentNotFound()
+		}
+		return err
+	}
+	// Starting is not part of the row's transaction (ADR-0005): the row is
+	// already gone, and the reconciler removes the prefix if this start fails.
+	if err := s.cleanup.StartDocumentDelete(ctx, id); err != nil {
+		logger.Ctx(ctx).Warn("start document delete workflow failed",
+			zap.Stringer("document", id), zap.Error(err))
+	}
+	return nil
+}
+
+// DeleteDocumentObjects removes every object under the Document's
+// documents/{document_id}/ prefix. It is the use case the cleanup workflow's
+// activity calls after the row is gone; an empty prefix is not an error, so a
+// retried activity is harmless.
+func (s *documentService) DeleteDocumentObjects(ctx context.Context, documentID uuid.UUID) error {
+	if err := s.fileSvc.DeletePrefix(ctx, file.DocumentPrefix(documentID)); err != nil {
+		return fmt.Errorf("delete objects of document %s: %w", documentID, err)
+	}
+	return nil
 }
 
 // ListPagedDocuments returns a page of the Documents the caller can read,

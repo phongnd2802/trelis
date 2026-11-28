@@ -396,6 +396,63 @@
                         }
                     }
                 }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "bearerAuth": []
+                    }
+                ],
+                "description": "Only the Document's owner may delete it. Removes the Document and everything derived from it, cancels its ingest and, once the row is gone, removes every object it stored. A reader who is not the owner gets 403; a caller who cannot read the Document gets 404, the same as for one that does not exist.",
+                "tags": [
+                    "documents"
+                ],
+                "summary": "Delete a Document",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Document ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    },
+                    "400": {
+                        "description": "Invalid Document ID",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Missing or invalid API key",
+                        "schema": {
+                            "$ref": "#/definitions/router.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "The caller can read the Document but is not its owner",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "No readable Document with that ID",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error; a failed API key check answers the router's error body instead",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
             }
         },
         "/documents/{id}/file": {

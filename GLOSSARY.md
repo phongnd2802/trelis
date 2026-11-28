@@ -35,7 +35,7 @@ A named set of Principals that access can be granted to at once.
 _Avoid_: Role, team
 
 **Access List**:
-The Principals and Groups allowed to read a Document; anything derived from that Document is readable only by them.
+The Principals and Groups allowed to read a Document; anything derived from that Document is readable only by them. It grants reading, and only the uploader can delete the Document.
 _Avoid_: Permission, ACL (in prose), RBAC
 
 **Restricted Document**:

@@ -37,12 +37,13 @@ const (
 // the boundary for this package: they log failures once and turn a failure
 // that retrying cannot fix into a non-retryable Temporal error (ADR-0007).
 type Activities struct {
-	ingest interfaces.IngestService
+	ingest  interfaces.IngestService
+	cleanup interfaces.DocumentCleanupService
 }
 
-// NewActivities returns the ingest activities on service.
-func NewActivities(service interfaces.IngestService) *Activities {
-	return &Activities{ingest: service}
+// NewActivities returns the ingest and cleanup activities on their services.
+func NewActivities(ingest interfaces.IngestService, cleanup interfaces.DocumentCleanupService) *Activities {
+	return &Activities{ingest: ingest, cleanup: cleanup}
 }
 
 // ParseAndChunk parses a Document's Source File, stores its Chunks and Parent
@@ -73,11 +74,7 @@ func (a *Activities) ParseAndChunk(ctx context.Context, documentID string) (int,
 		}
 		attempt := activity.GetInfo(ctx).Attempt
 		fields := []zap.Field{zap.Stringer("document", id), zap.Int32("attempt", attempt), zap.Error(err)}
-		if attempt < activityAttempts {
-			logger.Ctx(ctx).Warn("ingest: parse and chunk failed; retrying", fields...)
-		} else {
-			logger.Ctx(ctx).Error("ingest: parse and chunk failed", fields...)
-		}
+		logActivityFailure(ctx, attempt, activityAttempts, "ingest: parse and chunk failed", fields)
 		return 0, err
 	}
 	rejected := make([]string, len(result.Rejected))
@@ -124,11 +121,7 @@ func (a *Activities) EmbedBatch(ctx context.Context, documentID string, from, to
 		if status := api.HTTPStatusCode(err); status != 0 {
 			fields = append(fields, zap.Int("http_status", status))
 		}
-		if attempt < activityAttempts {
-			logger.Ctx(ctx).Warn("ingest: Chunk batch embed failed; retrying", fields...)
-		} else {
-			logger.Ctx(ctx).Error("ingest: Chunk batch embed failed", fields...)
-		}
+		logActivityFailure(ctx, attempt, activityAttempts, "ingest: Chunk batch embed failed", fields)
 		return 0, err
 	}
 	logger.Ctx(ctx).Info("ingest: Chunk batch embedded",
@@ -154,11 +147,7 @@ func (a *Activities) Complete(ctx context.Context, documentID string) error {
 		}
 		attempt := activity.GetInfo(ctx).Attempt
 		fields := []zap.Field{zap.Stringer("document", id), zap.Int32("attempt", attempt), zap.Error(err)}
-		if attempt < activityAttempts {
-			logger.Ctx(ctx).Warn("ingest: completing Document failed; retrying", fields...)
-		} else {
-			logger.Ctx(ctx).Error("ingest: completing Document failed", fields...)
-		}
+		logActivityFailure(ctx, attempt, activityAttempts, "ingest: completing Document failed", fields)
 		return err
 	}
 	logger.Ctx(ctx).Info("ingest: Document completed", zap.Stringer("document", id))
@@ -177,6 +166,36 @@ func (a *Activities) MarkFailed(ctx context.Context, documentID, reason string) 
 		return err
 	}
 	return nil
+}
+
+// DeleteObjects removes every object under a deleted Document's prefix. It is
+// idempotent: an empty prefix is not an error, so a retry or a second cleanup
+// run is harmless. A storage failure is returned as-is, so Temporal retries
+// the activity.
+func (a *Activities) DeleteObjects(ctx context.Context, documentID string) error {
+	id, err := parseDocumentID(documentID)
+	if err != nil {
+		return err
+	}
+	if err := a.cleanup.DeleteDocumentObjects(ctx, id); err != nil {
+		attempt := activity.GetInfo(ctx).Attempt
+		fields := []zap.Field{zap.Stringer("document", id), zap.Int32("attempt", attempt), zap.Error(err)}
+		logActivityFailure(ctx, attempt, deleteObjectsAttempts, "document delete: removing objects failed", fields)
+		return err
+	}
+	logger.Ctx(ctx).Info("document delete: objects removed", zap.Stringer("document", id))
+	return nil
+}
+
+// logActivityFailure logs one failed attempt: WARN while attempts remain, so
+// a retry is expected, and ERROR on the last one, which an operator must look
+// at. fields carry IDs and metadata only.
+func logActivityFailure(ctx context.Context, attempt int32, maxAttempts int, message string, fields []zap.Field) {
+	if int(attempt) < maxAttempts {
+		logger.Ctx(ctx).Warn(message+"; retrying", fields...)
+	} else {
+		logger.Ctx(ctx).Error(message, fields...)
+	}
 }
 
 // parseDocumentID parses the workflow's only input. A malformed ID can never

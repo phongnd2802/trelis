@@ -681,6 +681,48 @@ paths:
       tags:
       - documents
   /documents/{id}:
+    delete:
+      description: Only the Document's owner may delete it. Removes the Document and
+        everything derived from it, cancels its ingest and, once the row is gone,
+        removes every object it stored. A reader who is not the owner gets 403; a
+        caller who cannot read the Document gets 404, the same as for one that does
+        not exist.
+      parameters:
+      - description: Document ID
+        format: uuid
+        in: path
+        name: id
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: Invalid Document ID
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "401":
+          description: Missing or invalid API key
+          schema:
+            $ref: '#/definitions/router.ErrorResponse'
+        "403":
+          description: The caller can read the Document but is not its owner
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "404":
+          description: No readable Document with that ID
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+        "500":
+          description: Internal server error; a failed API key check answers the router's
+            error body instead
+          schema:
+            $ref: '#/definitions/handler.ErrorResponse'
+      security:
+      - bearerAuth: []
+      summary: Delete a Document
+      tags:
+      - documents
     get:
       description: Returns the Document, or 404 when it does not exist or the caller
         cannot read it, so a Restricted Document's existence is not revealed. Only
