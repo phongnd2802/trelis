@@ -57,7 +57,8 @@ func (a *Activities) ParseAndChunk(ctx context.Context, documentID string) (int,
 	if err != nil {
 		return 0, err
 	}
-	result, err := a.ingest.ParseAndChunk(ctx, id)
+	attempt := activity.GetInfo(ctx).Attempt
+	result, err := a.ingest.ParseAndChunk(ctx, id, int(attempt))
 	if err != nil {
 		var unparseable *types.UnparseableError
 		if errors.As(err, &unparseable) {
@@ -72,7 +73,6 @@ func (a *Activities) ParseAndChunk(ctx context.Context, documentID string) (int,
 			logger.Ctx(ctx).Warn("ingest: Document does not exist", zap.Stringer("document", id))
 			return 0, temporal.NewNonRetryableApplicationError(missing.Error(), documentNotFoundType, nil)
 		}
-		attempt := activity.GetInfo(ctx).Attempt
 		fields := []zap.Field{zap.Stringer("document", id), zap.Int32("attempt", attempt), zap.Error(err)}
 		logActivityFailure(ctx, attempt, activityAttempts, "ingest: parse and chunk failed", fields)
 		return 0, err

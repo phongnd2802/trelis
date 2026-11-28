@@ -276,6 +276,7 @@ func run(configPath string, args []string) (err error) {
 		ensureBucket(ctx, files)
 	}
 	docRepo := repository.NewDocumentRepository(dbStore)
+	eventRepo := repository.NewIngestEventRepository(dbStore)
 	// The embedder is optional: without a configured embedding role, ingest
 	// still parses and chunks, and the embed step fails the Document with a
 	// reason an operator can act on.
@@ -312,9 +313,9 @@ func run(configPath string, args []string) (err error) {
 	}
 	starter := ingest.NewStarter(temporal, cfg.Temporal.TaskQueue)
 	// One Starter serves both roles: the ingest start and the delete cleanup.
-	documentService := service.NewDocumentService(dbStore, docRepo, principalRepo, files, starter, starter)
+	documentService := service.NewDocumentService(dbStore, docRepo, principalRepo, eventRepo, files, starter, starter)
 	ingestActivities := ingest.NewActivities(service.NewIngestService(dbStore, docRepo,
-		repository.NewChunkRepository(dbStore), files, parser.NewFormatRouter(false), embedder,
+		repository.NewChunkRepository(dbStore), eventRepo, files, parser.NewFormatRouter(false), embedder,
 		cfg.Chunking.SplitterConfig()), documentService)
 	stopIngestWorker := startWorker(ctx, "ingest", cfg.Temporal.TaskQueue, func() worker.Worker {
 		return ingest.NewWorker(temporal, cfg.Temporal.TaskQueue, cfg.Temporal.ModelTaskQueue,

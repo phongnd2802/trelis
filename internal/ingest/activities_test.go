@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"go.temporal.io/sdk/testsuite"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
@@ -22,16 +23,21 @@ import (
 // methods are never called here, so the embedded interface can stay nil.
 type fakeIngestService struct {
 	interfaces.IngestService
-	result types.ChunkingResult
+	result  types.ChunkingResult
+	attempt int
 }
 
-func (f *fakeIngestService) ParseAndChunk(context.Context, uuid.UUID) (types.ChunkingResult, error) {
+func (f *fakeIngestService) ParseAndChunk(_ context.Context, _ uuid.UUID, attempt int) (types.ChunkingResult, error) {
+	f.attempt = attempt
 	return f.result, nil
 }
 
 func TestParseAndChunkActivityLogsTheChunkingReport(t *testing.T) {
 	core, logs := observer.New(zapcore.DebugLevel)
-	ctx := logger.WithContext(context.Background(), zap.New(core))
+	previous := zap.L()
+	zap.ReplaceGlobals(zap.New(core))
+	t.Cleanup(func() { zap.ReplaceGlobals(previous) })
+
 	documentID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000d1")
 	result := types.ChunkingResult{
 		Chunks:       7,
@@ -42,14 +48,27 @@ func TestParseAndChunkActivityLogsTheChunkingReport(t *testing.T) {
 			{Tier: string(chunker.TierHeading), Reason: "chunk 0 at [0,12) cuts a protected span"},
 		},
 	}
-	activity := NewActivities(&fakeIngestService{result: result}, nil)
+	service := &fakeIngestService{result: result}
+	activity := NewActivities(service, nil)
 
-	got, err := activity.ParseAndChunk(ctx, documentID.String())
+	// The activity environment supplies the activity context ParseAndChunk reads
+	// its attempt from, which a direct call does not.
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(activity.ParseAndChunk)
+	val, err := env.ExecuteActivity(activity.ParseAndChunk, documentID.String())
 	if err != nil {
 		t.Fatalf("ParseAndChunk: %v", err)
 	}
+	var got int
+	if err := val.Get(&got); err != nil {
+		t.Fatalf("read ParseAndChunk result: %v", err)
+	}
 	if got != result.Chunks {
 		t.Errorf("ParseAndChunk = %d, want the stored Chunk count %d", got, result.Chunks)
+	}
+	if service.attempt != 1 {
+		t.Errorf("service got attempt %d, want the activity's first attempt 1", service.attempt)
 	}
 
 	entries := logs.FilterMessage("ingest: Chunks stored").All()

@@ -66,6 +66,10 @@ type IngestWorkflow struct {
 // deterministic.
 func (w *IngestWorkflow) Run(ctx workflow.Context, documentID string) error {
 	log := workflow.GetLogger(ctx)
+	// No workflow.GetVersion is needed for the Ingest Events (#23): they are
+	// written inside the existing activities, so the command sequence this
+	// workflow schedules is unchanged and no run in flight replays against
+	// different history.
 	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		StartToCloseTimeout: parseAndChunkTimeout,
 		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: activityAttempts},

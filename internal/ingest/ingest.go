@@ -14,6 +14,13 @@
 // no vector yet, so the queue's per-second limit is close to a limit on
 // embeddings requests. Finally the complete activity checks that no Chunk is
 // left without an embedding and only then marks the Document completed.
+// Every step also records an Ingest Event in Postgres (internal/types): the
+// parse activity a parse_started for each attempt and a parse_finished in the
+// transaction that commits the Chunks, each embed batch an
+// embed_batch_finished in the transaction that stores its vectors, and the
+// complete and mark-failed activities completed or failed in the transaction
+// that sets the status. A client follows them over the SSE stream of
+// GET /documents/{id}/events and can resume from its Last-Event-ID (#23).
 // A Source File that cannot be parsed, or a Document that cannot be embedded,
 // is not retried: the workflow records the reason on the Document and ends.
 // A transient model or database failure is retried by the affected activity

@@ -3,10 +3,12 @@ package router
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -124,6 +126,60 @@ func TestProbesLogAtDebug(t *testing.T) {
 		if entry.Level != zapcore.DebugLevel {
 			t.Errorf("%s level = %v, want DEBUG", path, entry.Level)
 		}
+	}
+}
+
+func TestAccessLogPassesFlushedFramesToTheClient(t *testing.T) {
+	release := make(chan struct{})
+	h := chi.NewRouter()
+	h.Use(requestID, accessLog, recoverer)
+	h.Get("/stream", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "first")
+		if err := http.NewResponseController(w).Flush(); err != nil {
+			t.Errorf("flush through the access log: %v", err)
+		}
+		<-release
+		_, _ = io.WriteString(w, "second")
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	got := make(chan result, 1)
+	go func() {
+		resp, err := http.Get(srv.URL + "/stream")
+		got <- result{resp, err}
+	}()
+
+	var resp *http.Response
+	select {
+	case r := <-got:
+		if r.err != nil {
+			close(release)
+			t.Fatalf("GET /stream: %v", r.err)
+		}
+		resp = r.resp
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("no response arrived before the handler returned; the access log did not pass Flush through")
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	first := make([]byte, len("first"))
+	if _, err := io.ReadFull(resp.Body, first); err != nil {
+		close(release)
+		t.Fatalf("read the flushed frame: %v", err)
+	}
+	if string(first) != "first" {
+		t.Errorf("first frame = %q, want %q", first, "first")
+	}
+	close(release)
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil || string(rest) != "second" {
+		t.Errorf("rest of the body = %q, %v; want %q", rest, err, "second")
 	}
 }
 

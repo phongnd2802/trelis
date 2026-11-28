@@ -36,6 +36,12 @@ type DocumentService interface {
 	// ListPagedDocuments returns a page of the Documents the caller can read,
 	// newest first.
 	ListPagedDocuments(ctx context.Context, page *types.Pagination) (*types.PageResult, error)
+	// IngestEventsAfter returns the Ingest Events of a Document the caller
+	// can read whose Seq is greater than afterSeq, in order. It checks the
+	// Access List on every call, so a revoked grant or a deleted Document
+	// ends an open event stream on its next poll; a caller who cannot read
+	// the Document gets the same not-found error as for a missing one.
+	IngestEventsAfter(ctx context.Context, id uuid.UUID, afterSeq int64) ([]*types.IngestEvent, error)
 }
 
 // DocumentCleanupService is the use case the delete workflow's activity
