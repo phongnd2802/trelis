@@ -12,7 +12,10 @@ import pytest
 
 from trelis_eval.ablation_run import (
     METRIC_NAMES,
+    MRR,
+    NDCG_10,
     RECALL_5,
+    RECALL_10,
     AblationRun,
     AblationRunFile,
     GoldenSetRef,
@@ -23,12 +26,14 @@ from trelis_eval.ablation_run import (
     QuestionResult,
     QuestionStatus,
     RetrievalConfig,
+    RetrievedRecord,
     RunKind,
     RunSummary,
     load_ablation_run,
 )
+from trelis_eval.attribution import FailureLabel
 from trelis_eval.client import Usage
-from trelis_eval.graders import CORRECTNESS, Grade, GradeStatus
+from trelis_eval.graders import CITATION_PRECISION, CORRECTNESS, Grade, GradeStatus
 from trelis_eval.metrics import mean, nearest_rank_percentile
 from trelis_eval.report import (
     LATENCY_P50,
@@ -278,6 +283,113 @@ def multi_grader_answer_run_file(config, grades_by_name, *, run_id):
     )
 
 
+EVIDENCE = "https://example.com/a"
+OTHER_EVIDENCE = "https://example.com/b"
+
+
+def ok(score):
+    return Grade(score=score, rationale="graded", status=GradeStatus.OK)
+
+
+def failed():
+    return Grade(score=None, rationale="judge failed", status=GradeStatus.GRADER_ERROR)
+
+
+def not_applicable():
+    return Grade(score=None, rationale="nothing to check", status=GradeStatus.NOT_APPLICABLE)
+
+
+def file_from_questions(config, questions, *, run_id="run-1", kind=RunKind.RETRIEVAL):
+    """Build one results file from hand-built questions."""
+    questions = tuple(questions)
+    scored = [question for question in questions if question.status is QuestionStatus.SCORED]
+    metrics = [question.metrics for question in scored if question.metrics is not None]
+    latencies = [question.latency_ms for question in scored]
+    graders = (
+        tuple(sorted({name for question in questions for name in question.grades}))
+        if kind is RunKind.ANSWER
+        else ()
+    )
+    summary = RunSummary(
+        recall_at_5=mean([metric.recall_at_5 for metric in metrics]),
+        recall_at_10=mean([metric.recall_at_10 for metric in metrics]),
+        mrr=mean([metric.mrr for metric in metrics]),
+        ndcg_at_10=mean([metric.ndcg_at_10 for metric in metrics]),
+        scored=len(scored),
+        skipped=sum(1 for question in questions if question.status is QuestionStatus.SKIPPED),
+        error=sum(1 for question in questions if question.status is QuestionStatus.ERROR),
+        latency_p50=nearest_rank_percentile(latencies, 50),
+        latency_p95=nearest_rank_percentile(latencies, 95),
+    )
+    return AblationRunFile(
+        run_id=run_id,
+        golden_set=GoldenSetRef(path=GOLDEN_PATH, sha256=SHA256, questions=len(questions)),
+        manifest=ManifestRef(
+            path="eval/data/multihop-rag/strat500-manifest.jsonl",
+            sha256="b" * 64,
+        ),
+        base_url="http://localhost:8080",
+        harness_version="0.1.0",
+        run=AblationRun(
+            config=RetrievalConfig(name=config, techniques=(config,)),
+            top_k=10,
+            started_at="2026-01-01T00:00:00+00:00",
+            finished_at="2026-01-01T00:01:00+00:00",
+            questions=questions,
+            summary=summary,
+            kind=kind,
+            judge_model="judge-model" if kind is RunKind.ANSWER else None,
+            graders=graders,
+        ),
+    )
+
+
+def question_in(index, slices, values, *, latency_ms=10.0):
+    """Build one scored retrieval question in the given Slices."""
+    return replace(scored_question(index, values, latency_ms), slices=tuple(slices))
+
+
+def graded_question(
+    index,
+    slices,
+    correctness,
+    citation=None,
+    *,
+    evidence=(EVIDENCE,),
+    retrieved=(EVIDENCE,),
+):
+    """Build one scored answer with the given Grades and retrieved Documents."""
+    grades = {}
+    if correctness is not None:
+        grades[CORRECTNESS] = correctness
+    if citation is not None:
+        grades[CITATION_PRECISION] = citation
+    records = tuple(
+        RetrievedRecord(
+            chunk_id=f"chunk-{index}-{position}",
+            document_id=f"document-{index}-{position}",
+            source_id=source_id,
+            score=1.0,
+            scores={},
+        )
+        for position, source_id in enumerate(retrieved)
+    )
+    question = answer_question(index, 1.0)
+    return replace(
+        question,
+        slices=tuple(slices),
+        evidence=tuple(evidence),
+        retrieved=records,
+        metrics=None if not evidence else question.metrics,
+        grades=grades,
+    )
+
+
+def table_cells(line):
+    """Split one Markdown table row into its cells."""
+    return [cell.strip() for cell in line.strip().strip("|").split(" | ")]
+
+
 def test_correctness_uses_only_ok_grades_and_shows_the_error_count():
     run = answer_run_file("dense", [1.0, 0.0, 1.0, None])
     scores = [1.0, 0.0, 1.0]
@@ -495,6 +607,27 @@ def test_one_column_per_grader_in_registry_order_then_sorted_unknown_names():
     assert matrix.rows[1].graders == frozenset({"correctness"})
 
 
+BASELINE_MAIN_MATRIX = "\n".join(
+    (
+        "| Retrieval Config | Recall@5 | Recall@10 | MRR | nDCG@10 | Latency p50 (ms) | "
+        "Latency p95 (ms) | Scored | Skipped | Error | Concurrency |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| bm25+dense+rerank | 0.736 [0.710, 0.757] | 0.840 [0.820, 0.863] | "
+        "0.895 [0.872, 0.927] | 0.774 [0.748, 0.795] | 1221.3 [1217.7, 1227.8] | "
+        "1409.9 [1389.4, 1514.3] | 441 | 59 | 0 | 4 |",
+        "| bm25+dense | 0.666 [0.640, 0.690] | 0.811 [0.786, 0.828] | "
+        "0.828 [0.802, 0.859] | 0.714 [0.688, 0.735] | 243.5 [242.3, 245.3] | "
+        "259.0 [254.6, 262.3] | 441 | 59 | 0 | 4 |",
+        "| bm25 | 0.621 [0.595, 0.660] | 0.744 [0.718, 0.766] | "
+        "0.780 [0.759, 0.827] | 0.658 [0.635, 0.680] | 21.0 [20.7, 21.2] | "
+        "29.1 [28.6, 29.9] | 441 | 59 | 0 | 4 |",
+        "| dense | 0.630 [0.599, 0.651] | 0.779 [0.759, 0.796] | "
+        "0.797 [0.768, 0.820] | 0.678 [0.661, 0.701] | 23925.0 [23415.9, 24410.8] | "
+        "34511.5 [32487.8, 35237.7] | 441 | 59 | 0 | 4 |",
+    )
+)
+
+
 def test_the_committed_version_1_baselines_still_render():
     baselines = sorted((Path(__file__).parent.parent / "baselines").glob("*.jsonl"))
     assert baselines
@@ -511,6 +644,25 @@ def test_the_committed_version_1_baselines_still_render():
     assert all(row.estimates.get(CORRECTNESS) is None for row in matrix.rows)
     markdown = render_markdown(matrix)
     assert "Correctness" not in markdown
+    start = markdown.index("| Retrieval Config")
+    end = markdown.index("\n\n## Runs")
+    assert markdown[start:end] == BASELINE_MAIN_MATRIX
+    assert [table.name for table in matrix.slice_tables] == [
+        "comparison_query",
+        "inference_query",
+        "null_query",
+        "temporal_query",
+        "hops-0",
+        "hops-2",
+        "hops-3",
+        "hops-4",
+    ]
+    null_query = next(table for table in matrix.slice_tables if table.name == "null_query")
+    assert null_query.questions == 59
+    assert all(row.questions == 59 and row.scored == 0 for row in null_query.rows)
+    assert "## Slices" in markdown
+    assert "### comparison_query" in markdown
+    assert "No answer Ablation Run" in markdown.split("## Failure Attribution", 1)[1]
     assert "<table>" in render_html(matrix)
 
 
@@ -761,3 +913,346 @@ def test_render_html_marks_a_report_mixing_concurrencies():
 
     assert "different concurrency" in page.lower()
     assert "different concurrency" in markdown.lower()
+
+
+def test_slice_tables_list_question_types_then_hops_by_number():
+    questions = [
+        question_in(0, ("inference_query", "hops-10"), (1.0, 1.0, 1.0, 1.0)),
+        question_in(1, ("comparison_query", "hops-2"), (0.0, 1.0, 0.5, 0.7)),
+        question_in(2, ("hops-2",), (0.5, 0.5, 0.0, 0.2)),
+        question_in(3, ("temporal_query", "hops-10"), (1.0, 0.0, 0.0, 0.0)),
+        replace(
+            unscored_question(4, QuestionStatus.SKIPPED),
+            slices=("temporal_query", "hops-10"),
+        ),
+        replace(
+            unscored_question(5, QuestionStatus.ERROR),
+            slices=("error_query", "hops-7"),
+        ),
+    ]
+
+    matrix = build_matrix([file_from_questions("dense", questions)], seed=1, resamples=50)
+
+    assert [table.name for table in matrix.slice_tables] == [
+        "comparison_query",
+        "error_query",
+        "inference_query",
+        "temporal_query",
+        "hops-2",
+        "hops-7",
+        "hops-10",
+    ]
+    assert [table.questions for table in matrix.slice_tables] == [1, 1, 1, 2, 2, 1, 3]
+    error_table = next(table for table in matrix.slice_tables if table.name == "error_query")
+    [error_row] = error_table.rows
+    assert (error_table.questions, error_row.questions, error_row.scored) == (1, 1, 0)
+
+
+def test_a_slice_table_holds_its_slices_metrics_with_a_slice_seeded_interval():
+    questions = [
+        question_in(0, ("comparison_query",), (1.0, 1.0, 1.0, 1.0)),
+        question_in(1, ("comparison_query",), (0.0, 1.0, 0.5, 0.7)),
+        question_in(2, ("hops-2",), (0.5, 0.5, 0.0, 0.2)),
+    ]
+
+    matrix = build_matrix([file_from_questions("dense", questions)], seed=3, resamples=200)
+
+    table = next(table for table in matrix.slice_tables if table.name == "comparison_query")
+    [row] = table.rows
+    assert row.scored == 2
+    assert row.estimates[RECALL_5].point == pytest.approx(0.5)
+    assert row.estimates[RECALL_10].point == pytest.approx(1.0)
+    assert row.estimates[MRR].point == pytest.approx(0.75)
+    assert row.estimates[NDCG_10].point == pytest.approx(0.85)
+    expected = bootstrap_ci(
+        [1.0, 0.0],
+        statistics_mean,
+        rng=random.Random("3:dense:comparison_query:recall@5"),
+        resamples=200,
+    )
+    assert expected is not None
+    assert (row.estimates[RECALL_5].low, row.estimates[RECALL_5].high) == expected
+
+
+def test_a_slice_table_holds_the_graders_mean_and_outcomes():
+    questions = [
+        replace(answer_question(0, 1.0), slices=("comparison_query",)),
+        replace(answer_question(1, 0.0), slices=("comparison_query",)),
+        replace(answer_question(2, 1.0), slices=("hops-2",)),
+    ]
+
+    matrix = build_matrix(
+        [file_from_questions("dense", questions, kind=RunKind.ANSWER)],
+        seed=1,
+        resamples=100,
+    )
+
+    assert matrix.graders == (CORRECTNESS,)
+    table = next(table for table in matrix.slice_tables if table.name == "comparison_query")
+    [row] = table.rows
+    assert row.scored == 2
+    assert row.estimates[CORRECTNESS].point == pytest.approx(0.5)
+    assert row.grader_outcomes[CORRECTNESS].scores == (1.0, 0.0)
+    section = render_markdown(matrix).split("### comparison_query", 1)[1]
+    table_row = next(line for line in section.splitlines() if line.startswith("| dense |"))
+    assert "0.500 [" in table_row
+
+
+def test_each_slice_draws_its_interval_from_its_own_seeded_rng():
+    questions = [
+        question_in(index, ("alpha",), (value, 1.0, 1.0, 1.0))
+        for index, value in enumerate(VARIED_VALUES)
+    ] + [
+        question_in(100 + index, ("beta",), (value, 1.0, 1.0, 1.0))
+        for index, value in enumerate(VARIED_VALUES)
+    ]
+
+    matrix = build_matrix([file_from_questions("dense", questions)], seed=3, resamples=500)
+
+    alpha = next(table for table in matrix.slice_tables if table.name == "alpha")
+    beta = next(table for table in matrix.slice_tables if table.name == "beta")
+    alpha_estimate = alpha.rows[0].estimates[RECALL_5]
+    beta_estimate = beta.rows[0].estimates[RECALL_5]
+    assert alpha_estimate is not None
+    assert beta_estimate is not None
+    alpha_expected = bootstrap_ci(
+        VARIED_VALUES,
+        mean,
+        rng=random.Random("3:dense:alpha:recall@5"),
+        resamples=500,
+    )
+    beta_expected = bootstrap_ci(
+        VARIED_VALUES,
+        mean,
+        rng=random.Random("3:dense:beta:recall@5"),
+        resamples=500,
+    )
+    assert (alpha_estimate.low, alpha_estimate.high) == alpha_expected
+    assert (beta_estimate.low, beta_estimate.high) == beta_expected
+    assert (alpha_estimate.low, alpha_estimate.high) != (
+        beta_estimate.low,
+        beta_estimate.high,
+    )
+    again = build_matrix([file_from_questions("dense", questions)], seed=3, resamples=500)
+    assert render_markdown(matrix) == render_markdown(again)
+
+
+def test_a_config_without_the_slice_shows_dashes_in_every_cell():
+    dense = [question_in(0, ("comparison_query", "hops-2"), (1.0, 1.0, 1.0, 1.0))]
+    bm25 = [question_in(1, ("hops-2",), (0.0, 0.0, 0.0, 0.0))]
+
+    matrix = build_matrix(
+        [file_from_questions("dense", dense), file_from_questions("bm25", bm25)],
+        seed=1,
+        resamples=50,
+    )
+
+    table = next(table for table in matrix.slice_tables if table.name == "comparison_query")
+    rows = {row.config: row for row in table.rows}
+    assert rows["bm25"].questions == 0
+    assert rows["bm25"].scored == 0
+    assert all(estimate is None for estimate in rows["bm25"].estimates.values())
+
+    section = render_markdown(matrix).split("### comparison_query", 1)[1]
+    table_row = next(line for line in section.splitlines() if line.startswith("| bm25 |"))
+    assert table_cells(table_row) == ["bm25", "—", "—", "—", "—", "—"]
+
+
+def test_a_slice_with_only_errored_questions_still_gets_a_table():
+    questions = [
+        replace(
+            unscored_question(0, QuestionStatus.ERROR),
+            slices=("temporal_query", "hops-2"),
+        ),
+        question_in(1, ("inference_query", "hops-1"), (1.0, 1.0, 1.0, 1.0)),
+    ]
+
+    matrix = build_matrix([file_from_questions("dense", questions)], seed=1, resamples=50)
+
+    table = next(table for table in matrix.slice_tables if table.name == "temporal_query")
+    [row] = table.rows
+    assert (table.questions, row.questions, row.scored) == (1, 1, 0)
+    section = render_markdown(matrix).split("### temporal_query", 1)[1]
+    table_row = next(line for line in section.splitlines() if line.startswith("| dense |"))
+    assert table_cells(table_row) == ["dense", "n/a", "n/a", "n/a", "n/a", "0"]
+
+
+def test_failure_attribution_counts_and_shares_per_config_and_slice():
+    questions = [
+        graded_question(0, ("comparison_query",), ok(1.0), ok(1.0)),
+        graded_question(1, ("comparison_query",), ok(1.0), ok(0.5)),
+        graded_question(2, ("comparison_query",), ok(1.0), not_applicable()),
+        graded_question(3, ("comparison_query",), ok(1.0), failed()),
+        graded_question(4, ("comparison_query",), ok(1.0)),
+        graded_question(
+            5,
+            ("hops-2",),
+            ok(0.0),
+            ok(1.0),
+            evidence=(EVIDENCE, OTHER_EVIDENCE),
+            retrieved=(EVIDENCE,),
+        ),
+        graded_question(6, ("hops-2",), ok(0.0), ok(1.0)),
+        graded_question(7, ("hops-2",), ok(0.0), ok(1.0), evidence=(), retrieved=()),
+        graded_question(8, ("hops-2",), failed()),
+        graded_question(9, ("hops-2",), not_applicable()),
+    ]
+
+    matrix = build_matrix(
+        [file_from_questions("dense", questions, kind=RunKind.ANSWER)],
+        seed=1,
+        resamples=50,
+    )
+
+    [table] = matrix.attribution_tables
+    assert table.config == "dense"
+    assert [row.name for row in table.rows] == ["All", "comparison_query", "hops-2"]
+    rows = {row.name: row for row in table.rows}
+    assert rows["All"].graded == 10
+    assert rows["All"].counts == {
+        FailureLabel.CORRECT: 1,
+        FailureLabel.RETRIEVAL_MISS: 1,
+        FailureLabel.GENERATION_ERROR: 2,
+        FailureLabel.CITATION_ERROR: 2,
+        FailureLabel.UNATTRIBUTED: 4,
+    }
+    assert rows["comparison_query"].graded == 5
+    assert rows["comparison_query"].counts == {
+        FailureLabel.CORRECT: 1,
+        FailureLabel.RETRIEVAL_MISS: 0,
+        FailureLabel.GENERATION_ERROR: 0,
+        FailureLabel.CITATION_ERROR: 2,
+        FailureLabel.UNATTRIBUTED: 2,
+    }
+    assert rows["hops-2"].graded == 5
+    assert rows["hops-2"].counts == {
+        FailureLabel.CORRECT: 0,
+        FailureLabel.RETRIEVAL_MISS: 1,
+        FailureLabel.GENERATION_ERROR: 2,
+        FailureLabel.CITATION_ERROR: 0,
+        FailureLabel.UNATTRIBUTED: 2,
+    }
+
+    section = render_markdown(matrix).split("## Failure Attribution", 1)[1]
+    all_row = next(line for line in section.splitlines() if line.startswith("| All |"))
+    assert table_cells(all_row) == [
+        "All",
+        "10",
+        "1 (10%)",
+        "1 (10%)",
+        "2 (20%)",
+        "2 (20%)",
+        "4 (40%)",
+    ]
+
+
+def test_only_answer_runs_get_a_failure_attribution_table():
+    retrieval = file_from_questions("bm25", [question_in(0, ("hops-1",), (1.0, 1.0, 1.0, 1.0))])
+    answer = file_from_questions(
+        "dense",
+        [graded_question(0, ("hops-1",), ok(1.0), ok(1.0))],
+        kind=RunKind.ANSWER,
+        run_id="answer-1",
+    )
+
+    matrix = build_matrix([retrieval, answer], seed=1, resamples=50)
+
+    assert [table.config for table in matrix.attribution_tables] == ["dense"]
+    section = render_markdown(matrix).split("## Failure Attribution", 1)[1]
+    assert "### dense" in section
+    assert "### bm25" not in section
+
+
+def test_each_answer_run_gets_its_own_failure_attribution_table():
+    correct_run = file_from_questions(
+        "dense",
+        [graded_question(0, ("hops-1",), ok(1.0), ok(1.0))],
+        kind=RunKind.ANSWER,
+        run_id="answer-1",
+    )
+    wrong_run = file_from_questions(
+        "bm25",
+        [graded_question(1, ("hops-1",), ok(0.0), ok(1.0))],
+        kind=RunKind.ANSWER,
+        run_id="answer-2",
+    )
+
+    matrix = build_matrix([correct_run, wrong_run], seed=1, resamples=50)
+
+    assert [table.config for table in matrix.attribution_tables] == ["dense", "bm25"]
+    dense = next(table for table in matrix.attribution_tables if table.config == "dense")
+    bm25 = next(table for table in matrix.attribution_tables if table.config == "bm25")
+    assert dense.rows[0].counts[FailureLabel.CORRECT] == 1
+    assert bm25.rows[0].counts[FailureLabel.GENERATION_ERROR] == 1
+
+
+def test_an_attribution_row_with_nothing_graded_shows_a_dash_share():
+    retrieval = file_from_questions(
+        "bm25", [question_in(0, ("comparison_query",), (1.0, 1.0, 1.0, 1.0))]
+    )
+    answer = file_from_questions(
+        "dense",
+        [graded_question(1, ("hops-1",), ok(1.0), ok(1.0))],
+        kind=RunKind.ANSWER,
+        run_id="answer-1",
+    )
+
+    matrix = build_matrix([retrieval, answer], seed=1, resamples=50)
+
+    [table] = matrix.attribution_tables
+    assert [row.name for row in table.rows] == ["All", "comparison_query", "hops-1"]
+    empty = next(row for row in table.rows if row.name == "comparison_query")
+    assert empty.graded == 0
+    assert all(count == 0 for count in empty.counts.values())
+    section = render_markdown(matrix).split("### dense", 1)[1]
+    table_row = next(
+        line for line in section.splitlines() if line.startswith("| comparison_query |")
+    )
+    assert table_cells(table_row) == [
+        "comparison_query",
+        "0",
+        "0 (—)",
+        "0 (—)",
+        "0 (—)",
+        "0 (—)",
+        "0 (—)",
+    ]
+
+
+def test_a_retrieval_only_report_says_there_is_no_answer_run():
+    matrix = build_matrix(
+        [file_from_questions("dense", [question_in(0, ("hops-1",), (1.0, 1.0, 1.0, 1.0))])],
+        seed=1,
+        resamples=50,
+    )
+
+    assert matrix.attribution_tables == ()
+    markdown = render_markdown(matrix)
+    section = markdown.split("## Failure Attribution", 1)[1]
+    assert "No answer Ablation Run" in section
+    assert "###" not in section
+    assert "No answer Ablation Run" in render_html(matrix)
+
+
+def test_both_renderers_carry_the_slice_and_failure_sections_byte_identically():
+    questions = [graded_question(0, ("comparison_query", "hops-2"), ok(1.0), ok(1.0))]
+    first = build_matrix(
+        [file_from_questions("dense", questions, kind=RunKind.ANSWER)],
+        seed=1,
+        resamples=50,
+    )
+    second = build_matrix(
+        [file_from_questions("dense", questions, kind=RunKind.ANSWER)],
+        seed=1,
+        resamples=50,
+    )
+
+    markdown = render_markdown(first)
+    page = render_html(first)
+
+    assert "## Slices" in markdown
+    assert "## Failure Attribution" in markdown
+    assert "<h2>Slices</h2>" in page
+    assert "<h2>Failure Attribution</h2>" in page
+    assert markdown == render_markdown(second)
+    assert page == render_html(second)

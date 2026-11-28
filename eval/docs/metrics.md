@@ -284,6 +284,79 @@ not. Latency is measured under the run's `concurrency`, which is shown per
 row; a report mixing concurrency levels says so, because latency compares
 only at the same one.
 
+## Slices in the report
+
+The report breaks every metric and Grader down by Slice after the main
+matrix, with one table per Slice.
+
+The Slices are the ones carried by any question of the runs in the report,
+whatever its status, so a Slice whose questions all errored still gets a
+table. Question-type Slices — every name that is not `hops-N` — come first,
+sorted by name, then `hops-N` Slices in ascending `N`, so `hops-2` precedes
+`hops-10`. Each table is headed by the Slice and the number of Golden Set
+questions carrying it (`167 questions`), counted once even when several runs
+in the report share the Golden Set. That count is every question carrying the
+Slice, whatever its status; a row's `Scored` count is how many of them the
+config actually scored.
+
+A table has one row per Retrieval Config and the same metric and Grader
+columns as the main matrix, plus a `Scored` column: the number of that
+Slice's questions the config scored. Latency, the skipped and error counts and
+the concurrency are left out, because a Slice is about quality, not load.
+
+Every estimate is recomputed over the Slice's observations: Recall@5,
+Recall@10, MRR and nDCG@10 over the Slice's scored questions that have
+metrics, and a Grader over the `ok` Grades in the Slice, with the same
+`· N errors · N n/a` counts beside it. The interval is the same seeded
+percentile bootstrap, but each (config, Slice, metric) draws from its own
+`random.Random(f"{seed}:{config}:{slice}:{metric}")`, so the tables are
+independent of each other and of the main matrix. A config whose run has no
+question in the Slice shows `—` in every cell, `Scored` included. A config
+that has questions there but scored none of them shows `n/a` for a metric with
+no observation and `0` scored; a Grader with no `ok` grade shows `—` plus its
+non-zero counts, like the main matrix. A Slice question with no retrieval
+metric, such as a `null_query` answered in an answer run, shows `n/a` because
+nothing was measured, not `—`.
+
+## Failure Attribution
+
+For each answer Ablation Run the report adds one Failure Attribution table:
+one row for `All` and one per Slice, in the Slices section's order. The
+columns are `Graded`, `Correct`, `Retrieval miss`, `Generation error`,
+`Citation error` and `Unattributed`; each cell is the count and its share of
+that row's `Graded`, for example `12 (24%)`. `Graded` is the number of scored
+questions in the row. A row with nothing graded shows `0 (—)`, because there
+is no share to take.
+
+Each scored question gets exactly one label, in this order:
+
+1. **Unattributed** when the `correctness` Grade is missing, `grader_error`
+   or `not_applicable`: there is no outcome to attribute.
+2. A **wrong** answer, one whose correctness score is below 1.0, is a
+   **Retrieval miss** when the question has evidence and at least one evidence
+   `source_id` is absent from the question's retrieved records. The whole
+   retrieved list counts, not just the first 10 ranks, because the evidence
+   may sit deeper in the `top_k` candidate pool. Otherwise it is a
+   **Generation error**: every evidence Document was retrieved, or the
+   question has no evidence (a `null_query`), so retrieval did not starve the
+   generator.
+3. A **correct** answer, one whose correctness score is 1.0, is checked
+   against the `citation_precision` Grade. `ok` with a score below 1.0, or
+   `not_applicable` (the answer cites nothing), is a **Citation error**; `ok`
+   at 1.0 is **Correct**. A missing Grade or a `grader_error` leaves it
+   **Unattributed**, because the citations could not be checked.
+
+One missing hop already counts as a retrieval miss because a multi-hop answer
+needs every evidence Document: if one was never retrieved, the generator could
+not have supported that part of the answer, whatever it did with the rest. An
+uncited correct answer is a citation error because the answer is right but
+gives the reader nothing to verify it against, which is what the
+`citation_precision` Grader reports as `not_applicable`.
+
+The labels are computed by the report from the results file's Grades, evidence
+and retrieved records; the results-file schema does not change. A report with
+no answer Ablation Run says so in one line instead of showing tables.
+
 ## Questions that are not scored
 
 In a retrieval run, a `null_query` has no evidence: its expected answer is

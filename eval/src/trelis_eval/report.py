@@ -3,9 +3,11 @@
 The report is built from Ablation Run results files alone. Every Retrieval
 Config gets a row with the four metric means, one column per Grader in the
 report, and the two latency percentiles, each with a seeded percentile-bootstrap
-confidence interval, plus the counts and the run's concurrency. The same files
-and seed render byte-identical Markdown and HTML: no wall-clock time, no
-machine paths and no randomness outside the seeded RNG.
+confidence interval, plus the counts and the run's concurrency. Each Slice then
+gets a table of the same metric and Grader estimates, and each answer run gets a
+Failure Attribution table that labels its scored questions by the stage that
+failed. The same files and seed render byte-identical Markdown and HTML: no
+wall-clock time, no machine paths and no randomness outside the seeded RNG.
 ``eval/docs/metrics.md`` holds the definitions.
 """
 
@@ -29,10 +31,13 @@ from .ablation_run import (
     AblationRunFile,
     GoldenSetRef,
     GradeOutcomes,
+    QuestionResult,
     QuestionStatus,
     RunKind,
     grade_outcomes,
 )
+from .attribution import FailureLabel, attribute_failure
+from .golden import hop_count
 from .graders import default_grader_names, grader_label
 from .metrics import mean, nearest_rank_percentile
 
@@ -74,6 +79,44 @@ class MatrixRow:
 
 
 @dataclass(frozen=True)
+class SliceRow:
+    """One Retrieval Config's estimates over one Slice of its Ablation Run."""
+
+    config: str
+    questions: int
+    scored: int
+    graders: frozenset[str]
+    grader_outcomes: dict[str, GradeOutcomes]
+    estimates: dict[str, MetricEstimate | None]
+
+
+@dataclass(frozen=True)
+class SliceTable:
+    """One Slice's table: its Golden Set question count and one row per config."""
+
+    name: str
+    questions: int
+    rows: tuple[SliceRow, ...]
+
+
+@dataclass(frozen=True)
+class AttributionRow:
+    """One Failure Attribution row: ``All`` or one Slice, with its label counts."""
+
+    name: str
+    graded: int
+    counts: dict[FailureLabel, int]
+
+
+@dataclass(frozen=True)
+class AttributionTable:
+    """One answer Ablation Run's Failure Attribution, one row per Slice."""
+
+    config: str
+    rows: tuple[AttributionRow, ...]
+
+
+@dataclass(frozen=True)
 class AblationMatrix:
     """One row per Retrieval Config, with the metadata the rows share."""
 
@@ -84,6 +127,8 @@ class AblationMatrix:
     confidence: float
     graders: tuple[str, ...]
     rows: tuple[MatrixRow, ...]
+    slice_tables: tuple[SliceTable, ...]
+    attribution_tables: tuple[AttributionTable, ...]
 
 
 def bootstrap_ci(
@@ -139,48 +184,30 @@ def build_matrix(
         raise ValueError("no results files to report on")
     _check_comparable(run_files)
     grader_names = _report_grader_names(run_files)
+    slice_names = _slice_names(run_files)
+    slice_question_counts = _slice_question_counts(run_files, slice_names)
 
     rows = []
+    slice_rows: dict[str, list[SliceRow]] = {name: [] for name in slice_names}
+    attribution_tables = []
     for run_file in run_files:
         run = run_file.run
-        metric_values: dict[str, list[float]] = {name: [] for name in METRIC_NAMES}
-        latencies: list[float] = []
-        run_graders = _graders_in_run(run)
-        grader_outcomes: dict[str, GradeOutcomes] = {}
-        for name in grader_names:
-            if name in run_graders:
-                grader_outcomes[name] = grade_outcomes(run.questions, name)
-
-        for result in run.questions:
-            if result.status is not QuestionStatus.SCORED:
-                continue
-            latencies.append(result.latency_ms)
-            if result.metrics is not None:
-                values = result.metrics.to_json()
-                for name in METRIC_NAMES:
-                    metric_values[name].append(values[name])
-
         config = run.config.name
-        series = [
-            *((name, metric_values[name], _resample_mean) for name in METRIC_NAMES),
-            *((name, outcome.scores, _resample_mean) for name, outcome in grader_outcomes.items()),
-            (LATENCY_P50, latencies, _resample_percentile(50)),
-            (LATENCY_P95, latencies, _resample_percentile(95)),
-        ]
-        estimates: dict[str, MetricEstimate | None] = {
-            name: _estimate(
-                observations,
-                statistic,
-                seed=seed,
-                config=config,
-                metric=name,
-                resamples=resamples,
-                confidence=confidence,
-            )
-            for name, observations, statistic in series
-        }
-        for name in grader_names:
-            estimates.setdefault(name, None)
+        run_graders = _graders_in_run(run)
+        metric_values, latencies, grader_outcomes = _observations(
+            run.questions, grader_names, run_graders
+        )
+        estimates = _row_estimates(
+            [
+                *_mean_series(metric_values, grader_outcomes),
+                (LATENCY_P50, latencies, _resample_percentile(50)),
+                (LATENCY_P95, latencies, _resample_percentile(95)),
+            ],
+            grader_names,
+            key_parts=(str(seed), config),
+            resamples=resamples,
+            confidence=confidence,
+        )
         rows.append(
             MatrixRow(
                 config=config,
@@ -197,6 +224,32 @@ def build_matrix(
             )
         )
 
+        for name in slice_names:
+            questions = [result for result in run.questions if name in result.slices]
+            scored = sum(1 for result in questions if result.status is QuestionStatus.SCORED)
+            slice_metric_values, _, slice_outcomes = _observations(
+                questions, grader_names, run_graders
+            )
+            slice_rows[name].append(
+                SliceRow(
+                    config=config,
+                    questions=len(questions),
+                    scored=scored,
+                    graders=run_graders,
+                    grader_outcomes=slice_outcomes,
+                    estimates=_row_estimates(
+                        _mean_series(slice_metric_values, slice_outcomes),
+                        grader_names,
+                        key_parts=(str(seed), config, name),
+                        resamples=resamples,
+                        confidence=confidence,
+                    ),
+                )
+            )
+
+        if run.kind is RunKind.ANSWER:
+            attribution_tables.append(_attribution_table(config, run.questions, slice_names))
+
     first = run_files[0]
     return AblationMatrix(
         golden_set=first.golden_set,
@@ -206,7 +259,134 @@ def build_matrix(
         confidence=confidence,
         graders=grader_names,
         rows=tuple(rows),
+        slice_tables=tuple(
+            SliceTable(
+                name=name,
+                questions=slice_question_counts[name],
+                rows=tuple(slice_rows[name]),
+            )
+            for name in slice_names
+        ),
+        attribution_tables=tuple(attribution_tables),
     )
+
+
+def _observations(
+    results: Sequence[QuestionResult],
+    grader_names: Sequence[str],
+    run_graders: frozenset[str],
+) -> tuple[dict[str, list[float]], list[float], dict[str, GradeOutcomes]]:
+    """Collect one table row's metric values, latencies and Grader outcomes."""
+    metric_values: dict[str, list[float]] = {name: [] for name in METRIC_NAMES}
+    latencies: list[float] = []
+    for result in results:
+        if result.status is not QuestionStatus.SCORED:
+            continue
+        latencies.append(result.latency_ms)
+        if result.metrics is not None:
+            values = result.metrics.to_json()
+            for name in METRIC_NAMES:
+                metric_values[name].append(values[name])
+    grader_outcomes = {
+        name: grade_outcomes(results, name) for name in grader_names if name in run_graders
+    }
+    return metric_values, latencies, grader_outcomes
+
+
+_Series = tuple[str, Sequence[float], Callable[[Sequence[float]], float]]
+
+
+def _mean_series(
+    metric_values: dict[str, list[float]],
+    grader_outcomes: dict[str, GradeOutcomes],
+) -> list[_Series]:
+    """Return one table row's metric and Grader series, before any latency series."""
+    return [
+        *((name, metric_values[name], _resample_mean) for name in METRIC_NAMES),
+        *((name, outcome.scores, _resample_mean) for name, outcome in grader_outcomes.items()),
+    ]
+
+
+def _row_estimates(
+    series: Sequence[_Series],
+    grader_names: Sequence[str],
+    *,
+    key_parts: Sequence[str],
+    resamples: int,
+    confidence: float,
+) -> dict[str, MetricEstimate | None]:
+    """Estimate every series of one table row, with an interval each.
+
+    Each series draws from its own RNG keyed by ``key_parts`` and the series
+    name, so a Slice row can name its Slice and reordering rows cannot move
+    another row's interval.
+    """
+    estimates: dict[str, MetricEstimate | None] = {
+        name: _estimate(
+            observations,
+            statistic,
+            key=":".join((*key_parts, name)),
+            resamples=resamples,
+            confidence=confidence,
+        )
+        for name, observations, statistic in series
+    }
+    for name in grader_names:
+        estimates.setdefault(name, None)
+    return estimates
+
+
+def _slice_names(run_files: Sequence[AblationRunFile]) -> tuple[str, ...]:
+    """Return the Slices every question carries: question types, then ``hops-N`` by N."""
+    names = {
+        name
+        for run_file in run_files
+        for result in run_file.run.questions
+        for name in result.slices
+    }
+    question_types = []
+    hops = []
+    for name in names:
+        count = hop_count(name)
+        if count is None:
+            question_types.append(name)
+        else:
+            hops.append((count, name))
+    return tuple(sorted(question_types) + [name for _, name in sorted(hops)])
+
+
+def _slice_question_counts(
+    run_files: Sequence[AblationRunFile], slice_names: Sequence[str]
+) -> dict[str, int]:
+    """Count each Slice's distinct Golden Set questions across the runs."""
+    question_ids: dict[str, set[str]] = {name: set() for name in slice_names}
+    for run_file in run_files:
+        for result in run_file.run.questions:
+            for name in result.slices:
+                if name in question_ids:
+                    question_ids[name].add(result.id)
+    return {name: len(ids) for name, ids in question_ids.items()}
+
+
+def _attribution_table(
+    config: str, results: Sequence[QuestionResult], slice_names: Sequence[str]
+) -> AttributionTable:
+    """Count one answer run's labels, overall and per Slice."""
+    scored = [result for result in results if result.status is QuestionStatus.SCORED]
+    rows = [_attribution_row("All", scored)]
+    rows += [
+        _attribution_row(name, [result for result in scored if name in result.slices])
+        for name in slice_names
+    ]
+    return AttributionTable(config=config, rows=tuple(rows))
+
+
+def _attribution_row(name: str, results: Sequence[QuestionResult]) -> AttributionRow:
+    """Count one attribution row's labels; every label is present even at zero."""
+    counts = {label: 0 for label in FailureLabel}
+    for result in results:
+        counts[attribute_failure(result)] += 1
+    return AttributionRow(name=name, graded=len(results), counts=counts)
 
 
 def _report_grader_names(run_files: Sequence[AblationRunFile]) -> tuple[str, ...]:
@@ -237,11 +417,7 @@ def render_markdown(matrix: AblationMatrix) -> str:
     lines += ["", _CI_NOTE, ""]
     if _mixed_concurrency(matrix.rows):
         lines += [_concurrency_note(matrix.rows), ""]
-    lines += [
-        "| " + " | ".join(label for label, _ in columns) + " |",
-        "| " + " | ".join("---" for _ in columns) + " |",
-    ]
-    lines += [_markdown_matrix_row(row, columns) for row in matrix.rows]
+    lines += _markdown_table(columns, matrix.rows)
     lines += [
         "",
         "## Runs",
@@ -254,6 +430,10 @@ def render_markdown(matrix: AblationMatrix) -> str:
         f"{_markdown_text(row.harness_version)} |"
         for row in matrix.rows
     ]
+    lines += ["", "## Slices", ""]
+    lines += _markdown_slice_tables(matrix)
+    lines += ["", "## Failure Attribution", ""]
+    lines += _markdown_attribution_tables(matrix)
     return "\n".join(lines) + "\n"
 
 
@@ -286,22 +466,15 @@ def render_html(matrix: AblationMatrix) -> str:
     ]
     if _mixed_concurrency(matrix.rows):
         lines.append(f'<p class="note">{escape(_concurrency_note(matrix.rows))}</p>')
-    lines += [
-        '<div class="table-wrap">',
-        "<table>",
-        f"<caption>Point estimate [{_confidence_label(matrix.confidence)} confidence interval]. "
-        "Latency is in milliseconds.</caption>",
-        "<thead><tr>",
-        *(
-            f"<th>{escape(label)}</th>" if index == 0 else f'<th class="num">{escape(label)}</th>'
-            for index, (label, _) in enumerate(columns)
+    lines += _html_table(
+        columns,
+        matrix.rows,
+        caption=(
+            f"Point estimate [{_confidence_label(matrix.confidence)} confidence interval]. "
+            "Latency is in milliseconds."
         ),
-        "</tr></thead>",
-        "<tbody>",
-        *(_html_matrix_row(row, columns) for row in matrix.rows),
-        "</tbody>",
-        "</table>",
-        "</div>",
+    )
+    lines += [
         "<h2>Runs</h2>",
         '<div class="table-wrap">',
         "<table>",
@@ -313,6 +486,10 @@ def render_html(matrix: AblationMatrix) -> str:
         "</tbody>",
         "</table>",
         "</div>",
+        "<h2>Slices</h2>",
+        *_html_slice_tables(matrix),
+        "<h2>Failure Attribution</h2>",
+        *_html_attribution_tables(matrix),
         "</main>",
         "</body>",
         "</html>",
@@ -324,9 +501,7 @@ def _estimate(
     values: Sequence[float],
     statistic: Callable[[Sequence[float]], float],
     *,
-    seed: int,
-    config: str,
-    metric: str,
+    key: str,
     resamples: int,
     confidence: float,
 ) -> MetricEstimate | None:
@@ -334,7 +509,7 @@ def _estimate(
     interval = bootstrap_ci(
         values,
         statistic,
-        rng=random.Random(f"{seed}:{config}:{metric}"),
+        rng=random.Random(key),
         resamples=resamples,
         confidence=confidence,
     )
@@ -461,10 +636,10 @@ def _cell(
     return lambda row: formatter(row.estimates[name])
 
 
-def _grader_cell(name: str) -> Callable[[MatrixRow], str]:
+def _grader_cell(name: str) -> Callable[[MatrixRow | SliceRow], str]:
     """Return the formatter for one Grader column, with its non-zero counts beside it."""
 
-    def format_cell(row: MatrixRow) -> str:
+    def format_cell(row: MatrixRow | SliceRow) -> str:
         if name not in row.graders:
             return "—"
         estimate = row.estimates.get(name)
@@ -504,11 +679,154 @@ def _columns(matrix: AblationMatrix) -> tuple[tuple[str, Callable[[MatrixRow], s
 
 _RUN_COLUMNS = ("Retrieval Config", "Run ID", "Harness version")
 
+ATTRIBUTION_LABELS = {
+    FailureLabel.CORRECT: "Correct",
+    FailureLabel.RETRIEVAL_MISS: "Retrieval miss",
+    FailureLabel.GENERATION_ERROR: "Generation error",
+    FailureLabel.CITATION_ERROR: "Citation error",
+    FailureLabel.UNATTRIBUTED: "Unattributed",
+}
 
-def _markdown_matrix_row(
-    row: MatrixRow, columns: Sequence[tuple[str, Callable[[MatrixRow], str]]]
-) -> str:
-    """Format one Ablation Matrix table row."""
+_NO_SLICES = "No Slice in this report, so there is nothing to break down."
+_NO_ANSWER_RUN = "No answer Ablation Run in this report, so there is nothing to attribute."
+
+
+def _slice_columns(matrix: AblationMatrix) -> tuple[tuple[str, Callable[[SliceRow], str]], ...]:
+    """Return a Slice table's columns: metrics, Graders and the scored count."""
+    return (
+        ("Retrieval Config", lambda row: row.config),
+        *((METRIC_LABELS[name], _slice_cell(name, _format_metric)) for name in METRIC_NAMES),
+        *((grader_label(name), _slice_grader_cell(name)) for name in matrix.graders),
+        ("Scored", _dash_without_questions(lambda row: str(row.scored))),
+    )
+
+
+def _dash_without_questions(
+    format_cell: Callable[[SliceRow], str],
+) -> Callable[[SliceRow], str]:
+    """Return a Slice cell that is dashed when the config has no question in the Slice."""
+
+    def format_with_dash(row: SliceRow) -> str:
+        if row.questions == 0:
+            return "—"
+        return format_cell(row)
+
+    return format_with_dash
+
+
+def _slice_cell(
+    name: str, formatter: Callable[[MetricEstimate | None], str]
+) -> Callable[[SliceRow], str]:
+    """Return a Slice metric cell, dashed when the config has no question there."""
+    return _dash_without_questions(lambda row: formatter(row.estimates.get(name)))
+
+
+def _slice_grader_cell(name: str) -> Callable[[SliceRow], str]:
+    """Return a Slice Grader cell, dashed when the config has no question there."""
+    return _dash_without_questions(_grader_cell(name))
+
+
+def _attribution_columns() -> tuple[tuple[str, Callable[[AttributionRow], str]], ...]:
+    """Return the Failure Attribution columns, each count with its share of Graded."""
+    return (
+        ("Slice", lambda row: row.name),
+        ("Graded", lambda row: str(row.graded)),
+        *((ATTRIBUTION_LABELS[label], _share_cell(label)) for label in ATTRIBUTION_LABELS),
+    )
+
+
+def _share_cell(label: FailureLabel) -> Callable[[AttributionRow], str]:
+    """Return one Failure Attribution cell: the label's count and its share."""
+
+    def format_cell(row: AttributionRow) -> str:
+        return _format_share(row.counts[label], row.graded)
+
+    return format_cell
+
+
+def _format_share(count: int, graded: int) -> str:
+    """Format a count with its share of the row's graded questions."""
+    if graded == 0:
+        return f"{count} (—)"
+    return f"{count} ({count / graded:.0%})"
+
+
+def _questions_phrase(count: int) -> str:
+    """Return ``1 question`` or ``3 questions``."""
+    return f"{count} {'question' if count == 1 else 'questions'}"
+
+
+def _markdown_slice_tables(matrix: AblationMatrix) -> list[str]:
+    """Render one Markdown table per Slice, separated by a blank line."""
+    if not matrix.slice_tables:
+        return [_NO_SLICES]
+    columns = _slice_columns(matrix)
+    lines: list[str] = []
+    for index, table in enumerate(matrix.slice_tables):
+        if index:
+            lines.append("")
+        lines += [f"### {_markdown_text(table.name)}", "", _questions_phrase(table.questions), ""]
+        lines += _markdown_table(columns, table.rows)
+    return lines
+
+
+def _markdown_attribution_tables(matrix: AblationMatrix) -> list[str]:
+    """Render one Markdown Failure Attribution table per answer run."""
+    if not matrix.attribution_tables:
+        return [_NO_ANSWER_RUN]
+    columns = _attribution_columns()
+    lines: list[str] = []
+    for index, table in enumerate(matrix.attribution_tables):
+        if index:
+            lines.append("")
+        lines += [f"### {_markdown_text(table.config)}", ""]
+        lines += _markdown_table(columns, table.rows)
+    return lines
+
+
+def _html_slice_tables(matrix: AblationMatrix) -> list[str]:
+    """Render one HTML table per Slice, headed by the Slice and its question count."""
+    if not matrix.slice_tables:
+        return [f"<p>{escape(_NO_SLICES)}</p>"]
+    columns = _slice_columns(matrix)
+    lines: list[str] = []
+    for table in matrix.slice_tables:
+        lines += [
+            f"<h3>{escape(table.name)}</h3>",
+            f'<p class="note">{_questions_phrase(table.questions)}</p>',
+            *_html_table(columns, table.rows),
+        ]
+    return lines
+
+
+def _html_attribution_tables(matrix: AblationMatrix) -> list[str]:
+    """Render one HTML Failure Attribution table per answer run."""
+    if not matrix.attribution_tables:
+        return [f"<p>{escape(_NO_ANSWER_RUN)}</p>"]
+    columns = _attribution_columns()
+    lines: list[str] = []
+    for table in matrix.attribution_tables:
+        lines += [
+            f"<h3>{escape(table.config)}</h3>",
+            *_html_table(columns, table.rows),
+        ]
+    return lines
+
+
+def _markdown_table[RowT](
+    columns: Sequence[tuple[str, Callable[[RowT], str]]],
+    rows: Sequence[RowT],
+) -> list[str]:
+    """Format one Markdown table: its header, separator and one line per row."""
+    lines = [
+        "| " + " | ".join(label for label, _ in columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    return lines + [_markdown_row(row, columns) for row in rows]
+
+
+def _markdown_row[RowT](row: RowT, columns: Sequence[tuple[str, Callable[[RowT], str]]]) -> str:
+    """Format one Markdown table row."""
     cells = (_markdown_text(format_cell(row)) for _, format_cell in columns)
     return "| " + " | ".join(cells) + " |"
 
@@ -518,10 +836,34 @@ def _markdown_text(value: str) -> str:
     return value.replace("|", "\\|")
 
 
-def _html_matrix_row(
-    row: MatrixRow, columns: Sequence[tuple[str, Callable[[MatrixRow], str]]]
-) -> str:
-    """Format one Ablation Matrix table row."""
+def _html_table[RowT](
+    columns: Sequence[tuple[str, Callable[[RowT], str]]],
+    rows: Sequence[RowT],
+    *,
+    caption: str | None = None,
+) -> list[str]:
+    """Format one HTML table, with an optional caption, as a scrollable block."""
+    lines = ['<div class="table-wrap">', "<table>"]
+    if caption is not None:
+        lines.append(f"<caption>{escape(caption)}</caption>")
+    lines += [
+        "<thead><tr>",
+        *(
+            f"<th>{escape(label)}</th>" if index == 0 else f'<th class="num">{escape(label)}</th>'
+            for index, (label, _) in enumerate(columns)
+        ),
+        "</tr></thead>",
+        "<tbody>",
+        *(_html_row(row, columns) for row in rows),
+        "</tbody>",
+        "</table>",
+        "</div>",
+    ]
+    return lines
+
+
+def _html_row[RowT](row: RowT, columns: Sequence[tuple[str, Callable[[RowT], str]]]) -> str:
+    """Format one HTML table row."""
     cells = [
         f"<td>{escape(format_cell(row))}</td>"
         if index == 0
@@ -584,6 +926,7 @@ body {
 main { max-width: 72rem; margin: 0 auto; }
 h1 { margin: 0 0 0.5rem; font-size: 1.75rem; }
 h2 { margin-top: 2rem; font-size: 1.25rem; }
+h3 { margin-top: 1.5rem; font-size: 1.05rem; }
 p { color: var(--muted); }
 code { font-size: 0.9em; }
 dl {
