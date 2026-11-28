@@ -210,7 +210,7 @@ func (r *chunkRepository) SearchDense(ctx context.Context, documentIDs []uuid.UU
 	matches := make([]*types.ChunkMatch, 0, len(rows))
 	for _, row := range rows {
 		matches = append(matches, newChunkMatch(row.ID, row.DocumentID, row.Seq,
-			row.Content, row.ContextHeader, row.Score))
+			row.Content, row.ContextHeader, row.ParentID, row.Score))
 	}
 	return matches, nil
 }
@@ -236,14 +236,49 @@ func (r *chunkRepository) SearchBM25(ctx context.Context, documentIDs []uuid.UUI
 	matches := make([]*types.ChunkMatch, 0, len(rows))
 	for _, row := range rows {
 		matches = append(matches, newChunkMatch(row.ID, row.DocumentID, row.Seq,
-			row.Content, row.ContextHeader, row.Score))
+			row.Content, row.ContextHeader, row.ParentID, row.Score))
 	}
 	return matches, nil
 }
 
+// ListParentChunks returns the Parent Chunks of documentIDs whose IDs are in
+// parentIDs. The document filter is part of the query, so a Parent Chunk of a
+// Document the caller cannot read is never returned, even when a stale Chunk
+// still links to it (ADR-0004).
+func (r *chunkRepository) ListParentChunks(ctx context.Context, documentIDs, parentIDs []uuid.UUID) ([]*types.ParentChunk, error) {
+	rows, err := r.store.Querier(ctx).ListParentChunks(ctx, sqlc.ListParentChunksParams{
+		DocumentIds: documentIDs,
+		ParentIds:   parentIDs,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list parent chunks of %d documents: %w", len(documentIDs), err)
+	}
+	parents := make([]*types.ParentChunk, 0, len(rows))
+	for _, row := range rows {
+		parents = append(parents, &types.ParentChunk{
+			ID:            row.ID,
+			DocumentID:    row.DocumentID,
+			Seq:           int(row.Seq),
+			Content:       row.Content,
+			ContextHeader: row.ContextHeader,
+			StartOffset:   int(row.StartOffset),
+			EndOffset:     int(row.EndOffset),
+			CreatedAt:     row.CreatedAt,
+		})
+	}
+	return parents, nil
+}
+
 // newChunkMatch builds a match from the scalar fields the dense and BM25 rows
-// share; their generated row types differ but carry the same six columns.
-func newChunkMatch(id, documentID uuid.UUID, seq int32, content, contextHeader string, score float64) *types.ChunkMatch {
+// share; their generated row types differ but carry the same seven columns.
+func newChunkMatch(id, documentID uuid.UUID, seq int32, content, contextHeader string,
+	parentID pgtype.UUID, score float64,
+) *types.ChunkMatch {
+	var parent *uuid.UUID
+	if parentID.Valid {
+		id := uuid.UUID(parentID.Bytes)
+		parent = &id
+	}
 	return &types.ChunkMatch{
 		Chunk: &types.Chunk{
 			ID:            id,
@@ -252,7 +287,8 @@ func newChunkMatch(id, documentID uuid.UUID, seq int32, content, contextHeader s
 			Content:       content,
 			ContextHeader: contextHeader,
 		},
-		Score: score,
+		ParentID: parent,
+		Score:    score,
 	}
 }
 

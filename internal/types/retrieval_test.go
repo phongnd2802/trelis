@@ -1,6 +1,7 @@
 package types
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -36,6 +37,25 @@ func TestRetrievalRequestValidateFillsTheDefaults(t *testing.T) {
 func TestRerankIsAKnownRetrievalTechnique(t *testing.T) {
 	if !RetrievalTechniqueRerank.Known() {
 		t.Errorf("%q is not known, want rerank registered as a technique", RetrievalTechniqueRerank)
+	}
+}
+
+func TestParentChildIsAKnownRetrievalTechnique(t *testing.T) {
+	if !RetrievalTechniqueParentChild.Known() {
+		t.Errorf("%q is not known, want parent_child registered as a technique", RetrievalTechniqueParentChild)
+	}
+}
+
+func TestOnlyTheStageTechniquesAreStages(t *testing.T) {
+	for technique, want := range map[RetrievalTechnique]bool{
+		RetrievalTechniqueDense:       false,
+		RetrievalTechniqueBM25:        false,
+		RetrievalTechniqueRerank:      true,
+		RetrievalTechniqueParentChild: true,
+	} {
+		if got := technique.IsStage(); got != want {
+			t.Errorf("%q IsStage() = %t, want %t", technique, got, want)
+		}
 	}
 }
 
@@ -144,6 +164,70 @@ func TestRetrievalConfigValidateRejectsRerankAlone(t *testing.T) {
 	// The candidate list must not offer rerank itself as a candidate.
 	if count := strings.Count(err.Error(), `"rerank"`); count != 1 {
 		t.Errorf("error %q names rerank %d times, want once plus a candidate list without it", err, count)
+	}
+}
+
+func TestRetrievalConfigValidateAcceptsParentChildNextToACandidateTechnique(t *testing.T) {
+	for _, techniques := range [][]RetrievalTechnique{
+		{RetrievalTechniqueParentChild, RetrievalTechniqueBM25},
+		{RetrievalTechniqueDense, RetrievalTechniqueParentChild},
+		{RetrievalTechniqueBM25, RetrievalTechniqueRerank, RetrievalTechniqueParentChild},
+	} {
+		config := RetrievalConfig{Techniques: techniques}
+		if err := config.Validate(); err != nil {
+			t.Errorf("Validate(%v) = %v, want parent_child accepted as a final stage", techniques, err)
+		}
+	}
+}
+
+func TestRetrievalConfigValidateRejectsOnlyStageTechniques(t *testing.T) {
+	for _, techniques := range [][]RetrievalTechnique{
+		{RetrievalTechniqueParentChild},
+		{RetrievalTechniqueRerank, RetrievalTechniqueParentChild},
+		{RetrievalTechniqueParentChild, RetrievalTechniqueRerank},
+	} {
+		config := RetrievalConfig{Techniques: techniques}
+		err := config.Validate()
+		if err == nil {
+			t.Fatalf("Validate(%v) = nil, want a stage-only config rejected", techniques)
+		}
+		for _, want := range []string{"at least one", `"dense"`, `"bm25"`} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("Validate(%v) error %q does not name %q", techniques, err, want)
+			}
+		}
+		if strings.Contains(err.Error(), `"parent_child", "dense"`) {
+			t.Errorf("Validate(%v) error %q offers parent_child as a candidate", techniques, err)
+		}
+	}
+}
+
+func TestCandidateTechniquesLeavesOutStageTechniques(t *testing.T) {
+	config := RetrievalConfig{Techniques: []RetrievalTechnique{
+		RetrievalTechniqueDense,
+		RetrievalTechniqueRerank,
+		RetrievalTechniqueParentChild,
+		RetrievalTechniqueBM25,
+	}}
+	got := config.CandidateTechniques()
+	want := []RetrievalTechnique{RetrievalTechniqueDense, RetrievalTechniqueBM25}
+	if !slices.Equal(got, want) {
+		t.Errorf("CandidateTechniques() = %v, want the candidate sources alone %v", got, want)
+	}
+}
+
+func TestRetrievalConfigExpandsParents(t *testing.T) {
+	for _, tc := range []struct {
+		techniques []RetrievalTechnique
+		want       bool
+	}{
+		{[]RetrievalTechnique{RetrievalTechniqueBM25, RetrievalTechniqueRerank}, false},
+		{[]RetrievalTechnique{RetrievalTechniqueBM25, RetrievalTechniqueParentChild}, true},
+	} {
+		config := RetrievalConfig{Techniques: tc.techniques}
+		if got := config.ExpandsParents(); got != tc.want {
+			t.Errorf("ExpandsParents() with %v = %t, want %t", tc.techniques, got, tc.want)
+		}
 	}
 }
 

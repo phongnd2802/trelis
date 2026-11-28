@@ -45,6 +45,12 @@ type Querier interface {
 	ListAPIKeys(ctx context.Context, principalID uuid.UUID) ([]ListAPIKeysRow, error)
 	ListDocumentGroups(ctx context.Context, documentID uuid.UUID) ([]string, error)
 	ListDocumentPrincipals(ctx context.Context, documentID uuid.UUID) ([]string, error)
+	// Parent Chunks of the readable Documents (#36): retrieval matches Chunks,
+	// then replaces them with the Parent Chunks they link to. The readable-ID
+	// filter is part of the query, so a Parent Chunk of a Document the caller
+	// cannot read is never returned even when a stale Chunk still links to it
+	// (ADR-0004).
+	ListParentChunks(ctx context.Context, arg ListParentChunksParams) ([]ParentChunk, error)
 	ListPrincipalGroups(ctx context.Context, principalID uuid.UUID) ([]ListPrincipalGroupsRow, error)
 	// The Documents a Principal can read that finished ingest. Retrieval passes
 	// this set into every search; a Document still processing has only part of

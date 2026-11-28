@@ -185,6 +185,14 @@ func TestAnInvalidRequestIsValidation(t *testing.T) {
 			body:    `{"query":"who won?","retrieval_config":{"techniques":["rerank"]}}`,
 			wantMsg: []string{"rerank", "at least one"},
 		},
+		"parent_child alone": {
+			body:    `{"query":"who won?","retrieval_config":{"techniques":["parent_child"]}}`,
+			wantMsg: []string{"parent_child", "at least one", "dense"},
+		},
+		"only stage techniques": {
+			body:    `{"query":"who won?","retrieval_config":{"techniques":["rerank","parent_child"]}}`,
+			wantMsg: []string{"rerank", "parent_child", "at least one"},
+		},
 		"rerank_candidates below top_k": {
 			body:    `{"query":"who won?","top_k":10,"retrieval_config":{"techniques":["bm25","rerank"],"rerank_candidates":5}}`,
 			wantMsg: []string{"rerank_candidates", "top_k"},

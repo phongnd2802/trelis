@@ -55,6 +55,12 @@ type ChunkSearcher interface {
 	// the search itself, so a Chunk of another Document never takes a top-K
 	// place.
 	SearchBM25(ctx context.Context, documentIDs []uuid.UUID, query string, topK int) ([]*types.ChunkMatch, error)
+
+	// ListParentChunks returns the Parent Chunks of documentIDs whose IDs are
+	// in parentIDs. The readable-document filter is part of the query, so a
+	// Parent Chunk of a Document the caller cannot read is never returned,
+	// even when a stale Chunk still links to it (ADR-0004).
+	ListParentChunks(ctx context.Context, documentIDs, parentIDs []uuid.UUID) ([]*types.ParentChunk, error)
 }
 
 // ChunkReader reads one Chunk for a Principal, always within the Documents

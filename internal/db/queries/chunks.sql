@@ -68,9 +68,9 @@ WHERE c.id = @id AND can_read_document(d.id, @principal_id::uuid);
 -- zero-norm vector) can never be a match; NaN would also break JSON encoding.
 -- name: SearchDenseChunks :many
 WITH query_vec AS MATERIALIZED (SELECT sqlc.arg(query_embedding)::text::vector AS embedding)
-SELECT id, document_id, seq, content, context_header, score
+SELECT id, document_id, seq, content, context_header, parent_id, score
 FROM (
-    SELECT chunks.id, chunks.document_id, chunks.seq, chunks.content, chunks.context_header,
+    SELECT chunks.id, chunks.document_id, chunks.seq, chunks.content, chunks.context_header, chunks.parent_id,
            (1 - CASE WHEN chunks.embedding_model = sqlc.arg(embedding_model)::text
                      THEN chunks.embedding <=> query_vec.embedding END)::float8 AS score
     FROM chunks, query_vec
@@ -102,9 +102,9 @@ LIMIT sqlc.arg(top_k);
 -- ContextHeader + "\n\n" + Content (chunkText in
 -- internal/application/service/ingest.go).
 -- name: SearchBM25Chunks :many
-SELECT id, document_id, seq, content, context_header, score::float8 AS score
+SELECT id, document_id, seq, content, context_header, parent_id, score::float8 AS score
 FROM (
-    SELECT chunks.id, chunks.document_id, chunks.seq, chunks.content, chunks.context_header,
+    SELECT chunks.id, chunks.document_id, chunks.seq, chunks.content, chunks.context_header, chunks.parent_id,
            pdb.score(chunks) AS score
     FROM chunks
     WHERE chunks.document_id = ANY(sqlc.arg(document_ids)::uuid[])
@@ -114,3 +114,15 @@ FROM (
     LIMIT sqlc.arg(top_k)
 ) ranked
 ORDER BY score DESC, id;
+
+-- Parent Chunks of the readable Documents (#36): retrieval matches Chunks,
+-- then replaces them with the Parent Chunks they link to. The readable-ID
+-- filter is part of the query, so a Parent Chunk of a Document the caller
+-- cannot read is never returned even when a stale Chunk still links to it
+-- (ADR-0004).
+-- name: ListParentChunks :many
+SELECT id, document_id, seq, content, context_header, start_offset, end_offset, created_at
+FROM parent_chunks
+WHERE document_id = ANY(sqlc.arg(document_ids)::uuid[])
+  AND id = ANY(sqlc.arg(parent_ids)::uuid[])
+ORDER BY document_id, seq;

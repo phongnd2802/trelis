@@ -146,6 +146,53 @@ func (q *Queries) InsertParentChunk(ctx context.Context, arg InsertParentChunkPa
 	return id, err
 }
 
+const listParentChunks = `-- name: ListParentChunks :many
+SELECT id, document_id, seq, content, context_header, start_offset, end_offset, created_at
+FROM parent_chunks
+WHERE document_id = ANY($1::uuid[])
+  AND id = ANY($2::uuid[])
+ORDER BY document_id, seq
+`
+
+type ListParentChunksParams struct {
+	DocumentIds []uuid.UUID
+	ParentIds   []uuid.UUID
+}
+
+// Parent Chunks of the readable Documents (#36): retrieval matches Chunks,
+// then replaces them with the Parent Chunks they link to. The readable-ID
+// filter is part of the query, so a Parent Chunk of a Document the caller
+// cannot read is never returned even when a stale Chunk still links to it
+// (ADR-0004).
+func (q *Queries) ListParentChunks(ctx context.Context, arg ListParentChunksParams) ([]ParentChunk, error) {
+	rows, err := q.db.Query(ctx, listParentChunks, arg.DocumentIds, arg.ParentIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ParentChunk
+	for rows.Next() {
+		var i ParentChunk
+		if err := rows.Scan(
+			&i.ID,
+			&i.DocumentID,
+			&i.Seq,
+			&i.Content,
+			&i.ContextHeader,
+			&i.StartOffset,
+			&i.EndOffset,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUnembeddedChunksByDocument = `-- name: ListUnembeddedChunksByDocument :many
 SELECT id, seq, content, context_header, start_offset, end_offset
 FROM chunks
@@ -202,9 +249,9 @@ func (q *Queries) ListUnembeddedChunksByDocument(ctx context.Context, arg ListUn
 }
 
 const searchBM25Chunks = `-- name: SearchBM25Chunks :many
-SELECT id, document_id, seq, content, context_header, score::float8 AS score
+SELECT id, document_id, seq, content, context_header, parent_id, score::float8 AS score
 FROM (
-    SELECT chunks.id, chunks.document_id, chunks.seq, chunks.content, chunks.context_header,
+    SELECT chunks.id, chunks.document_id, chunks.seq, chunks.content, chunks.context_header, chunks.parent_id,
            pdb.score(chunks) AS score
     FROM chunks
     WHERE chunks.document_id = ANY($1::uuid[])
@@ -228,6 +275,7 @@ type SearchBM25ChunksRow struct {
 	Seq           int32
 	Content       string
 	ContextHeader string
+	ParentID      pgtype.UUID
 	Score         float64
 }
 
@@ -265,6 +313,7 @@ func (q *Queries) SearchBM25Chunks(ctx context.Context, arg SearchBM25ChunksPara
 			&i.Seq,
 			&i.Content,
 			&i.ContextHeader,
+			&i.ParentID,
 			&i.Score,
 		); err != nil {
 			return nil, err
@@ -279,9 +328,9 @@ func (q *Queries) SearchBM25Chunks(ctx context.Context, arg SearchBM25ChunksPara
 
 const searchDenseChunks = `-- name: SearchDenseChunks :many
 WITH query_vec AS MATERIALIZED (SELECT $4::text::vector AS embedding)
-SELECT id, document_id, seq, content, context_header, score
+SELECT id, document_id, seq, content, context_header, parent_id, score
 FROM (
-    SELECT chunks.id, chunks.document_id, chunks.seq, chunks.content, chunks.context_header,
+    SELECT chunks.id, chunks.document_id, chunks.seq, chunks.content, chunks.context_header, chunks.parent_id,
            (1 - CASE WHEN chunks.embedding_model = $1::text
                      THEN chunks.embedding <=> query_vec.embedding END)::float8 AS score
     FROM chunks, query_vec
@@ -307,6 +356,7 @@ type SearchDenseChunksRow struct {
 	Seq           int32
 	Content       string
 	ContextHeader string
+	ParentID      pgtype.UUID
 	Score         float64
 }
 
@@ -345,6 +395,7 @@ func (q *Queries) SearchDenseChunks(ctx context.Context, arg SearchDenseChunksPa
 			&i.Seq,
 			&i.Content,
 			&i.ContextHeader,
+			&i.ParentID,
 			&i.Score,
 		); err != nil {
 			return nil, err

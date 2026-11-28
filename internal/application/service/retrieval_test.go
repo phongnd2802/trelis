@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -54,6 +55,12 @@ type fakeChunkSearch struct {
 	bm25DocumentIDs []uuid.UUID
 	bm25Query       string
 	bm25TopK        int
+
+	parentChunks      []*types.ParentChunk
+	parentErr         error
+	parentCalls       int
+	parentDocumentIDs []uuid.UUID
+	parentIDs         []uuid.UUID
 }
 
 func (f *fakeChunkSearch) SearchDense(_ context.Context, documentIDs []uuid.UUID, queryVector []float32, model string, topK int) ([]*types.ChunkMatch, error) {
@@ -69,6 +76,13 @@ func (f *fakeChunkSearch) SearchBM25(_ context.Context, documentIDs []uuid.UUID,
 	f.bm25DocumentIDs = append([]uuid.UUID(nil), documentIDs...)
 	f.bm25Query, f.bm25TopK = query, topK
 	return f.bm25Matches, f.bm25Err
+}
+
+func (f *fakeChunkSearch) ListParentChunks(_ context.Context, documentIDs, parentIDs []uuid.UUID) ([]*types.ParentChunk, error) {
+	f.parentCalls++
+	f.parentDocumentIDs = append([]uuid.UUID(nil), documentIDs...)
+	f.parentIDs = append([]uuid.UUID(nil), parentIDs...)
+	return f.parentChunks, f.parentErr
 }
 
 // fakeEmbedder answers one vector per text and records what it was asked to
@@ -129,6 +143,16 @@ func callerContext(principalID uuid.UUID) context.Context {
 // intPointer returns a pointer to n, for an explicitly given top_k.
 func intPointer(n int) *int { return &n }
 
+// expandedEntries returns the expand step's expanded list, failing when the
+// step left the field out.
+func expandedEntries(t *testing.T, step types.TraceStep) []types.ParentExpansion {
+	t.Helper()
+	if step.Expanded == nil {
+		t.Fatal("expand_parents step left expanded out, want a list (empty when there are no results)")
+	}
+	return *step.Expanded
+}
+
 // hybridRequest is a request that runs bm25 and dense together, the shape most
 // fusion tests need; a test sets TopK or the config's RRFK as it needs.
 func hybridRequest(query string) *types.RetrievalRequest {
@@ -140,17 +164,15 @@ func hybridRequest(query string) *types.RetrievalRequest {
 	}
 }
 
-// TestEveryKnownTechniqueHasARunner guards the runner map from drifting away
+// TestEveryKnownCandidateTechniqueHasARunner guards the runner map from drifting away
 // from the techniques validation admits.
 func TestEveryKnownCandidateTechniqueHasARunner(t *testing.T) {
 	retrieval, ok := NewRetrievalService(nil, nil, nil, nil).(*retrievalService)
 	if !ok {
 		t.Fatal("NewRetrievalService did not return a *retrievalService")
 	}
-	for _, technique := range types.KnownRetrievalTechniques() {
-		if technique == types.RetrievalTechniqueRerank {
-			continue // rerank reorders another technique's candidates; it has no runner.
-		}
+	config := &types.RetrievalConfig{Techniques: types.KnownRetrievalTechniques()}
+	for _, technique := range config.CandidateTechniques() {
 		if retrieval.runners[technique] == nil {
 			t.Errorf("retrieval technique %q has no runner", technique)
 		}
@@ -706,6 +728,17 @@ func rerankRequest(query string, techniques ...types.RetrievalTechnique) *types.
 	}
 }
 
+// parentChildRequest is a request that runs the named candidate techniques and
+// then parent_child; top_k is set by the test.
+func parentChildRequest(query string, techniques ...types.RetrievalTechnique) *types.RetrievalRequest {
+	return &types.RetrievalRequest{
+		Query: query,
+		RetrievalConfig: &types.RetrievalConfig{
+			Techniques: append(append([]types.RetrievalTechnique(nil), techniques...), types.RetrievalTechniqueParentChild),
+		},
+	}
+}
+
 func TestRetrieveSingleTechniqueReranksByTheRerankScores(t *testing.T) {
 	principalID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000a1")
 	docA := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
@@ -1072,6 +1105,373 @@ func TestRetrieveWithRerankAndAnEmptyPoolSkipsTheCall(t *testing.T) {
 	if step.Step != types.TraceStepRerank || step.Technique != types.RetrievalTechniqueRerank ||
 		step.Model != "" || step.Candidates == nil || *step.Candidates != 0 {
 		t.Errorf("trace[2] = %+v, want the rerank step with 0 candidates and no model", step)
+	}
+}
+
+func TestRetrieveParentChildCollapsesChunksOfOneParentChunk(t *testing.T) {
+	principalID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000a1")
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	parentID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000c1")
+	chunkA := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+	chunkB := uuid.MustParse("0190d2a8-0000-7000-8000-000000000002")
+	chunkStandalone := uuid.MustParse("0190d2a8-0000-7000-8000-000000000003")
+
+	docs := &fakeReadableDocuments{readable: []uuid.UUID{docID}}
+	chunks := &fakeChunkSearch{
+		denseMatches: []*types.ChunkMatch{
+			{Chunk: &types.Chunk{ID: chunkA, DocumentID: docID, Seq: 0, Content: "Điều 1. Phạm vi"}, ParentID: &parentID, Score: 0.9},
+			{Chunk: &types.Chunk{ID: chunkStandalone, DocumentID: docID, Seq: 1, Content: "Điều 2. Đối tượng"}, Score: 0.7},
+			{Chunk: &types.Chunk{ID: chunkB, DocumentID: docID, Seq: 2, Content: "Điều 3. Thu nhập"}, ParentID: &parentID, Score: 0.6},
+		},
+		parentChunks: []*types.ParentChunk{{
+			ID: parentID, DocumentID: docID, Seq: 0,
+			Content: "Điều 1. Phạm vi\nĐiều 3. Thu nhập", ContextHeader: "Chương I",
+		}},
+	}
+	retrieval := NewRetrievalService(docs, chunks,
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
+
+	req := parentChildRequest("who won?", types.RetrievalTechniqueDense)
+	req.TopK = intPointer(5)
+	got, err := retrieval.Retrieve(callerContext(principalID), req)
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+
+	// Collapsing can merge several Chunks into one result, so the search is
+	// deeper than top_k even with a single technique.
+	if chunks.denseTopK != types.RetrievalFusionCandidates {
+		t.Errorf("dense top_k = %d, want the fusion depth %d", chunks.denseTopK, types.RetrievalFusionCandidates)
+	}
+	// The parent lookup runs once, over the readable set and the distinct
+	// parent IDs, in rank order.
+	if chunks.parentCalls != 1 {
+		t.Fatalf("ListParentChunks called %d times, want once", chunks.parentCalls)
+	}
+	if !slices.Equal(chunks.parentDocumentIDs, []uuid.UUID{docID}) {
+		t.Errorf("ListParentChunks document IDs = %v, want the readable set %v", chunks.parentDocumentIDs, []uuid.UUID{docID})
+	}
+	if !slices.Equal(chunks.parentIDs, []uuid.UUID{parentID}) {
+		t.Errorf("ListParentChunks parent IDs = %v, want the distinct %v", chunks.parentIDs, []uuid.UUID{parentID})
+	}
+
+	if len(got.Results) != 2 {
+		t.Fatalf("results = %+v, want the parent and the standalone Chunk", got.Results)
+	}
+	first := got.Results[0]
+	if first.ChunkID != chunkA || first.DocumentID != docID || first.Seq != 0 {
+		t.Errorf("first result ids = %s/%s/%d, want the best child %s", first.ChunkID, first.DocumentID, first.Seq, chunkA)
+	}
+	if first.Content != "Điều 1. Phạm vi\nĐiều 3. Thu nhập" || first.ContextHeader != "Chương I" {
+		t.Errorf("first result content/header = %q/%q, want the Parent Chunk's", first.Content, first.ContextHeader)
+	}
+	if first.ParentChunkID == nil || *first.ParentChunkID != parentID {
+		t.Errorf("first result parent_chunk_id = %v, want %s", first.ParentChunkID, parentID)
+	}
+	if first.Score != 0.9 || first.Scores[types.RetrievalTechniqueDense] != 0.9 ||
+		first.Ranks[types.RetrievalTechniqueDense] != 1 {
+		t.Errorf("first result score/scores/ranks = %v/%v/%v, want the best child's",
+			first.Score, first.Scores, first.Ranks)
+	}
+	second := got.Results[1]
+	if second.ChunkID != chunkStandalone || second.ParentChunkID != nil ||
+		second.Content != "Điều 2. Đối tượng" || second.Score != 0.7 {
+		t.Errorf("second result = %+v, want the standalone child unchanged", second)
+	}
+
+	// The expansion step comes last and names the children behind each
+	// result in rank order.
+	if len(got.Trace) != 3 {
+		t.Fatalf("trace = %+v, want the embed, search and expand steps", got.Trace)
+	}
+	step := got.Trace[2]
+	if step.Step != types.TraceStepExpandParents || step.Technique != types.RetrievalTechniqueParentChild ||
+		step.DurationMS < 0 || step.Candidates == nil || *step.Candidates != 2 {
+		t.Errorf("trace[2] = %+v, want the expand step with 2 results before the cut", step)
+	}
+	expanded := expandedEntries(t, step)
+	if len(expanded) != 2 {
+		t.Fatalf("expanded = %+v, want one entry per returned result", expanded)
+	}
+	if expansion := expanded[0]; expansion.ChunkID != chunkA || expansion.ParentChunkID == nil ||
+		*expansion.ParentChunkID != parentID ||
+		!slices.Equal(expansion.MatchedChunkIDs, []uuid.UUID{chunkA, chunkB}) {
+		t.Errorf("expanded[0] = %+v, want chunk A over parent %s with the matched children in rank order",
+			expansion, parentID)
+	}
+	if expansion := expanded[1]; expansion.ChunkID != chunkStandalone ||
+		expansion.ParentChunkID != nil ||
+		!slices.Equal(expansion.MatchedChunkIDs, []uuid.UUID{chunkStandalone}) {
+		t.Errorf("expanded[1] = %+v, want the standalone child alone", expansion)
+	}
+}
+
+func TestRetrieveParentChildStillFillsTopKAfterCollapse(t *testing.T) {
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	parentID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000c1")
+	chunkA := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+	chunkB := uuid.MustParse("0190d2a8-0000-7000-8000-000000000002")
+	chunkC := uuid.MustParse("0190d2a8-0000-7000-8000-000000000003")
+	chunkD := uuid.MustParse("0190d2a8-0000-7000-8000-000000000004")
+
+	chunks := &fakeChunkSearch{
+		denseMatches: []*types.ChunkMatch{
+			{Chunk: &types.Chunk{ID: chunkA, DocumentID: docID, Seq: 0, Content: "first"}, ParentID: &parentID, Score: 0.9},
+			{Chunk: &types.Chunk{ID: chunkB, DocumentID: docID, Seq: 1, Content: "second"}, ParentID: &parentID, Score: 0.8},
+			{Chunk: &types.Chunk{ID: chunkC, DocumentID: docID, Seq: 2, Content: "third"}, ParentID: &parentID, Score: 0.7},
+			{Chunk: &types.Chunk{ID: chunkD, DocumentID: docID, Seq: 3, Content: "fourth"}, Score: 0.6},
+		},
+		parentChunks: []*types.ParentChunk{{
+			ID: parentID, DocumentID: docID, Seq: 0, Content: "the three first Chunks",
+		}},
+	}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
+
+	req := parentChildRequest("who won?", types.RetrievalTechniqueDense)
+	req.TopK = intPointer(2)
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), req)
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+
+	// The first three children merge into the first result; the fourth fills
+	// the second top_k place.
+	if len(got.Results) != 2 || got.Results[1].ChunkID != chunkD {
+		t.Fatalf("results = %+v, want the collapsed parent then chunk D", got.Results)
+	}
+	expanded := expandedEntries(t, got.Trace[len(got.Trace)-1])
+	if len(expanded) != 2 ||
+		!slices.Equal(expanded[0].MatchedChunkIDs, []uuid.UUID{chunkA, chunkB, chunkC}) {
+		t.Errorf("expanded = %+v, want the three matched Chunks collapsed into the first result", expanded)
+	}
+}
+
+func TestRetrieveParentChildFallsBackWhenAParentIsMissing(t *testing.T) {
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	parentID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000c1")
+	chunkID := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+
+	chunks := &fakeChunkSearch{
+		denseMatches: []*types.ChunkMatch{{
+			Chunk:    &types.Chunk{ID: chunkID, DocumentID: docID, Content: "the child alone"},
+			ParentID: &parentID,
+			Score:    0.9,
+		}},
+	}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
+
+	req := parentChildRequest("who won?", types.RetrievalTechniqueDense)
+	req.TopK = intPointer(5)
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), req)
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+
+	// The Parent Chunk vanished between the search and the lookup, as a
+	// re-ingest can make it; the child stands alone rather than disappearing.
+	if len(got.Results) != 1 || got.Results[0].Content != "the child alone" ||
+		got.Results[0].ParentChunkID != nil || got.Results[0].ChunkID != chunkID {
+		t.Errorf("results = %+v, want the child unchanged with no parent_chunk_id", got.Results)
+	}
+	expanded := expandedEntries(t, got.Trace[len(got.Trace)-1])
+	if len(expanded) != 1 || expanded[0].ParentChunkID != nil ||
+		!slices.Equal(expanded[0].MatchedChunkIDs, []uuid.UUID{chunkID}) {
+		t.Errorf("expanded = %+v, want the child as a fallback result", expanded)
+	}
+}
+
+func TestRetrieveParentChildCollapsesOnTheRerankedOrderBeforeTheCut(t *testing.T) {
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	parentID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000c1")
+	chunkA := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+	chunkB := uuid.MustParse("0190d2a8-0000-7000-8000-000000000002")
+	chunkC := uuid.MustParse("0190d2a8-0000-7000-8000-000000000003")
+
+	chunks := &fakeChunkSearch{
+		denseMatches: []*types.ChunkMatch{
+			{Chunk: &types.Chunk{ID: chunkA, DocumentID: docID, Seq: 0, Content: "near A"}, ParentID: &parentID, Score: 0.9},
+			{Chunk: &types.Chunk{ID: chunkB, DocumentID: docID, Seq: 1, Content: "near B"}, ParentID: &parentID, Score: 0.8},
+			{Chunk: &types.Chunk{ID: chunkC, DocumentID: docID, Seq: 2, Content: "far C"}, Score: 0.7},
+		},
+		parentChunks: []*types.ParentChunk{{
+			ID: parentID, DocumentID: docID, Seq: 0, Content: "parent of A and B",
+		}},
+	}
+	reranker := &fakeReranker{scores: []float64{0.8, 0.9, 0.7}, model: "fake-rerank"}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, reranker)
+
+	req := parentChildRequest("who won?", types.RetrievalTechniqueDense, types.RetrievalTechniqueRerank)
+	req.TopK = intPointer(1)
+	req.RetrievalConfig.RerankCandidates = intPointer(3)
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), req)
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+
+	// With rerank on, the pool stays rerank_candidates even though collapsing
+	// can merge results.
+	if chunks.denseTopK != 3 {
+		t.Errorf("dense top_k = %d, want the rerank pool 3", chunks.denseTopK)
+	}
+	if len(reranker.gotTexts) != 3 {
+		t.Fatalf("reranked %d texts, want the whole pool of 3: %q", len(reranker.gotTexts), reranker.gotTexts)
+	}
+	// The collapse runs on the reranked order and only then cuts to top_k:
+	// B leads, A shares its parent, and C is cut.
+	if len(got.Results) != 1 {
+		t.Fatalf("results = %+v, want the single top_k result", got.Results)
+	}
+	first := got.Results[0]
+	if first.ChunkID != chunkB || first.Content != "parent of A and B" ||
+		first.ParentChunkID == nil || *first.ParentChunkID != parentID {
+		t.Errorf("first result = %+v, want B's parent", first)
+	}
+	if first.Score != 0.9 || first.Scores[types.RetrievalTechniqueDense] != 0.8 ||
+		first.Ranks[types.RetrievalTechniqueRerank] != 1 || first.Ranks[types.RetrievalTechniqueDense] != 2 {
+		t.Errorf("first result score/scores/ranks = %v/%v/%v, want B's rerank 0.9 over its dense 0.8",
+			first.Score, first.Scores, first.Ranks)
+	}
+
+	// embed, search, rerank, expand: the expand step is last and reports the
+	// two collapsed results before the cut.
+	if len(got.Trace) != 4 {
+		t.Fatalf("trace = %+v, want the embed, search, rerank and expand steps", got.Trace)
+	}
+	if step := got.Trace[2]; step.Step != types.TraceStepRerank {
+		t.Errorf("trace[2] = %+v, want the rerank step before the expansion", step)
+	}
+	step := got.Trace[3]
+	if step.Step != types.TraceStepExpandParents || step.Candidates == nil || *step.Candidates != 2 {
+		t.Errorf("trace[3] = %+v, want the expand step with 2 results before the cut", step)
+	}
+	expanded := expandedEntries(t, step)
+	if len(expanded) != 1 || expanded[0].ChunkID != chunkB ||
+		!slices.Equal(expanded[0].MatchedChunkIDs, []uuid.UUID{chunkB, chunkA}) {
+		t.Errorf("expanded = %+v, want B over A in the reranked order", expanded)
+	}
+}
+
+func TestRetrieveParentChildSearchesAtLeastTheFusionDepth(t *testing.T) {
+	chunks := &fakeChunkSearch{}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{}, chunks,
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
+
+	req := parentChildRequest("who won?", types.RetrievalTechniqueDense)
+	req.TopK = intPointer(3)
+	if _, err := retrieval.Retrieve(callerContext(uuid.New()), req); err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if chunks.denseTopK != types.RetrievalFusionCandidates {
+		t.Errorf("dense top_k = %d, want at least the fusion depth %d", chunks.denseTopK, types.RetrievalFusionCandidates)
+	}
+
+	req = parentChildRequest("who won?", types.RetrievalTechniqueDense)
+	req.TopK = intPointer(types.RetrievalFusionCandidates + 10)
+	if _, err := retrieval.Retrieve(callerContext(uuid.New()), req); err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if chunks.denseTopK != types.RetrievalFusionCandidates+10 {
+		t.Errorf("dense top_k = %d, want top_k above the fusion depth to be kept", chunks.denseTopK)
+	}
+}
+
+func TestRetrieveParentChildWrapsAListParentsFailure(t *testing.T) {
+	listErr := errors.New("postgres down")
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	parentID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000c1")
+	chunks := &fakeChunkSearch{
+		denseMatches: []*types.ChunkMatch{{
+			Chunk:    &types.Chunk{ID: uuid.New(), DocumentID: docID, Content: "near"},
+			ParentID: &parentID,
+			Score:    0.9,
+		}},
+		parentErr: listErr,
+	}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
+
+	req := parentChildRequest("who won?", types.RetrievalTechniqueDense)
+	req.TopK = intPointer(5)
+	_, err := retrieval.Retrieve(callerContext(uuid.New()), req)
+	if !errors.Is(err, listErr) || !strings.Contains(err.Error(), "parent chunks") {
+		t.Errorf("Retrieve = %v, want the parent lookup error wrapped with what it was doing", err)
+	}
+	if _, ok := apperrors.IsAppError(err); ok {
+		t.Errorf("Retrieve = %v, want a plain error so the handler answers 500", err)
+	}
+}
+
+func TestRetrieveWithParentChildOffNeverListsParents(t *testing.T) {
+	docID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000b1")
+	parentID := uuid.MustParse("0190d2a8-0000-7000-8000-0000000000c1")
+	chunkID := uuid.MustParse("0190d2a8-0000-7000-8000-000000000001")
+	chunks := &fakeChunkSearch{
+		denseMatches: []*types.ChunkMatch{{
+			Chunk:    &types.Chunk{ID: chunkID, DocumentID: docID, Content: "the child"},
+			ParentID: &parentID,
+			Score:    0.9,
+		}},
+		// A caller here would fail the request, so the assertion is strict.
+		parentErr: errors.New("must not be reached"),
+	}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{docID}}, chunks,
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
+
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), &types.RetrievalRequest{
+		Query: "who won?", TopK: intPointer(5),
+	})
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if chunks.parentCalls != 0 {
+		t.Errorf("ListParentChunks called %d times with parent_child off, want never", chunks.parentCalls)
+	}
+	if len(got.Results) != 1 || got.Results[0].Content != "the child" ||
+		got.Results[0].ParentChunkID != nil {
+		t.Errorf("results = %+v, want the child unchanged", got.Results)
+	}
+	for _, step := range got.Trace {
+		if step.Step == types.TraceStepExpandParents {
+			t.Errorf("trace = %+v, want no expand step with parent_child off", got.Trace)
+		}
+	}
+}
+
+func TestRetrieveParentChildWithNothingReadableKeepsTheEmptyExpandedList(t *testing.T) {
+	chunks := &fakeChunkSearch{parentErr: errors.New("must not be reached")}
+	retrieval := NewRetrievalService(&fakeReadableDocuments{readable: []uuid.UUID{}}, chunks,
+		&fakeEmbedder{vectors: [][]float32{{1}}, model: "fake-embedding"}, nil)
+
+	req := parentChildRequest("who won?", types.RetrievalTechniqueDense)
+	req.TopK = intPointer(5)
+	got, err := retrieval.Retrieve(callerContext(uuid.New()), req)
+	if err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if chunks.parentCalls != 0 {
+		t.Errorf("ListParentChunks called %d times with nothing readable, want never", chunks.parentCalls)
+	}
+
+	step := got.Trace[len(got.Trace)-1]
+	if step.Step != types.TraceStepExpandParents || step.Technique != types.RetrievalTechniqueParentChild ||
+		step.Candidates == nil || *step.Candidates != 0 {
+		t.Fatalf("trace last step = %+v, want expand_parents with 0 candidates", step)
+	}
+	if expanded := expandedEntries(t, step); len(expanded) != 0 {
+		t.Errorf("expanded = %+v, want an empty list", expanded)
+	}
+
+	// The empty answer keeps its shape: expanded is present as [], not left
+	// out the way an omitted slice would be.
+	body, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"expanded":[]`) {
+		t.Errorf("JSON = %s, want the expand step's expanded as []", body)
 	}
 }
 
