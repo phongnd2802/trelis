@@ -19,6 +19,9 @@ type Querier interface {
 	CreateGroup(ctx context.Context, name string) (CreateGroupRow, error)
 	CreatePrincipal(ctx context.Context, name string) (CreatePrincipalRow, error)
 	DeleteChunksByDocument(ctx context.Context, documentID uuid.UUID) error
+	// Deleting a Document removes its Chunks, Parent Chunks and Access List by
+	// ON DELETE CASCADE. Zero rows means it was already deleted.
+	DeleteDocument(ctx context.Context, id uuid.UUID) (int64, error)
 	DeleteParentChunksByDocument(ctx context.Context, documentID uuid.UUID) error
 	// The system view of one Document, with no access check: the ingest
 	// activities run with no Principal.

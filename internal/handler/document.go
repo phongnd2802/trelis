@@ -171,6 +171,35 @@ func (h *DocumentHandler) GetDocument(w http.ResponseWriter, r *http.Request) {
 	writeData(r.Context(), w, http.StatusOK, doc)
 }
 
+// DeleteDocument answers DELETE /documents/{id}: only the owner may delete a
+// Document. It removes the Document and everything derived from it, cancels
+// its ingest and, once the row is gone, removes its objects.
+//
+//	@Summary		Delete a Document
+//	@Description	Only the Document's owner may delete it. Removes the Document and everything derived from it, cancels its ingest and, once the row is gone, removes every object it stored. A reader who is not the owner gets 403; a caller who cannot read the Document gets 404, the same as for one that does not exist.
+//	@Tags			documents
+//	@Security		bearerAuth
+//	@Param			id	path	string	true	"Document ID"	format(uuid)
+//	@Success		204	"No Content"
+//	@Failure		400	{object}	handler.ErrorResponse	"Invalid Document ID"
+//	@Failure		401	{object}	router.ErrorResponse	"Missing or invalid API key"
+//	@Failure		403	{object}	handler.ErrorResponse	"The caller can read the Document but is not its owner"
+//	@Failure		404	{object}	handler.ErrorResponse	"No readable Document with that ID"
+//	@Failure		500	{object}	handler.ErrorResponse	"Internal server error; a failed API key check answers the router's error body instead"
+//	@Router			/documents/{id} [delete]
+func (h *DocumentHandler) DeleteDocument(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, r, errors.NewBadRequestError("Invalid Document ID"))
+		return
+	}
+	if err := h.service.DeleteDocument(r.Context(), id); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // DownloadDocumentFile streams a Document's Source File to a caller who can
 // read it, like Omnisc's DownloadKnowledgeFile. It is always an attachment,
 // never rendered in the API's origin (ADR-0006).

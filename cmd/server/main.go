@@ -310,9 +310,12 @@ func run(configPath string, args []string) (err error) {
 	} else {
 		logger.Ctx(ctx).Warn("no chat model configured; pipeline answers will answer service unavailable")
 	}
+	starter := ingest.NewStarter(temporal, cfg.Temporal.TaskQueue)
+	// One Starter serves both roles: the ingest start and the delete cleanup.
+	documentService := service.NewDocumentService(dbStore, docRepo, principalRepo, files, starter, starter)
 	ingestActivities := ingest.NewActivities(service.NewIngestService(dbStore, docRepo,
 		repository.NewChunkRepository(dbStore), files, parser.NewFormatRouter(false), embedder,
-		cfg.Chunking.SplitterConfig()))
+		cfg.Chunking.SplitterConfig()), documentService)
 	stopIngestWorker := startWorker(ctx, "ingest", cfg.Temporal.TaskQueue, func() worker.Worker {
 		return ingest.NewWorker(temporal, cfg.Temporal.TaskQueue, cfg.Temporal.ModelTaskQueue,
 			cfg.Models.Embedding.BatchSize, ingestActivities)
@@ -323,14 +326,10 @@ func run(configPath string, args []string) (err error) {
 			cfg.Temporal.ModelActivitiesPerSecond, ingestActivities)
 	})
 	defer stopModelWorker()
-	starter := ingest.NewStarter(temporal, cfg.Temporal.TaskQueue)
 	stopReconciler := startReconciler(ctx,
 		service.NewReconcileService(docRepo, files, starter), cfg.Reconciler.Interval)
 	defer stopReconciler()
-	docs := handler.NewDocumentHandler(
-		service.NewDocumentService(dbStore, docRepo, principalRepo, files, starter),
-		cfg.Storage.MaxFileSize(),
-	)
+	docs := handler.NewDocumentHandler(documentService, cfg.Storage.MaxFileSize())
 	retrievalService := service.NewRetrievalService(docRepo, repository.NewChunkSearcher(dbStore), embedder, reranker)
 	retrieval := handler.NewRetrievalHandler(retrievalService)
 	answers := handler.NewAnswerHandler(service.NewAnswerService(retrievalService, answerGenerator))

@@ -11,6 +11,11 @@ SELECT * FROM documents WHERE owner_id = $1 AND file_hash = $2;
 -- name: GetDocumentByID :one
 SELECT * FROM documents WHERE id = $1;
 
+-- Deleting a Document removes its Chunks, Parent Chunks and Access List by
+-- ON DELETE CASCADE. Zero rows means it was already deleted.
+-- name: DeleteDocument :execrows
+DELETE FROM documents WHERE id = $1;
+
 -- A failed parse keeps its reason; a pending, processing or completed
 -- Document carries none, so the reason can neither go stale nor be set on a
 -- Document that did not fail. execrows lets the caller notice a missing row.

@@ -4,8 +4,8 @@
 // kept whole so codes stay stable, the domain codes (tenants, agents, ...)
 // and the constructors Trelis does not call are dropped,
 // ErrRequestEntityTooLarge and ErrModelProvider are added, along with
-// NewModelProviderError and the AppError cause/Unwrap, and IsAppError unwraps.
-// See NOTICE.
+// NewForbiddenError, NewModelProviderError and the AppError cause/Unwrap, and
+// IsAppError unwraps. See NOTICE.
 
 // Package errors is the application error a handler answers with: a stable
 // numeric code, a message fit for the client, and the HTTP status.
@@ -88,6 +88,16 @@ func NewNotFoundError(message string) *AppError {
 		Code:     ErrNotFound,
 		Message:  message,
 		HTTPCode: http.StatusNotFound,
+	}
+}
+
+// NewForbiddenError creates a forbidden error: the caller may read the
+// resource but may not change it.
+func NewForbiddenError(message string) *AppError {
+	return &AppError{
+		Code:     ErrForbidden,
+		Message:  message,
+		HTTPCode: http.StatusForbidden,
 	}
 }
 

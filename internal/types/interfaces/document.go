@@ -27,9 +27,33 @@ type DocumentService interface {
 	// read, with the same not-found error as GetDocumentByID. The caller
 	// closes the reader.
 	GetDocumentFile(ctx context.Context, id uuid.UUID) (*types.Document, io.ReadCloser, error)
+	// DeleteDocument removes a Document the caller owns and everything derived
+	// from it. Only the owner may delete it: a caller who can read it but is
+	// not its owner gets a forbidden error, and one who cannot read it gets
+	// the same not-found error as for a missing Document. It starts the
+	// workflow that removes the Document's objects.
+	DeleteDocument(ctx context.Context, id uuid.UUID) error
 	// ListPagedDocuments returns a page of the Documents the caller can read,
 	// newest first.
 	ListPagedDocuments(ctx context.Context, page *types.Pagination) (*types.PageResult, error)
+}
+
+// DocumentCleanupService is the use case the delete workflow's activity
+// calls once a Document's row is gone: removing the objects under its prefix
+// (ADR-0006).
+type DocumentCleanupService interface {
+	// DeleteDocumentObjects removes every object under the Document's
+	// documents/{document_id}/ prefix. An empty prefix is not an error, so a
+	// retried activity or a second cleanup run is harmless.
+	DeleteDocumentObjects(ctx context.Context, documentID uuid.UUID) error
+}
+
+// DocumentUseCases is the whole Document service: the handler's
+// DocumentService and the delete workflow activity's DocumentCleanupService.
+// The constructor returns one value that wires both.
+type DocumentUseCases interface {
+	DocumentService
+	DocumentCleanupService
 }
 
 // DocumentRepository persists Documents and their Access Lists.
@@ -50,6 +74,10 @@ type DocumentRepository interface {
 	// reason shown with it; any other status clears the reason. It returns
 	// ErrDocumentNotFound when no row matches.
 	SetParseStatus(ctx context.Context, id uuid.UUID, status, parseError string) error
+	// DeleteDocument removes the Document row and everything derived from it.
+	// It returns ErrDocumentNotFound when no row matched, which covers a
+	// concurrent delete.
+	DeleteDocument(ctx context.Context, id uuid.UUID) error
 	// GetReadableDocumentByID returns the Document if principalID can read
 	// it, else ErrDocumentNotFound.
 	GetReadableDocumentByID(ctx context.Context, principalID, id uuid.UUID) (*types.Document, error)

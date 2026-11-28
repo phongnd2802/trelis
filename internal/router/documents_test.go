@@ -41,12 +41,14 @@ type server struct {
 	ctx    context.Context
 }
 
-// fakeStarter is an IngestStarter that records the IDs it was asked to start
-// and can fail.
+// fakeStarter is a workflow starter that records the IDs it was asked to
+// start and can fail either workflow.
 type fakeStarter struct {
-	mu      sync.Mutex
-	started []uuid.UUID
-	err     error
+	mu        sync.Mutex
+	started   []uuid.UUID
+	deleted   []uuid.UUID
+	err       error
+	deleteErr error
 }
 
 func (f *fakeStarter) StartIngest(_ context.Context, documentID uuid.UUID) error {
@@ -56,11 +58,27 @@ func (f *fakeStarter) StartIngest(_ context.Context, documentID uuid.UUID) error
 	return f.err
 }
 
+// StartDocumentDelete records the Document whose cleanup workflow was asked
+// for.
+func (f *fakeStarter) StartDocumentDelete(_ context.Context, documentID uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleted = append(f.deleted, documentID)
+	return f.deleteErr
+}
+
 // startedIDs returns the IDs StartIngest was called with, in order.
 func (f *fakeStarter) startedIDs() []uuid.UUID {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]uuid.UUID(nil), f.started...)
+}
+
+// deletedIDs returns the IDs StartDocumentDelete was called with, in order.
+func (f *fakeStarter) deletedIDs() []uuid.UUID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]uuid.UUID(nil), f.deleted...)
 }
 
 func newServer(t *testing.T, principals ...string) *server {
@@ -82,7 +100,7 @@ func newServer(t *testing.T, principals ...string) *server {
 	c.files = filetest.NewMemory()
 	c.ingest = &fakeStarter{}
 	docs := service.NewDocumentService(store,
-		repository.NewDocumentRepository(store), principalRepo, c.files, c.ingest)
+		repository.NewDocumentRepository(store), principalRepo, c.files, c.ingest, c.ingest)
 	c.h = New(Readiness{}, authn, handler.NewPrincipalHandler(principalSvc),
 		handler.NewDocumentHandler(docs, testMaxFileSize), nil, nil, nil, false)
 	return c
@@ -463,5 +481,114 @@ func TestDocumentsNeedAKey(t *testing.T) {
 	c := newServer(t)
 	if rec := get(t, c.h, "/documents", ""); rec.Code != http.StatusUnauthorized {
 		t.Errorf("GET /documents without a key = %d, want 401", rec.Code)
+	}
+}
+
+// deleteDocument DELETEs /documents/{id} as the named Principal.
+func (c *server) deleteDocument(as, id string) *httptest.ResponseRecorder {
+	c.t.Helper()
+	req := httptest.NewRequest(http.MethodDelete, "/documents/"+id, nil)
+	req.Header.Set("Authorization", c.key(as))
+	rec := httptest.NewRecorder()
+	c.h.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestTheOwnerDeletesADocumentAndStartsItsCleanup(t *testing.T) {
+	c := newServer(t, "alice")
+	id := c.uploaded("alice", upFile("luat.txt", "Luật 04/2007"))
+
+	rec := c.deleteDocument("alice", id)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE /documents/%s = %d %s, want 204", id, rec.Code, rec.Body)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("204 body = %s, want no body", rec.Body)
+	}
+	if got := c.ingest.deletedIDs(); len(got) != 1 || got[0].String() != id {
+		t.Errorf("StartDocumentDelete called with %v, want once with %s", got, id)
+	}
+	if rec := get(t, c.h, "/documents/"+id, c.key("alice")); rec.Code != http.StatusNotFound {
+		t.Errorf("GET the deleted Document = %d %s, want 404", rec.Code, rec.Body)
+	}
+
+	if rec := c.deleteDocument("alice", id); rec.Code != http.StatusNotFound {
+		t.Errorf("second DELETE = %d %s, want 404", rec.Code, rec.Body)
+	}
+	if got := c.ingest.deletedIDs(); len(got) != 1 {
+		t.Errorf("StartDocumentDelete called %d times, want only the first delete to start cleanup", len(got))
+	}
+}
+
+func TestAReaderWhoIsNotTheOwnerCannotDelete(t *testing.T) {
+	c := newServer(t, "alice", "bob", "carol")
+	c.group("tax", "carol")
+	id := c.uploaded("alice", upFile("nghi-dinh.txt", "Nghị định 65"),
+		principals("bob"), groups("tax"))
+
+	for _, who := range []string{"bob", "carol"} {
+		rec := c.deleteDocument(who, id)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("%s DELETE = %d %s, want 403", who, rec.Code, rec.Body)
+			continue
+		}
+		if e := decode(t, rec); e.Success || e.Error == nil || e.Error.Code != 1002 {
+			t.Errorf("%s 403 body = %s, want the forbidden error envelope", who, rec.Body)
+		}
+	}
+	if got := c.ingest.deletedIDs(); len(got) != 0 {
+		t.Errorf("StartDocumentDelete called with %v after forbidden deletes, want never", got)
+	}
+	if rec := get(t, c.h, "/documents/"+id, c.key("alice")); rec.Code != http.StatusOK {
+		t.Errorf("alice GET after forbidden deletes = %d, want the Document still readable", rec.Code)
+	}
+}
+
+func TestDeletingAnUnreadableDocumentIsTheSameNotFoundAsAMissingOne(t *testing.T) {
+	c := newServer(t, "alice", "bob")
+	id := c.uploaded("alice", upFile("luong.txt", "Bảng lương 2024"))
+
+	unreadable := c.deleteDocument("bob", id)
+	missing := c.deleteDocument("bob", "0190d2a8-0000-7000-8000-00000000dead")
+	if unreadable.Code != http.StatusNotFound {
+		t.Errorf("bob DELETE alice's Document = %d %s, want 404", unreadable.Code, unreadable.Body)
+	}
+	if unreadable.Body.String() != missing.Body.String() {
+		t.Errorf("unreadable body %s differs from missing body %s, which reveals existence",
+			unreadable.Body, missing.Body)
+	}
+	if got := c.ingest.deletedIDs(); len(got) != 0 {
+		t.Errorf("StartDocumentDelete called with %v, want never", got)
+	}
+	if rec := get(t, c.h, "/documents/"+id, c.key("alice")); rec.Code != http.StatusOK {
+		t.Errorf("alice GET after bob's delete = %d, want 200", rec.Code)
+	}
+}
+
+func TestDeletingAMalformedDocumentIDIs400(t *testing.T) {
+	c := newServer(t, "alice")
+	rec := c.deleteDocument("alice", "not-a-uuid")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("DELETE /documents/not-a-uuid = %d %s, want 400", rec.Code, rec.Body)
+	}
+	if e := decode(t, rec); e.Success || e.Error == nil || e.Error.Code != 1000 {
+		t.Errorf("400 body = %s, want the bad-request error envelope", rec.Body)
+	}
+}
+
+func TestADeleteSucceedsWhenTheCleanupWorkflowWillNotStart(t *testing.T) {
+	c := newServer(t, "alice")
+	id := c.uploaded("alice", upFile("luat-thue.txt", "Điều 1. Phạm vi điều chỉnh"))
+	c.ingest.deleteErr = errors.New("temporal unreachable")
+
+	rec := c.deleteDocument("alice", id)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE = %d %s, want 204 even when cleanup did not start", rec.Code, rec.Body)
+	}
+	if rec := get(t, c.h, "/documents/"+id, c.key("alice")); rec.Code != http.StatusNotFound {
+		t.Errorf("GET the deleted Document = %d, want 404", rec.Code)
+	}
+	if got := c.ingest.deletedIDs(); len(got) != 1 {
+		t.Errorf("StartDocumentDelete called %d times, want once even though it failed", len(got))
 	}
 }

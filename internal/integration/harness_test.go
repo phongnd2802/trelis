@@ -25,6 +25,7 @@ import (
 	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
 	tcneo4j "github.com/testcontainers/testcontainers-go/modules/neo4j"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
 
 	"github.com/phongnd2802/trelis/internal/models/modeltest"
@@ -219,6 +220,8 @@ type trelis struct {
 	// taskQueue is this Trelis's Temporal task queue, named after dbname so
 	// processes running side by side never take each other's tasks.
 	taskQueue string
+	// logs is everything the process wrote to stdout and stderr.
+	logs *syncBuffer
 }
 
 // listeningAddr returns the addr field of the JSON record Trelis logs once it
@@ -267,6 +270,7 @@ func startWith(t *testing.T, extraEnv ...string) *trelis {
 		t.Fatal(err)
 	}
 	var logs syncBuffer
+	tr.logs = &logs
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start trelis: %v", err)
 	}
@@ -325,6 +329,23 @@ func startWith(t *testing.T, extraEnv ...string) *trelis {
 		t.Fatalf("trelis not listening after %v:\n%s", bootTimeout, logs.String())
 	}
 	return tr
+}
+
+// logContains reports whether this Trelis's output contains s.
+func (tr *trelis) logContains(s string) bool {
+	return strings.Contains(tr.logs.String(), s)
+}
+
+// temporalClient dials the shared Temporal dev server and closes the client
+// when the test ends.
+func temporalClient(t *testing.T) client.Client {
+	t.Helper()
+	c, err := client.Dial(client.Options{HostPort: net.JoinHostPort(deps.temporal.host, deps.temporal.port)})
+	if err != nil {
+		t.Fatalf("dial Temporal: %v", err)
+	}
+	t.Cleanup(c.Close)
+	return c
 }
 
 // freshDatabase creates an empty database on the shared Postgres, dropped

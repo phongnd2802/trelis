@@ -114,6 +114,20 @@ func (r *documentRepository) SetParseStatus(ctx context.Context, id uuid.UUID, s
 	return nil
 }
 
+// DeleteDocument removes a Document; its Chunks, Parent Chunks and Access
+// List rows go with it by ON DELETE CASCADE. A Document already gone is
+// ErrDocumentNotFound, which covers a concurrent delete.
+func (r *documentRepository) DeleteDocument(ctx context.Context, id uuid.UUID) error {
+	rows, err := r.store.Querier(ctx).DeleteDocument(ctx, id)
+	if err != nil {
+		return fmt.Errorf("delete document %s: %w", id, err)
+	}
+	if rows == 0 {
+		return ErrDocumentNotFound
+	}
+	return nil
+}
+
 // GetReadableDocumentByID returns the Document if principalID can read it.
 func (r *documentRepository) GetReadableDocumentByID(ctx context.Context, principalID, id uuid.UUID) (*types.Document, error) {
 	row, err := r.store.Querier(ctx).GetReadableDocument(ctx, sqlc.GetReadableDocumentParams{ID: id, PrincipalID: principalID})
