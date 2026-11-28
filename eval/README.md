@@ -140,8 +140,17 @@ Retrieval Configs:
 ```sh
 uv run --project eval trelis-eval retrieval run \
   --golden eval/data/multihop-rag/subset-golden.jsonl \
-  --manifest eval/data/multihop-rag/manifest.jsonl
+  --manifest eval/data/multihop-rag/manifest.jsonl \
+  --model-mode live
 ```
+
+Every run needs `--model-mode` or `$TRELIS_EVAL_MODEL_MODE`; without either it
+fails before its first request. The mode records where the model answers came
+from: `live` means Trelis called the providers directly, and `passthrough`,
+`record` and `replay` are the record/replay proxy's modes. The Ablation Matrix
+reports latency only for a `live` or `passthrough` run: a `record` run mixes
+recorded upstream calls with replayed ones, and a `replay` run replays every
+call.
 
 Pass `--config` more than once to compare configs in one command, for example
 `--config dense --config bm25+dense` once the server implements `bm25` (#33).
@@ -211,6 +220,7 @@ set -a; . .local/eval.env; set +a
 uv run --project eval trelis-eval answer run \
   --golden eval/data/multihop-rag/subset-golden.jsonl \
   --manifest eval/data/multihop-rag/manifest.jsonl \
+  --model-mode live \
   --graders correctness
 ```
 
@@ -247,7 +257,8 @@ upstream is called.
 ## Build the Ablation Matrix report
 
 Turn results files into the Ablation Matrix, with a 95% confidence interval on
-every metric, each Grader column and every latency percentile:
+every metric, each Grader column, every latency percentile, Tokens and Cost
+per Correct Answer:
 
 ```sh
 uv run --project eval trelis-eval report eval/baselines
@@ -256,13 +267,43 @@ uv run --project eval trelis-eval report eval/baselines
 `report` accepts results files or a directory of `*.jsonl` (sorted by name),
 writes `eval/reports/ablation-matrix.md` and `ablation-matrix.html`, and prints
 both paths. `--seed` (default 1) and `--resamples` (default 10,000) control the
-bootstrap; `--out-dir` chooses another directory. It needs no running Trelis.
-The report also has one table per Slice and, for answer runs, a Failure
-Attribution table. `eval/reports/` is meant to be published, not gitignored.
-The interval, comparability and determinism rules are in
-[docs/metrics.md](docs/metrics.md#confidence-intervals), and the two new
-sections are defined in [Slices in the report](docs/metrics.md#slices-in-the-report)
+bootstrap; `--out-dir` chooses another directory. `--prices PATH` names the
+price table (default `eval/prices.toml` when it exists; a missing file given
+explicitly is an error). It needs no running Trelis. The report also has one
+table per Slice and, for answer runs, a Failure Attribution table. Latency is
+shown only for `live` and `passthrough` runs: a `record` run mixes recorded
+upstream calls with replayed ones, a `replay` run replays every call, and a
+results file from before model modes shows `unknown`, with a note under the
+matrix. Tokens and Cost per Correct Answer are `—` on a
+retrieval row; a model the price table does not price also leaves that row's
+cost `—`, with a note naming the model. `eval/reports/` is meant to be
+published, not gitignored. The interval, comparability and determinism rules
+are in [docs/metrics.md](docs/metrics.md#confidence-intervals); Tokens and Cost
+per Correct Answer are defined in
+[Tokens and Cost per Correct Answer](docs/metrics.md#tokens-and-cost-per-correct-answer),
+and the two older sections in [Slices in the report](docs/metrics.md#slices-in-the-report)
 and [Failure Attribution](docs/metrics.md#failure-attribution).
+
+### Fill in the price table
+
+`eval/prices.toml` is committed with a currency and the price of the chat
+model this repo's eval stack uses (`deepseek-v4-flash-0731`, with its source
+and date). An answer whose model is not in the table makes Cost per Correct
+Answer `—` for that row. Add one table per model, keyed by the `model` of the
+answer's `generate` trace step exactly as Trelis reports it:
+
+```toml
+currency = "USD"
+
+[models."deepseek-v4-flash-0731"]
+input_per_million = 0.27
+output_per_million = 1.10
+```
+
+Those numbers are only the shape, not a quote; use what your provider charges.
+Prices are per million tokens and must not be negative. Cost covers only the
+generate call, because Trelis's debug object reports only the chat call's
+usage: embedding, rerank and the judge are not included.
 
 ## Record and replay model calls
 
@@ -277,8 +318,9 @@ uv run --project eval trelis-eval proxy --mode record \
 ```
 
 The command prints the `TRELIS_MODELS_EMBEDDING_BASE_URL` line to start Trelis
-with. Run the same Ablation Run again with `--mode replay` (no upstream and no
-provider key) and every recorded answer is served from
+with. Run the Ablation Run with `--model-mode record`; the replay pass uses
+`--model-mode replay`. Run the same Ablation Run again with `--mode replay` (no
+upstream and no provider key) and every recorded answer is served from
 `eval/fixtures/models` byte for byte, including its original `usage`. A
 missing fixture fails with a `404` and names the request, so a prompt or
 Chunk change cannot silently score a stale answer. [docs/record-replay.md](docs/record-replay.md)
@@ -304,11 +346,18 @@ scripts/eval-stack.sh up replay --rerank
 uv run --project eval trelis-eval retrieval run \
   --golden eval/data/multihop-rag/strat500-golden.jsonl \
   --manifest eval/data/multihop-rag/strat500-manifest.jsonl \
+  --model-mode replay \
   --config bm25 --config dense --config bm25+dense --config bm25+dense+rerank \
   --concurrency 4
 
 scripts/eval-stack.sh down
 ```
+
+`up` prints the `export TRELIS_EVAL_MODEL_MODE=<mode>` line to use: `record`
+with `up record`, `replay` with `up replay`. The run must record the mode it
+actually used, because the report shows latency only for `live` and
+`passthrough` runs. The command above uses the replay stack; pass
+`--model-mode record` (or export it) for the recording run.
 
 The script exports `.local/models.env` when it exists, so the keys above can
 live there instead. Unlike `make dev`, where the file overrides the

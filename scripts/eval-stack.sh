@@ -20,6 +20,12 @@
 #   scripts/eval-stack.sh down
 #   scripts/eval-stack.sh status
 #
+# `up` prints the line an Ablation Run needs, `export TRELIS_EVAL_MODEL_MODE=<mode>`
+# (record with `up record`, replay with `up replay`): the harness records the
+# mode in its results header, and the report shows latency only for live and
+# passthrough runs: a record run mixes recorded upstream calls with replayed
+# ones, and a replay run replays every call.
+#
 # Environment:
 #   EVAL_FIXTURES            fixture tree (default eval/fixtures/models, gitignored)
 #   EVAL_PROXY_ADDR          proxy listen address (default 127.0.0.1:4100)
@@ -304,6 +310,7 @@ case "$cmd" in
     cat >&2 <<EOF
 eval stack up ($mode): Trelis $trelis_url, $routes
 fixtures: $fixtures ($(find "$fixtures" -type f -name '*.json' | wc -l) recorded)
+for trelis-eval runs: export TRELIS_EVAL_MODEL_MODE=$mode
 logs: $state/trelis.log, $state/proxy.log; stop with scripts/eval-stack.sh down
 EOF
     ;;

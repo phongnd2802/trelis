@@ -99,16 +99,19 @@ the same concurrency. The metrics do not depend on it.
 
 ## Confidence intervals
 
-The Ablation Matrix report gives every metric mean and both latency
-percentiles a 95% confidence interval. The interval is a percentile bootstrap
-over the observations that estimate uses:
+The Ablation Matrix report gives every metric mean, both latency percentiles,
+Tokens and Cost per Correct Answer a 95% confidence interval. The interval is
+a percentile bootstrap over the observations that estimate uses:
 
 - each resample draws its observations with replacement at the same size: the
-  scored questions for a retrieval metric, the `ok` Grades for a Grader, and
-  the scored questions' per-call `latency_ms` for latency;
+  scored questions for a retrieval metric, the `ok` Grades for a Grader, the
+  scored questions' per-call `latency_ms` for latency, the scored answer
+  questions' `total_tokens` for Tokens, and the `(cost, correctness score)`
+  pairs for Cost per Correct Answer;
 - the statistic is computed on every resample: the mean for Recall@5,
-  Recall@10, MRR, nDCG@10 and each Grader, and the nearest-rank percentile for
-  latency;
+  Recall@10, MRR, nDCG@10, each Grader and Tokens, the nearest-rank percentile
+  for latency, and the ratio of mean cost to mean correctness for Cost per
+  Correct Answer;
 - the resample statistics are sorted, and the bounds are the values at rank
   `ceil(q * resamples)` (1-based, at least 1) for `q = 0.025` and
   `q = 0.975`, computed with exact integer arithmetic. The tail is rounded
@@ -122,8 +125,9 @@ over the observations that estimate uses:
 The bootstrap is seeded, and each (row, metric) draws from its own
 `random.Random(f"{seed}:{config_name}:{metric}")`, so adding, removing or
 reordering rows leaves another row's interval unchanged. The same results
-files and seed give byte-identical Markdown and HTML. The interval describes
-the sampled Golden questions, not a rerun of the same questions.
+files, seed and price table give byte-identical Markdown and HTML. The
+interval describes the sampled Golden questions, not a rerun of the same
+questions.
 
 ## Graders
 
@@ -254,28 +258,40 @@ uv run --project eval trelis-eval report eval/baselines
 ```
 
 `RESULTS` is one or more results files; a directory contributes every
-`*.jsonl` in it, sorted by name. The command writes
-`<out-dir>/ablation-matrix.md` and `<out-dir>/ablation-matrix.html` (default
-`eval/reports`) and prints both paths. It reads the files only: no HTTP
-request and no API key. Nothing in the report depends on the wall clock, so
-the same files and seed reproduce it byte for byte.
+`*.jsonl` in it, sorted by name. `--prices PATH` names the TOML price table
+(default `eval/prices.toml` when it exists; a missing file given explicitly is
+an error). The command writes `<out-dir>/ablation-matrix.md` and
+`<out-dir>/ablation-matrix.html` (default `eval/reports`) and prints both
+paths. It reads the files only: no HTTP request and no API key. Nothing in the
+report depends on the wall clock, so the same files, seed and price table
+reproduce it byte for byte.
 
 The matrix has one row per Retrieval Config: Recall@5, Recall@10, MRR,
 nDCG@10, one column per Grader present in the report, latency p50 and p95,
-each as `point [low, high]`, then the scored, skipped and error counts and the
-run's `concurrency`. The Grader columns are the names in the report's answer
-runs, in registry order, with unknown names sorted after them; each column
-uses the Grader's label. A Grader cell is the mean over its `ok` scores with
-the same seeded bootstrap interval, followed by its `grader_error` and
-`not_applicable` counts, each part only when it is non-zero:
-`0.720 [0.660, 0.780] · 3 errors · 5 n/a` (`1 error` singular). A row that
-lacks that Grader, and a retrieval row, shows `—`; an answer row with the
-Grader but no `ok` grade shows `—` for the estimate plus the non-zero counts,
-such as `— · 5 n/a`. A report of retrieval runs alone has no Grader columns.
-Both kinds can appear in one report, and the header records the Golden Set
-path and SHA-256, its question count, `top_k`, the seed, the resample count and
-the confidence level; a second table records each row's `run_id` and harness
-version.
+Tokens and Cost per Correct Answer, each estimate as `point [low, high]`, then
+the scored, skipped and error counts and the run's `concurrency`. The Grader
+columns are the names in the report's answer runs, in registry order, with
+unknown names sorted after them; each column uses the Grader's label. A Grader
+cell is the mean over its `ok` scores with the same seeded bootstrap interval,
+followed by its `grader_error` and `not_applicable` counts, each part only when
+it is non-zero: `0.720 [0.660, 0.780] · 3 errors · 5 n/a` (`1 error` singular).
+A row that lacks that Grader, and a retrieval row, shows `—`; an answer row
+with the Grader but no `ok` grade shows `—` for the estimate plus the non-zero
+counts, such as `— · 5 n/a`. A report of retrieval runs alone has no Grader
+columns. Both kinds can appear in one report, and the header records the
+Golden Set path and SHA-256, its question count, `top_k`, the seed, the
+resample count and the confidence level; a second table records each row's
+`run_id` and harness version.
+
+Latency is shown only for a run whose model answers came from the provider:
+`live` or `passthrough`. A `record` run mixes recorded upstream calls with
+replayed ones, so its latency measures neither the provider nor the replay; a
+`replay` run replays every call; and a run written before the header recorded
+a mode shows `unknown`. Those latency cells show `replayed` or `unknown`, and a
+note under the matrix explains either case. `trelis-eval retrieval run` and
+`answer run` require `--model-mode` or `$TRELIS_EVAL_MODEL_MODE`, and the header
+records it, because a replayed or mixed latency must not be compared with a
+live one's.
 
 The files must share the Golden Set SHA-256 and `top_k`, and no two may name
 the same Retrieval Config; different `run_id`s are fine, because the baselines
@@ -283,6 +299,57 @@ come from different runs. The command exits 1 with `error: ...` when they do
 not. Latency is measured under the run's `concurrency`, which is shown per
 row; a report mixing concurrency levels says so, because latency compares
 only at the same one.
+
+## Tokens and Cost per Correct Answer
+
+**Tokens** is the mean `total_tokens` per scored answer question: the chat
+call whose usage Trelis reports in the answer's debug object. A retrieval run
+made no chat call, so its Tokens cell is `—`; an answer run with no scored
+question shows `n/a`. The interval is the seeded bootstrap mean, keyed
+`tokens`.
+
+**Cost per Correct Answer** is what a Retrieval Config spends per question
+divided by the share of questions it answers correctly
+([GLOSSARY](../../GLOSSARY.md)). One question's cost prices the `generate`
+trace step's model with the price table:
+
+```
+cost = prompt_tokens × input_per_million / 1e6
+     + completion_tokens × output_per_million / 1e6
+```
+
+The estimate uses the scored questions that have an `ok` `correctness` Grade,
+as `(cost, correctness score)` pairs. Its point estimate is
+`mean(cost) / mean(score)`, and its interval is the seeded bootstrap of that
+ratio over resampled pairs, keyed `cost_per_correct`. A resample with no
+correct answer has a zero share, so its ratio is infinite; an infinite bound
+renders as `∞`, and a point estimate whose share is zero is just `∞`. The
+point estimate renders to four significant digits, for example
+`0.002714 [0.002101, 0.003390]`.
+
+A question whose usage is all zeros made no chat call: it costs `0` and still
+enters the pairs. A `grader_error` or `not_applicable` correctness Grade does
+not, because there is no correctness score to divide by.
+
+The cell is `—` when it cannot be priced. A missing price table and an
+unpriced model also add a note under the matrix:
+
+- no price table was given (`--prices`), so the column has no currency either;
+- a question in the pairs names a model the table does not price; the report
+  never guesses a price and names the missing model(s).
+
+A retrieval run, or an answer run with no `ok` correctness Grade, simply
+shows `—` without a note, because there is no cost to explain.
+
+The currency is part of the header, `Cost per Correct Answer (USD)`, and comes
+from the price table. `eval/prices.toml` is the committed table: a
+`currency` and one `[models."<name>"]` table per model, whose key must equal
+the `generate` step's `model` exactly. Prices are configuration, not code;
+each committed entry names its source and the date it was read.
+
+Cost covers **only the generate call**, because Trelis's debug object reports
+only the chat call's usage. Embedding, rerank and the judge are not included;
+the judge is eval cost, not the config's cost.
 
 ## Slices in the report
 
@@ -427,35 +494,38 @@ blank lines, and every line carries `"schema_version": 2` and a `"type"`:
 `trelis-eval` writes the file and `load_ablation_run` reads it. The reader
 validates the schema version, the record types and their order, and the field
 types, so a later ticket can build reports on the file without guessing. A
-version-1 file has no `kind`, `judge_model`, `graders`, answer fields or
-summary `grades`; the reader loads it as a retrieval run. The four files in
-`eval/baselines/` are version 1, and `trelis-eval report` keeps reading them.
+version-1 file has no `kind`, `model_mode`, `judge_model`, `graders`, answer
+fields or summary `grades`; the reader loads it as a retrieval run whose model
+mode is `unknown`. The four files in `eval/baselines/` are version 1, and
+`trelis-eval report` keeps reading them.
 
 The header carries the SHA-256 of the Golden Set and manifest so a results
 file can be tied to the exact inputs. `kind` is `retrieval` for a file written
-by `retrieval run` and `answer` for one written by `answer run`. An answer
-header also records the judge model (null when no judge-based Grader ran) and
-the Grader names. `config.name` is the `+`-joined techniques in sorted order,
-and the reader rejects a name that is not that canonical join. No file carries
-an API key or the judge's key, and a question line never carries Chunk
-`content` or `context_header`: results files are versioned and shared, while
-text can be re-read from Trelis. The `evidence` list is de-duplicated
-`source_id` values; `retrieved` follows the API's result order. Each scored
-question keeps the API's `trace`, so latency can be attributed per Retrieval
-Technique and model without a schema change.
+by `retrieval run` and `answer` for one written by `answer run`. `model_mode`
+is `live`, `passthrough`, `record` or `replay`, and always written; a version-2
+file written before the field existed loads as `unknown`, and a version-1 file
+must not carry it. An answer header also records the judge model (null when no
+judge-based Grader ran) and the Grader names. `config.name` is the `+`-joined
+techniques in sorted order, and the reader rejects a name that is not that
+canonical join. No file carries an API key or the judge's key, and a question
+line never carries Chunk `content` or `context_header`: results files are
+versioned and shared, while text can be re-read from Trelis. The `evidence`
+list is de-duplicated `source_id` values; `retrieved` follows the API's result
+order. Each scored question keeps the API's `trace`, so latency can be
+attributed per Retrieval Technique and model without a schema change.
 
 ### `run`
 
 A retrieval run:
 
 ```json
-{"schema_version": 2, "type": "run", "kind": "retrieval", "run_id": "20260101T000000Z", "config": {"name": "dense", "techniques": ["dense"]}, "top_k": 10, "concurrency": 1, "golden_set": {"path": "eval/data/multihop-rag/subset-golden.jsonl", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "questions": 500}, "manifest": {"path": "eval/data/multihop-rag/manifest.jsonl", "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}, "base_url": "http://localhost:8080", "harness_version": "0.1.0", "started_at": "2026-01-01T00:00:00+00:00"}
+{"schema_version": 2, "type": "run", "kind": "retrieval", "model_mode": "live", "run_id": "20260101T000000Z", "config": {"name": "dense", "techniques": ["dense"]}, "top_k": 10, "concurrency": 1, "golden_set": {"path": "eval/data/multihop-rag/subset-golden.jsonl", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "questions": 500}, "manifest": {"path": "eval/data/multihop-rag/manifest.jsonl", "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}, "base_url": "http://localhost:8080", "harness_version": "0.1.0", "started_at": "2026-01-01T00:00:00+00:00"}
 ```
 
 An answer run adds `judge_model` and `graders`:
 
 ```json
-{"schema_version": 2, "type": "run", "kind": "answer", "run_id": "20260101T000000Z", "config": {"name": "dense", "techniques": ["dense"]}, "top_k": 10, "concurrency": 1, "golden_set": {"path": "eval/data/multihop-rag/subset-golden.jsonl", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "questions": 500}, "manifest": {"path": "eval/data/multihop-rag/manifest.jsonl", "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}, "base_url": "http://localhost:8080", "harness_version": "0.1.0", "started_at": "2026-01-01T00:00:00+00:00", "judge_model": "judge-model", "graders": ["correctness"]}
+{"schema_version": 2, "type": "run", "kind": "answer", "model_mode": "replay", "run_id": "20260101T000000Z", "config": {"name": "dense", "techniques": ["dense"]}, "top_k": 10, "concurrency": 1, "golden_set": {"path": "eval/data/multihop-rag/subset-golden.jsonl", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "questions": 500}, "manifest": {"path": "eval/data/multihop-rag/manifest.jsonl", "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}, "base_url": "http://localhost:8080", "harness_version": "0.1.0", "started_at": "2026-01-01T00:00:00+00:00", "judge_model": "judge-model", "graders": ["correctness"]}
 ```
 
 ### `question` — retrieval, scored

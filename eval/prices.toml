@@ -1,0 +1,22 @@
+# Price table for Cost per Correct Answer (#51).
+#
+# `trelis-eval report --prices` reads this file, and defaults to it when it
+# exists. Prices are configuration, not code: fill in what your provider
+# charges for the models Trelis reports in an answer's `generate` trace step.
+#
+# Each `[models."<name>"]` key must equal that step's `model` exactly. Both
+# fields are required, are per million tokens, and must not be negative. The
+# currency is shown in the report's column header.
+currency = "USD"
+
+# Alibaba Cloud Model Studio, Singapore (ap-southeast-1), pay-as-you-go list
+# price, read 2026-11-28 from
+# https://www.alibabacloud.com/help/en/model-studio/model-pricing
+# (page last updated 2026-11-27). Since 2026-08-17 this snapshot is billed
+# peak/off-peak: peak 08:00-22:00 UTC+8 is $0.44 in / $1.32 out, off-peak
+# 22:00-08:00 UTC+8 is $0.22 / $0.66. The table takes one price, so it uses
+# peak, the upper bound. It ignores the context-cache discount and the free
+# quota, and calls through a prepaid Token Plan may be billed differently.
+[models."deepseek-v4-flash-0731"]
+input_per_million = 0.44
+output_per_million = 1.32

@@ -2,12 +2,14 @@
 
 The report is built from Ablation Run results files alone. Every Retrieval
 Config gets a row with the four metric means, one column per Grader in the
-report, and the two latency percentiles, each with a seeded percentile-bootstrap
-confidence interval, plus the counts and the run's concurrency. Each Slice then
-gets a table of the same metric and Grader estimates, and each answer run gets a
-Failure Attribution table that labels its scored questions by the stage that
-failed. The same files and seed render byte-identical Markdown and HTML: no
-wall-clock time, no machine paths and no randomness outside the seeded RNG.
+report, the two latency percentiles (shown only when the run measured the
+provider), Tokens and Cost per Correct Answer from a configured price table,
+each with a seeded percentile-bootstrap confidence interval, plus the counts
+and the run's concurrency. Each Slice then gets a table of the same metric and
+Grader estimates, and each answer run gets a Failure Attribution table that
+labels its scored questions by the stage that failed. The same files, seed and
+price table render byte-identical Markdown and HTML: no wall-clock time, no
+machine paths and no randomness outside the seeded RNG.
 ``eval/docs/metrics.md`` holds the definitions.
 """
 
@@ -19,7 +21,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from html import escape
-from typing import cast
+from typing import Any, cast
 
 from .ablation_run import (
     METRIC_NAMES,
@@ -31,6 +33,7 @@ from .ablation_run import (
     AblationRunFile,
     GoldenSetRef,
     GradeOutcomes,
+    ModelMode,
     QuestionResult,
     QuestionStatus,
     RunKind,
@@ -38,11 +41,18 @@ from .ablation_run import (
 )
 from .attribution import FailureLabel, attribute_failure
 from .golden import hop_count
-from .graders import default_grader_names, grader_label
+from .graders import CORRECTNESS, GradeStatus, default_grader_names, grader_label
 from .metrics import mean, nearest_rank_percentile
+from .prices import PriceTable, generate_model, question_cost
 
 LATENCY_P50 = "latency_p50"
 LATENCY_P95 = "latency_p95"
+TOKENS = "tokens"
+"""The estimate key of the mean total tokens per scored answer question."""
+COST_PER_CORRECT = "cost_per_correct"
+"""The estimate key of mean cost divided by mean correctness score."""
+
+_MEASURED_MODEL_MODES = frozenset({ModelMode.LIVE, ModelMode.PASSTHROUGH})
 
 METRIC_LABELS = {
     RECALL_5: "Recall@5",
@@ -62,6 +72,22 @@ class MetricEstimate:
 
 
 @dataclass(frozen=True)
+class CostObservations:
+    """What one row's Cost per Correct Answer can be built from.
+
+    ``pairs`` holds one ``(cost, correctness score)`` per priced question with
+    an ok correctness Grade, ``unpriced_models`` names the generate models the
+    price table lacks, and ``questions_without_model`` counts the ok-graded
+    answers whose trace has no generate step. An unpriced model or a missing
+    model makes the whole row's cost unavailable.
+    """
+
+    pairs: tuple[tuple[float, float], ...] = ()
+    unpriced_models: tuple[str, ...] = ()
+    questions_without_model: int = 0
+
+
+@dataclass(frozen=True)
 class MatrixRow:
     """One Retrieval Config's Ablation Run, with every estimate's interval."""
 
@@ -70,12 +96,14 @@ class MatrixRow:
     harness_version: str
     concurrency: int
     kind: RunKind
+    model_mode: ModelMode
     scored: int
     skipped: int
     error: int
     graders: frozenset[str]
     grader_outcomes: dict[str, GradeOutcomes]
     estimates: dict[str, MetricEstimate | None]
+    cost: CostObservations = CostObservations()
 
 
 @dataclass(frozen=True)
@@ -129,11 +157,12 @@ class AblationMatrix:
     rows: tuple[MatrixRow, ...]
     slice_tables: tuple[SliceTable, ...]
     attribution_tables: tuple[AttributionTable, ...]
+    currency: str | None = None
 
 
-def bootstrap_ci(
-    values: Sequence[float],
-    statistic: Callable[[Sequence[float]], float],
+def bootstrap_ci[T](
+    values: Sequence[T],
+    statistic: Callable[[Sequence[T]], float],
     *,
     rng: random.Random,
     resamples: int,
@@ -145,14 +174,15 @@ def bootstrap_ci(
     from ``rng``, the statistic is computed on each, and the bounds are the
     sorted values at rank ``ceil(q * resamples)`` (1-based, at least 1) for
     ``q = (1 - confidence) / 2`` and its complement. No values gives ``None``;
-    constant values give the value at both bounds.
+    constant values give their statistic at both bounds.
     """
     _check_resamples(resamples)
     _check_confidence(confidence)
     if not values:
         return None
     if len(set(values)) == 1:
-        return values[0], values[0]
+        fixed = statistic(values)
+        return fixed, fixed
 
     lower_rank, upper_rank = _bound_ranks(resamples, confidence)
     estimates = []
@@ -169,6 +199,7 @@ def build_matrix(
     seed: int,
     resamples: int,
     confidence: float = 0.95,
+    prices: PriceTable | None = None,
 ) -> AblationMatrix:
     """Build the Ablation Matrix from loaded Ablation Run results files.
 
@@ -176,7 +207,8 @@ def build_matrix(
     over its scored questions, so it equals the results file's summary, and a
     latency percentile uses the same nearest-rank rule. Each interval draws
     from its own RNG keyed by the seed, config name and metric, so reordering
-    rows cannot change another row's interval.
+    rows cannot change another row's interval. ``prices`` prices Cost per
+    Correct Answer; without it the column is unavailable.
     """
     _check_resamples(resamples)
     _check_confidence(confidence)
@@ -197,12 +229,18 @@ def build_matrix(
         metric_values, latencies, grader_outcomes = _observations(
             run.questions, grader_names, run_graders
         )
+        series: list[_Series] = [
+            *_mean_series(metric_values, grader_outcomes),
+            (LATENCY_P50, latencies, _resample_percentile(50)),
+            (LATENCY_P95, latencies, _resample_percentile(95)),
+        ]
+        cost = _cost_observations(run, prices)
+        if run.kind is RunKind.ANSWER:
+            series.append((TOKENS, _token_values(run), _resample_mean))
+            if prices is not None and not cost.unpriced_models and not cost.questions_without_model:
+                series.append((COST_PER_CORRECT, cost.pairs, _resample_cost_per_correct))
         estimates = _row_estimates(
-            [
-                *_mean_series(metric_values, grader_outcomes),
-                (LATENCY_P50, latencies, _resample_percentile(50)),
-                (LATENCY_P95, latencies, _resample_percentile(95)),
-            ],
+            series,
             grader_names,
             key_parts=(str(seed), config),
             resamples=resamples,
@@ -215,12 +253,14 @@ def build_matrix(
                 harness_version=run_file.harness_version,
                 concurrency=run.concurrency,
                 kind=run.kind,
+                model_mode=run.model_mode,
                 scored=run.summary.scored,
                 skipped=run.summary.skipped,
                 error=run.summary.error,
                 graders=run_graders,
                 grader_outcomes=grader_outcomes,
                 estimates=estimates,
+                cost=cost,
             )
         )
 
@@ -268,6 +308,7 @@ def build_matrix(
             for name in slice_names
         ),
         attribution_tables=tuple(attribution_tables),
+        currency=prices.currency if prices is not None else None,
     )
 
 
@@ -293,7 +334,53 @@ def _observations(
     return metric_values, latencies, grader_outcomes
 
 
-_Series = tuple[str, Sequence[float], Callable[[Sequence[float]], float]]
+def _token_values(run: AblationRun) -> list[float]:
+    """Return the total tokens of every scored answer."""
+    return [
+        float(result.usage.total_tokens)
+        for result in run.questions
+        if result.status is QuestionStatus.SCORED and result.usage is not None
+    ]
+
+
+def _cost_observations(run: AblationRun, prices: PriceTable | None) -> CostObservations:
+    """Return the cost pairs and the reasons a row's cost can be unavailable.
+
+    A question enters the pairs only when its correctness Grade is ``ok`` and
+    its usage is priced. Its cost is the generate call's usage priced by the
+    generate step's model; a model the table does not price, or a trace with no
+    generate step, leaves the row's cost unavailable rather than guessing.
+    """
+    if run.kind is not RunKind.ANSWER or prices is None:
+        return CostObservations()
+    pairs: list[tuple[float, float]] = []
+    unpriced: set[str] = set()
+    questions_without_model = 0
+    for result in run.questions:
+        if result.status is not QuestionStatus.SCORED:
+            continue
+        grade = result.grades.get(CORRECTNESS)
+        if grade is None or grade.status is not GradeStatus.OK or grade.score is None:
+            continue
+        if result.usage is None:
+            continue
+        cost = question_cost(result.usage, result.trace, prices)
+        if cost is None:
+            model = generate_model(result.trace)
+            if model is None:
+                questions_without_model += 1
+            else:
+                unpriced.add(model)
+            continue
+        pairs.append((cost, grade.score))
+    return CostObservations(
+        pairs=tuple(pairs),
+        unpriced_models=tuple(sorted(unpriced)),
+        questions_without_model=questions_without_model,
+    )
+
+
+_Series = tuple[str, Sequence[Any], Callable[[Sequence[Any]], float]]
 
 
 def _mean_series(
@@ -418,6 +505,7 @@ def render_markdown(matrix: AblationMatrix) -> str:
     if _mixed_concurrency(matrix.rows):
         lines += [_concurrency_note(matrix.rows), ""]
     lines += _markdown_table(columns, matrix.rows)
+    lines += _markdown_notes(matrix)
     lines += [
         "",
         "## Runs",
@@ -474,6 +562,7 @@ def render_html(matrix: AblationMatrix) -> str:
             "Latency is in milliseconds."
         ),
     )
+    lines += [f'<p class="note">{escape(note)}</p>' for note in _notes(matrix)]
     lines += [
         "<h2>Runs</h2>",
         '<div class="table-wrap">',
@@ -497,9 +586,9 @@ def render_html(matrix: AblationMatrix) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _estimate(
-    values: Sequence[float],
-    statistic: Callable[[Sequence[float]], float],
+def _estimate[T](
+    values: Sequence[T],
+    statistic: Callable[[Sequence[T]], float],
     *,
     key: str,
     resamples: int,
@@ -521,6 +610,18 @@ def _estimate(
 def _resample_mean(values: Sequence[float]) -> float:
     """Return a resample's mean; a resample of a non-empty set is never empty."""
     return cast(float, mean(values))
+
+
+def _resample_cost_per_correct(pairs: Sequence[tuple[float, float]]) -> float:
+    """Return a resample's mean cost divided by its mean correctness score.
+
+    A resample with no correct answer has a zero share, so its ratio is
+    infinite; a question costs money whether or not it is right.
+    """
+    share = cast(float, mean([score for _, score in pairs]))
+    if share == 0:
+        return math.inf
+    return cast(float, mean([cost for cost, _ in pairs])) / share
 
 
 def _resample_percentile(percentile: int) -> Callable[[Sequence[float]], float]:
@@ -583,9 +684,12 @@ def _check_comparable(run_files: Sequence[AblationRunFile]) -> None:
 
 def _preamble(matrix: AblationMatrix) -> str:
     """Return the opening sentence both renderers share."""
+    files = _files_phrase(len(matrix.rows))
+    if matrix.currency is None:
+        return f"Built from {files} alone: the same files and seed give this report byte for byte."
     return (
-        f"Built from {_files_phrase(len(matrix.rows))} alone: the same files "
-        "and seed give this report byte for byte."
+        f"Built from {files} and the price table alone: the same files, seed and "
+        "price table give this report byte for byte."
     )
 
 
@@ -622,18 +726,69 @@ def _format_metric(estimate: MetricEstimate | None) -> str:
     return f"{estimate.point:.3f} [{estimate.low:.3f}, {estimate.high:.3f}]"
 
 
-def _format_latency(estimate: MetricEstimate | None) -> str:
-    """Format a latency cell in milliseconds with one decimal."""
+def _format_one_decimal(estimate: MetricEstimate | None) -> str:
+    """Format a latency or tokens cell with one decimal."""
     if estimate is None:
         return "n/a"
     return f"{estimate.point:.1f} [{estimate.low:.1f}, {estimate.high:.1f}]"
+
+
+def _format_cost(estimate: MetricEstimate | None) -> str:
+    """Format a cost cell with four significant digits; an infinite point is just ``∞``."""
+    if estimate is None:
+        return "—"
+    if math.isinf(estimate.point):
+        return "∞"
+    return (
+        f"{_format_cost_number(estimate.point)} "
+        f"[{_format_cost_number(estimate.low)}, {_format_cost_number(estimate.high)}]"
+    )
+
+
+def _format_cost_number(value: float) -> str:
+    """Format one cost bound with four significant digits, trailing zeros kept."""
+    if math.isinf(value):
+        return "∞"
+    return f"{value:#.4g}".removesuffix(".")
 
 
 def _cell(
     name: str, formatter: Callable[[MetricEstimate | None], str]
 ) -> Callable[[MatrixRow], str]:
     """Return the formatter for one estimate cell of a matrix row."""
-    return lambda row: formatter(row.estimates[name])
+    return lambda row: formatter(row.estimates.get(name))
+
+
+def _latency_cell(name: str) -> Callable[[MatrixRow], str]:
+    """Return a latency cell, gated when the run did not measure provider latency."""
+
+    def format_cell(row: MatrixRow) -> str:
+        if row.model_mode in _MEASURED_MODEL_MODES:
+            return _format_one_decimal(row.estimates.get(name))
+        if row.model_mode is ModelMode.UNKNOWN:
+            return "unknown"
+        return "replayed"
+
+    return format_cell
+
+
+def _tokens_cell(row: MatrixRow) -> str:
+    """Return a Tokens cell; a retrieval run made no chat call to count."""
+    if row.kind is not RunKind.ANSWER:
+        return "—"
+    return _format_one_decimal(row.estimates.get(TOKENS))
+
+
+def _cost_cell(row: MatrixRow) -> str:
+    """Return a Cost per Correct Answer cell; a missing estimate is a dash."""
+    return _format_cost(row.estimates.get(COST_PER_CORRECT))
+
+
+def _cost_label(currency: str | None) -> str:
+    """Return the cost column's header, naming the currency when a table gives one."""
+    if currency is None:
+        return "Cost per Correct Answer"
+    return f"Cost per Correct Answer ({currency})"
 
 
 def _grader_cell(name: str) -> Callable[[MatrixRow | SliceRow], str]:
@@ -661,6 +816,69 @@ _CI_NOTE = (
     "not_applicable."
 )
 
+_LATENCY_NOTE = (
+    "Latency is reported only for live and passthrough runs: a record run mixes "
+    "recorded upstream calls with replayed ones, so its latency measures neither the "
+    "provider nor the replay; a replay run replays every call, and a run from before "
+    "model modes is unknown, so those cells show replayed or unknown."
+)
+
+_NO_PRICE_TABLE_NOTE = (
+    "No price table was given, so Cost per Correct Answer is —; pass --prices with a "
+    "price for each model the generate step names."
+)
+
+_COST_SCOPE_NOTE = (
+    "Cost covers only the generate call: Trelis's debug object reports only the chat "
+    "call's usage, so embedding, rerank and the judge are not included."
+)
+
+
+def _notes(matrix: AblationMatrix) -> list[str]:
+    """Return the notes both renderers put under the main matrix."""
+    notes = []
+    if _latency_gated(matrix.rows):
+        notes.append(_LATENCY_NOTE)
+    if matrix.currency is None:
+        if any(_needs_a_price_table(row) for row in matrix.rows):
+            notes.append(_NO_PRICE_TABLE_NOTE)
+    elif any(row.kind is RunKind.ANSWER for row in matrix.rows):
+        notes.append(_COST_SCOPE_NOTE)
+    notes += [
+        _unpriced_note(row)
+        for row in matrix.rows
+        if row.cost.unpriced_models or row.cost.questions_without_model
+    ]
+    return notes
+
+
+def _needs_a_price_table(row: MatrixRow) -> bool:
+    """Say whether a row has an ok correctness Grade that a price table would price."""
+    if row.kind is not RunKind.ANSWER:
+        return False
+    outcomes = row.grader_outcomes.get(CORRECTNESS)
+    return outcomes is not None and bool(outcomes.scores)
+
+
+def _latency_gated(rows: Sequence[MatrixRow]) -> bool:
+    """Say whether any row's latency did not measure the provider."""
+    return any(row.model_mode not in _MEASURED_MODEL_MODES for row in rows)
+
+
+def _unpriced_note(row: MatrixRow) -> str:
+    """Explain one row whose Cost per Correct Answer cannot be priced."""
+    reasons = []
+    models = row.cost.unpriced_models
+    if len(models) == 1:
+        reasons.append(f"the price table has no entry for model {models[0]}")
+    elif models:
+        reasons.append("the price table has no entry for models " + ", ".join(models))
+    missing = row.cost.questions_without_model
+    if missing:
+        noun = "answer has" if missing == 1 else "answers have"
+        reasons.append(f"{missing} {noun} no generate step")
+    return f"Cost per Correct Answer is — for {row.config}: " + "; ".join(reasons) + "."
+
 
 def _columns(matrix: AblationMatrix) -> tuple[tuple[str, Callable[[MatrixRow], str]], ...]:
     """Return the matrix columns, with one Grader column per Grader in the report."""
@@ -668,8 +886,10 @@ def _columns(matrix: AblationMatrix) -> tuple[tuple[str, Callable[[MatrixRow], s
         ("Retrieval Config", lambda row: row.config),
         *((METRIC_LABELS[name], _cell(name, _format_metric)) for name in METRIC_NAMES),
         *((grader_label(name), _grader_cell(name)) for name in matrix.graders),
-        ("Latency p50 (ms)", _cell(LATENCY_P50, _format_latency)),
-        ("Latency p95 (ms)", _cell(LATENCY_P95, _format_latency)),
+        ("Latency p50 (ms)", _latency_cell(LATENCY_P50)),
+        ("Latency p95 (ms)", _latency_cell(LATENCY_P95)),
+        ("Tokens", _tokens_cell),
+        (_cost_label(matrix.currency), _cost_cell),
         ("Scored", lambda row: str(row.scored)),
         ("Skipped", lambda row: str(row.skipped)),
         ("Error", lambda row: str(row.error)),
@@ -811,6 +1031,11 @@ def _html_attribution_tables(matrix: AblationMatrix) -> list[str]:
             *_html_table(columns, table.rows),
         ]
     return lines
+
+
+def _markdown_notes(matrix: AblationMatrix) -> list[str]:
+    """Return the notes under the Markdown matrix, each as its own paragraph."""
+    return [line for note in _notes(matrix) for line in ("", note)]
 
 
 def _markdown_table[RowT](

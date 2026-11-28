@@ -18,6 +18,7 @@ from trelis_eval.ablation_run import (
     GradeSummary,
     Manifest,
     ManifestRef,
+    ModelMode,
     QuestionMetrics,
     QuestionResult,
     QuestionStatus,
@@ -835,6 +836,19 @@ def test_jsonl_reader_rejects_a_bad_schema_or_record_order(tmp_path):
         ([{**good_header, "schema_version": 3}, good_summary], "schema_version"),
         ([{**good_header, "schema_version": 2}, good_summary], "kind"),
         ([{**good_header, "kind": "retrieval"}, good_summary], "kind"),
+        ([{**good_header, "model_mode": "live"}, good_summary], "model_mode"),
+        (
+            [
+                {
+                    **good_header,
+                    "schema_version": 2,
+                    "kind": "retrieval",
+                    "model_mode": "bogus",
+                },
+                {**good_summary, "schema_version": 2},
+            ],
+            "model_mode",
+        ),
         (
             [
                 {**good_header, "schema_version": 2, "kind": "retrieval"},
@@ -975,6 +989,55 @@ def test_jsonl_round_trip_keeps_the_concurrency_latency_was_measured_under(tmp_p
     write_ablation_run(path, run_file)
 
     assert load_ablation_run(path).run.concurrency == 4
+
+
+def test_a_run_header_round_trips_the_model_mode(tmp_path):
+    import dataclasses
+
+    golden = [question("q1", ["https://example.com/a"])]
+    run_file = build_run_file(tmp_path, golden, RetrievalServer({}))
+    run_file = dataclasses.replace(
+        run_file, run=dataclasses.replace(run_file.run, model_mode=ModelMode.LIVE)
+    )
+    path = tmp_path / "runs" / "r" / "dense.jsonl"
+
+    write_ablation_run(path, run_file)
+
+    assert load_ablation_run(path) == run_file
+    [header] = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()[:1]]
+    assert header["model_mode"] == "live"
+
+
+def test_a_version_2_header_without_a_model_mode_loads_as_unknown(tmp_path):
+    header = {
+        "schema_version": 2,
+        "type": "run",
+        "kind": "retrieval",
+        "run_id": "v2-no-mode",
+        "config": {"name": "dense", "techniques": ["dense"]},
+        "top_k": 10,
+        "concurrency": 1,
+        "golden_set": {"path": "golden.jsonl", "sha256": "0" * 64, "questions": 0},
+        "manifest": {"path": "manifest.jsonl", "sha256": "0" * 64},
+        "base_url": BASE_URL,
+        "harness_version": HARNESS_VERSION,
+        "started_at": "2026-01-01T00:00:00+00:00",
+    }
+    summary = {
+        "schema_version": 2,
+        "type": "summary",
+        "metrics": {"recall@5": None, "recall@10": None, "mrr": None, "ndcg@10": None},
+        "counts": {"scored": 0, "skipped": 0, "error": 0},
+        "latency_ms": {"p50": None, "p95": None},
+        "finished_at": "2026-01-01T00:00:01+00:00",
+    }
+    path = tmp_path / "no-model-mode.jsonl"
+    path.write_text(
+        json.dumps(header) + "\n" + json.dumps(summary) + "\n",
+        encoding="utf-8",
+    )
+
+    assert load_ablation_run(path).run.model_mode is ModelMode.UNKNOWN
 
 
 def test_step_latencies_split_the_trace_by_technique_and_step():
@@ -1447,6 +1510,7 @@ def test_a_version_1_file_loads_as_a_retrieval_run(tmp_path):
     loaded = load_ablation_run(path)
 
     assert loaded.run.kind is RunKind.RETRIEVAL
+    assert loaded.run.model_mode is ModelMode.UNKNOWN
     assert loaded.run.judge_model is None
     assert loaded.run.graders == ()
     assert loaded.run.summary.grades == {}

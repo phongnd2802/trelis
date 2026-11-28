@@ -9,6 +9,10 @@ question text, Chunk content or API key.
 Document and Chunk IDs are those of the Trelis that produced the run, so they
 mean nothing to another instance. Compare the scores, not the IDs.
 
+These version-1 files load as `unknown`, so the report shows `unknown` latency
+for them (and `—` for Tokens and Cost per Correct Answer); a re-run today would
+pass the mode it used.
+
 ## `dense-strat500-seed1.jsonl`
 
 The first row of the Ablation Matrix: dense retrieval alone.
