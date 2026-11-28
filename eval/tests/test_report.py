@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import random
 from dataclasses import replace
+from pathlib import Path
 from statistics import mean as statistics_mean
 
 import pytest
@@ -15,13 +16,18 @@ from trelis_eval.ablation_run import (
     AblationRun,
     AblationRunFile,
     GoldenSetRef,
+    GradeSummary,
     ManifestRef,
     QuestionMetrics,
     QuestionResult,
     QuestionStatus,
     RetrievalConfig,
+    RunKind,
     RunSummary,
+    load_ablation_run,
 )
+from trelis_eval.client import Usage
+from trelis_eval.graders import CORRECTNESS, Grade, GradeStatus
 from trelis_eval.metrics import mean, nearest_rank_percentile
 from trelis_eval.report import (
     LATENCY_P50,
@@ -132,6 +138,263 @@ def run_file(
 # Per-question values whose bootstrap means take many distinct values, so two
 # seeds give different bounds.
 VARIED_VALUES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.55, 0.6, 0.7, 0.8, 0.9, 0.27]
+
+
+def grade_for_score(score):
+    if score is None:
+        return Grade(
+            score=None,
+            rationale="judge failed",
+            status=GradeStatus.GRADER_ERROR,
+        )
+    return Grade(score=score, rationale="graded", status=GradeStatus.OK)
+
+
+def answer_question(index, score, latency_ms=10.0):
+    return QuestionResult(
+        id=f"a{index}",
+        slices=("inference_query",),
+        status=QuestionStatus.SCORED,
+        evidence=("https://example.com/a",),
+        retrieved=(),
+        trace=(),
+        metrics=QuestionMetrics(1.0, 1.0, 1.0, 1.0),
+        latency_ms=latency_ms,
+        answer="An answer.",
+        finish_reason="stop",
+        usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        grades={"correctness": grade_for_score(score)},
+    )
+
+
+def answer_run_file(config, correctness, *, judge_model="judge-model", run_id="answer-1"):
+    """Build one answer results file with one correctness Grade per value.
+
+    ``None`` in ``correctness`` is a grader_error; a float is an ok score.
+    """
+    questions = [answer_question(index, score) for index, score in enumerate(correctness)]
+    ok_scores = [score for score in correctness if score is not None]
+    summary = RunSummary(
+        recall_at_5=mean([1.0 for _ in questions]),
+        recall_at_10=mean([1.0 for _ in questions]),
+        mrr=mean([1.0 for _ in questions]),
+        ndcg_at_10=mean([1.0 for _ in questions]),
+        scored=len(questions),
+        skipped=0,
+        error=0,
+        latency_p50=nearest_rank_percentile([10.0 for _ in questions], 50),
+        latency_p95=nearest_rank_percentile([10.0 for _ in questions], 95),
+        grades={
+            "correctness": GradeSummary(
+                mean=mean(ok_scores),
+                ok=len(ok_scores),
+                grader_error=sum(1 for score in correctness if score is None),
+            )
+        },
+    )
+    return AblationRunFile(
+        run_id=run_id,
+        golden_set=GoldenSetRef(
+            path=GOLDEN_PATH,
+            sha256=SHA256,
+            questions=len(questions),
+        ),
+        manifest=ManifestRef(
+            path="eval/data/multihop-rag/strat500-manifest.jsonl",
+            sha256="b" * 64,
+        ),
+        base_url="http://localhost:8080",
+        harness_version="0.1.0",
+        run=AblationRun(
+            config=RetrievalConfig(name=config, techniques=(config,)),
+            top_k=10,
+            started_at="2026-01-01T00:00:00+00:00",
+            finished_at="2026-01-01T00:01:00+00:00",
+            questions=tuple(questions),
+            summary=summary,
+            kind=RunKind.ANSWER,
+            judge_model=judge_model,
+            graders=("correctness",),
+        ),
+    )
+
+
+def multi_grader_answer_run_file(config, grades_by_name, *, run_id):
+    """Build one answer results file with one Grade per named Grader and question."""
+    count = len(next(iter(grades_by_name.values())))
+    questions = []
+    for index in range(count):
+        grades = {name: grade_for_score(values[index]) for name, values in grades_by_name.items()}
+        questions.append(replace(answer_question(index, 1.0), grades=grades))
+    summary_grades = {}
+    for name, values in grades_by_name.items():
+        ok_scores = [value for value in values if value is not None]
+        summary_grades[name] = GradeSummary(
+            mean=mean(ok_scores),
+            ok=len(ok_scores),
+            grader_error=sum(1 for value in values if value is None),
+        )
+    summary = RunSummary(
+        recall_at_5=1.0,
+        recall_at_10=1.0,
+        mrr=1.0,
+        ndcg_at_10=1.0,
+        scored=count,
+        skipped=0,
+        error=0,
+        latency_p50=nearest_rank_percentile([10.0 for _ in questions], 50),
+        latency_p95=nearest_rank_percentile([10.0 for _ in questions], 95),
+        grades=summary_grades,
+    )
+    return AblationRunFile(
+        run_id=run_id,
+        golden_set=GoldenSetRef(path=GOLDEN_PATH, sha256=SHA256, questions=count),
+        manifest=ManifestRef(
+            path="eval/data/multihop-rag/strat500-manifest.jsonl",
+            sha256="b" * 64,
+        ),
+        base_url="http://localhost:8080",
+        harness_version="0.1.0",
+        run=AblationRun(
+            config=RetrievalConfig(name=config, techniques=(config,)),
+            top_k=10,
+            started_at="2026-01-01T00:00:00+00:00",
+            finished_at="2026-01-01T00:01:00+00:00",
+            questions=tuple(questions),
+            summary=summary,
+            kind=RunKind.ANSWER,
+            judge_model="judge-model",
+            graders=tuple(grades_by_name),
+        ),
+    )
+
+
+def test_correctness_uses_only_ok_grades_and_shows_the_error_count():
+    run = answer_run_file("dense", [1.0, 0.0, 1.0, None])
+    scores = [1.0, 0.0, 1.0]
+
+    matrix = build_matrix([run], seed=3, resamples=200)
+
+    [row] = matrix.rows
+    assert row.kind is RunKind.ANSWER
+    assert row.grader_errors["correctness"] == 1
+    estimate = row.estimates[CORRECTNESS]
+    assert estimate is not None
+    assert estimate.point == pytest.approx(2 / 3)
+    expected = bootstrap_ci(
+        scores,
+        statistics_mean,
+        rng=random.Random("3:dense:correctness"),
+        resamples=200,
+    )
+    assert expected is not None
+    assert (estimate.low, estimate.high) == expected
+    table_row = next(
+        line for line in render_markdown(matrix).splitlines() if line.startswith("| dense |")
+    )
+    assert f"0.667 [{expected[0]:.3f}, {expected[1]:.3f}] · 1 error" in table_row
+
+
+def test_an_answer_row_with_only_grader_errors_shows_n_a_and_the_count():
+    run = answer_run_file("dense", [None, None, None])
+
+    matrix = build_matrix([run], seed=1, resamples=50)
+
+    [row] = matrix.rows
+    assert row.estimates[CORRECTNESS] is None
+    assert row.grader_errors["correctness"] == 3
+    table_row = next(
+        line for line in render_markdown(matrix).splitlines() if line.startswith("| dense |")
+    )
+    assert "n/a · 3 errors" in table_row
+
+
+def test_a_retrieval_row_shows_a_dash_in_the_correctness_column():
+    matrix = build_matrix(
+        [run_file("bm25"), answer_run_file("dense", [1.0])],
+        seed=1,
+        resamples=50,
+    )
+
+    retrieval_row = matrix.rows[0]
+    assert retrieval_row.kind is RunKind.RETRIEVAL
+    assert retrieval_row.graders == frozenset()
+    assert retrieval_row.estimates[CORRECTNESS] is None
+    assert retrieval_row.grader_errors == {}
+    table_row = next(
+        line for line in render_markdown(matrix).splitlines() if line.startswith("| bm25 |")
+    )
+    # The cell after nDCG@10 is the correctness column.
+    assert table_row.split(" | ")[5] == "—"
+
+
+def test_a_report_mixes_a_retrieval_row_and_an_answer_row():
+    matrix = build_matrix(
+        [run_file("bm25"), answer_run_file("dense", [1.0, 0.0])],
+        seed=1,
+        resamples=50,
+    )
+
+    markdown = render_markdown(matrix)
+    retrieval_row = next(line for line in markdown.splitlines() if line.startswith("| bm25 |"))
+    answer_row = next(line for line in markdown.splitlines() if line.startswith("| dense |"))
+
+    assert retrieval_row.split(" | ")[5] == "—"
+    assert "0.500 [" in answer_row
+
+
+def test_one_column_per_grader_in_registry_order_then_sorted_unknown_names():
+    full = multi_grader_answer_run_file(
+        "dense",
+        {
+            "correctness": [1.0, 0.0],
+            "zeta": [0.5, 0.5],
+            "alpha": [0.0, 1.0],
+        },
+        run_id="multi-full",
+    )
+    partial = multi_grader_answer_run_file(
+        "bm25", {"correctness": [1.0, 1.0]}, run_id="multi-partial"
+    )
+
+    matrix = build_matrix([full, partial], seed=1, resamples=20)
+
+    assert matrix.graders == ("correctness", "alpha", "zeta")
+    lines = render_markdown(matrix).splitlines()
+    header = next(line for line in lines if line.startswith("| Retrieval Config"))
+    assert header.split(" | ")[5:8] == ["Correctness", "alpha", "zeta"]
+    full_cells = next(line for line in lines if line.startswith("| dense |")).split(" | ")
+    partial_cells = next(line for line in lines if line.startswith("| bm25 |")).split(" | ")
+    assert "0.500 [" in full_cells[6]
+    assert "0.500 [" in full_cells[7]
+    assert partial_cells[6] == "—"
+    assert partial_cells[7] == "—"
+    assert matrix.rows[0].grader_errors == {
+        "correctness": 0,
+        "alpha": 0,
+        "zeta": 0,
+    }
+    assert matrix.rows[1].grader_errors == {"correctness": 0}
+    assert matrix.rows[1].graders == frozenset({"correctness"})
+
+
+def test_the_committed_version_1_baselines_still_render():
+    baselines = sorted((Path(__file__).parent.parent / "baselines").glob("*.jsonl"))
+    assert baselines
+
+    matrix = build_matrix(
+        [load_ablation_run(path) for path in baselines],
+        seed=1,
+        resamples=50,
+    )
+
+    assert all(row.kind is RunKind.RETRIEVAL for row in matrix.rows)
+    assert matrix.graders == ()
+    assert all(row.graders == frozenset() for row in matrix.rows)
+    assert all(row.estimates.get(CORRECTNESS) is None for row in matrix.rows)
+    markdown = render_markdown(matrix)
+    assert "Correctness" not in markdown
+    assert "<table>" in render_html(matrix)
 
 
 class FixedSampler(random.Random):

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fakes import AnswerServer
 
 from trelis_eval.cli import main
 from trelis_eval.golden import (
@@ -798,6 +799,170 @@ def test_retrieval_run_defaults_to_a_120s_request_timeout_and_one_request_at_a_t
         (out_dir / "20260101T000000Z" / "dense.jsonl").read_text(encoding="utf-8").splitlines()[0]
     )
     assert header["concurrency"] == 1
+
+
+def answer_arguments(tmp_path, *extra):
+    """Write the two-answer Golden Set inputs and return the answer-run argv."""
+    questions = [
+        retrieval_question("mhr-0000", ["https://example.com/a"]),
+        retrieval_question("mhr-0001", ["https://example.com/a"]),
+    ]
+    golden_path, manifest_path = write_retrieval_inputs(
+        tmp_path,
+        questions,
+        [completed_record("https://example.com/a", "doc-a")],
+    )
+    return [
+        "answer",
+        "run",
+        "--golden",
+        str(golden_path),
+        "--manifest",
+        str(manifest_path),
+        "--out-dir",
+        str(tmp_path / "runs"),
+        "--run-id",
+        "20260101T000000Z",
+        *extra,
+    ]
+
+
+def set_judge_env(monkeypatch):
+    monkeypatch.setenv("TRELIS_EVAL_JUDGE_API_KEY", "judge-key-never-logged")
+    monkeypatch.setenv("TRELIS_EVAL_JUDGE_BASE_URL", "http://judge.test/v1")
+    monkeypatch.setenv("TRELIS_EVAL_JUDGE_MODEL", "judge-model")
+
+
+def test_answer_run_without_judge_config_fails_before_any_request(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("TRELIS_API_KEY", "test-key")
+    for name in (
+        "TRELIS_EVAL_JUDGE_API_KEY",
+        "TRELIS_EVAL_JUDGE_BASE_URL",
+        "TRELIS_EVAL_JUDGE_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    def should_not_be_called(request):
+        pytest.fail("missing judge config must fail before any request")
+
+    code = main(answer_arguments(tmp_path), transport=httpx.MockTransport(should_not_be_called))
+
+    assert code == 1
+    error = capsys.readouterr().err
+    assert error.startswith("error: ")
+    assert "TRELIS_EVAL_JUDGE" in error
+    assert len(error.splitlines()) == 1
+    assert not (tmp_path / "runs" / "20260101T000000Z" / "dense.jsonl").exists()
+
+
+def test_answer_run_rejects_an_unknown_grader_before_any_request(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("TRELIS_API_KEY", "test-key")
+    set_judge_env(monkeypatch)
+
+    def should_not_be_called(request):
+        pytest.fail("an unknown Grader must fail before any request")
+
+    code = main(
+        answer_arguments(tmp_path, "--graders", "nope"),
+        transport=httpx.MockTransport(should_not_be_called),
+    )
+
+    assert code == 1
+    error = capsys.readouterr().err
+    assert "nope" in error
+    assert "correctness" in error
+
+
+def test_answer_run_writes_grades_the_judge_model_and_the_summary(tmp_path, monkeypatch, capsys):
+    import trelis_eval.cli as cli
+
+    monkeypatch.setenv("TRELIS_API_KEY", "test-key")
+    monkeypatch.setenv("TRELIS_BASE_URL", "http://trelis.test")
+    # The flags below must win over these environment values.
+    monkeypatch.setenv("TRELIS_EVAL_JUDGE_API_KEY", "judge-key-never-logged")
+    monkeypatch.setenv("TRELIS_EVAL_JUDGE_BASE_URL", "http://env-judge.test/v1")
+    monkeypatch.setenv("TRELIS_EVAL_JUDGE_MODEL", "env-judge-model")
+    server = AnswerServer(
+        {
+            "Question mhr-0000?": {
+                "answer": "An answer.",
+                "results": [retrieval_chunk("doc-a", "chunk-1")],
+            },
+            "Question mhr-0001?": {
+                "answer": "A different answer.",
+                "results": [retrieval_chunk("doc-a", "chunk-2")],
+            },
+        }
+    )
+    seen = {}
+    real_judge = cli.JudgeClient
+
+    def judge_handler(_request):
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": '{"correct": true, "rationale": "same claim"}',
+                        }
+                    }
+                ]
+            },
+        )
+
+    def spy_judge(base_url, api_key, model, **kwargs):
+        seen["base_url"] = base_url
+        seen["api_key"] = api_key
+        seen["model"] = model
+        return real_judge(
+            base_url,
+            api_key,
+            model,
+            transport=httpx.MockTransport(judge_handler),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(cli, "JudgeClient", spy_judge)
+
+    code = main(
+        answer_arguments(
+            tmp_path,
+            "--judge-base-url",
+            "http://flag-judge.test/v1",
+            "--judge-model",
+            "flag-judge-model",
+        ),
+        transport=httpx.MockTransport(server),
+    )
+
+    assert code == 0
+    assert seen["base_url"] == "http://flag-judge.test/v1"
+    assert seen["model"] == "flag-judge-model"
+    assert seen["api_key"] == "judge-key-never-logged"
+    lines = [
+        json.loads(line)
+        for line in (tmp_path / "runs" / "20260101T000000Z" / "dense.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert lines[0]["kind"] == "answer"
+    assert lines[0]["judge_model"] == "flag-judge-model"
+    assert lines[0]["graders"] == ["correctness"]
+    assert lines[1]["grades"]["correctness"]["score"] == 1.0
+    assert lines[-1]["grades"]["correctness"] == {
+        "mean": 1.0,
+        "ok": 2,
+        "grader_error": 0,
+    }
+    output = capsys.readouterr().out
+    assert "dense: scored=2 skipped=0 error=0" in output
+    assert "correctness" in output
+    assert "grader_error=0" in output
+    assert "judge-key-never-logged" not in output
+    raw = (tmp_path / "runs" / "20260101T000000Z" / "dense.jsonl").read_text(encoding="utf-8")
+    assert "judge-key-never-logged" not in raw
 
 
 def test_proxy_record_requires_an_upstream(capsys):

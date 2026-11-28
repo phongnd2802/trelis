@@ -7,26 +7,31 @@ from datetime import UTC, datetime
 
 import httpx
 import pytest
+from fakes import USAGE, AnswerServer, ScriptedJudge
 
 from trelis_eval.ablation_run import (
     HARNESS_VERSION,
     AblationAborted,
     AblationRunFile,
     GoldenSetRef,
+    GradeSummary,
     Manifest,
     ManifestRef,
     QuestionStatus,
     RetrievalConfig,
+    RunKind,
     default_run_id,
     file_sha256,
     load_ablation_run,
     load_manifest,
     parse_retrieval_config,
     run_ablation,
+    run_answer_ablation,
     write_ablation_run,
 )
 from trelis_eval.client import TraceStep, TrelisClient
 from trelis_eval.golden import Evidence, GoldenQuestion, write_golden_set
+from trelis_eval.graders import CorrectnessGrader, Grade, GradeStatus
 
 BASE_URL = "http://trelis.test"
 API_KEY = "test-key-never-logged"
@@ -769,7 +774,9 @@ def test_jsonl_round_trip_keeps_the_trace_hashes_and_never_the_api_key(tmp_path)
     assert "# Header" not in raw
     lines = [json.loads(line) for line in raw.splitlines()]
     assert [line["type"] for line in lines] == ["run", "question", "summary"]
-    assert {line["schema_version"] for line in lines} == {1}
+    assert {line["schema_version"] for line in lines} == {2}
+    assert lines[0]["kind"] == "retrieval"
+    assert "grades" not in lines[-1]
     assert lines[0]["golden_set"] == {
         "path": str(tmp_path / "golden.jsonl"),
         "sha256": hashlib.sha256((tmp_path / "golden.jsonl").read_bytes()).hexdigest(),
@@ -821,7 +828,16 @@ def test_jsonl_reader_rejects_a_bad_schema_or_record_order(tmp_path):
         return path
 
     cases = [
-        ([{**good_header, "schema_version": 2}, good_summary], "schema_version"),
+        ([{**good_header, "schema_version": 3}, good_summary], "schema_version"),
+        ([{**good_header, "schema_version": 2}, good_summary], "kind"),
+        ([{**good_header, "kind": "retrieval"}, good_summary], "kind"),
+        (
+            [
+                {**good_header, "schema_version": 2, "kind": "retrieval"},
+                {**good_summary, "schema_version": 2, "grades": {}},
+            ],
+            "grades",
+        ),
         ([{**good_header, "top_k": 9}, good_summary], "top_k"),
         ([good_header, {**good_summary, "type": "unknown"}], "type"),
         (
@@ -986,3 +1002,347 @@ def test_step_latencies_split_the_trace_by_technique_and_step():
         "dense/embed_query": (5, 5),
         "dense/search": (200, 20000),
     }
+
+
+def answer_question(question_id, expected_answer="Paris", source_ids=("https://example.com/a",)):
+    return GoldenQuestion(
+        id=question_id,
+        question=f"Question {question_id}?",
+        expected_answer=expected_answer,
+        evidence=tuple(Evidence(source_id=source_id, fact="f") for source_id in source_ids),
+        slices=("inference_query", "hops-1"),
+    )
+
+
+def answer_manifest(source_ids=("https://example.com/a",)):
+    return Manifest(
+        source_by_document={"doc-a": "https://example.com/a"},
+        completed_source_ids=frozenset(source_ids),
+    )
+
+
+def test_an_answer_run_writes_grades_retrieval_metrics_and_the_summary_counts():
+    golden = [
+        answer_question("q1"),
+        answer_question("q2"),
+        answer_question("q3"),
+    ]
+    server = AnswerServer(
+        {
+            "Question q1?": {"answer": "PARIS [1]", "results": [chunk("doc-a", "c1")]},
+            "Question q2?": {"answer": "Lyon"},
+            "Question q3?": {
+                "answer": "The capital of France is Paris.",
+                "results": [chunk("doc-a", "c3")],
+            },
+        }
+    )
+    judge = ScriptedJudge(
+        '{"correct": false, "rationale": "different city"}',
+        '{"correct": true, "rationale": "same city"}',
+    )
+    clock = scripted_clock([0.0, 0.01, 1.0, 1.02, 2.0, 2.04])
+
+    with make_client(server) as client:
+        run = run_answer_ablation(
+            client,
+            golden,
+            answer_manifest(),
+            RetrievalConfig("dense", ("dense",)),
+            [CorrectnessGrader(judge)],
+            judge_model="judge-model",
+            clock=clock,
+        )
+
+    assert run.kind is RunKind.ANSWER
+    assert run.judge_model == "judge-model"
+    assert run.graders == ("correctness",)
+    first, second, third = run.questions
+    assert first.status is QuestionStatus.SCORED
+    assert first.grades["correctness"] == Grade(
+        score=1.0, rationale="normalized match", status=GradeStatus.OK
+    )
+    assert second.grades["correctness"].score == 0.0
+    assert third.grades["correctness"].score == 1.0
+    assert first.answer == "PARIS [1]"
+    assert first.finish_reason == "stop"
+    assert first.usage is not None
+    assert first.usage.total_tokens == 12
+    assert first.metrics is not None
+    assert first.metrics.recall_at_10 == 1.0
+    assert second.metrics is not None
+    assert second.metrics.recall_at_10 == 0.0
+    assert run.summary.grades["correctness"] == GradeSummary(
+        mean=pytest.approx(2 / 3), ok=3, grader_error=0
+    )
+    assert run.summary.metrics == {
+        "recall@5": pytest.approx(2 / 3),
+        "recall@10": pytest.approx(2 / 3),
+        "mrr": pytest.approx(2 / 3),
+        "ndcg@10": pytest.approx(2 / 3),
+    }
+    assert server.requests[0]["debug"] is True
+    assert server.requests[0]["retrieval_config"] == {"techniques": ["dense"]}
+    assert len(judge.prompts) == 2
+
+
+def test_a_grader_error_is_excluded_from_the_mean_and_counted():
+    golden = [
+        answer_question("q1"),
+        answer_question("q2"),
+        answer_question("q3"),
+    ]
+    server = AnswerServer(
+        {
+            "Question q1?": {"answer": "Paris", "results": [chunk("doc-a", "c1")]},
+            "Question q2?": {"answer": "Lyon", "results": [chunk("doc-a", "c2")]},
+            "Question q3?": {"answer": "Paris, France", "results": [chunk("doc-a", "c3")]},
+        }
+    )
+    judge = ScriptedJudge(
+        "not the expected JSON",
+        '{"correct": false, "rationale": "different city"}',
+    )
+
+    with make_client(server) as client:
+        run = run_answer_ablation(
+            client,
+            golden,
+            answer_manifest(),
+            RetrievalConfig("dense", ("dense",)),
+            [CorrectnessGrader(judge)],
+        )
+
+    errored_grade = run.questions[1].grades["correctness"]
+    assert errored_grade.status is GradeStatus.GRADER_ERROR
+    assert errored_grade.score is None
+    assert run.summary.grades["correctness"] == GradeSummary(mean=0.5, ok=2, grader_error=1)
+
+
+def test_a_trelis_error_is_a_question_error_not_a_grader_error():
+    golden = [answer_question("q1"), answer_question("q2")]
+    server = AnswerServer(
+        {
+            "Question q2?": {"answer": "Paris", "results": [chunk("doc-a", "c2")]},
+        },
+        failing_queries={"Question q1?"},
+        failure_status=500,
+    )
+    judge = ScriptedJudge()
+
+    with make_client(server) as client:
+        run = run_answer_ablation(
+            client,
+            golden,
+            answer_manifest(),
+            RetrievalConfig("dense", ("dense",)),
+            [CorrectnessGrader(judge)],
+        )
+
+    errored, scored = run.questions
+    assert errored.status is QuestionStatus.ERROR
+    assert errored.grades == {}
+    assert "HTTP 500" in errored.error
+    assert scored.status is QuestionStatus.SCORED
+    assert run.summary.error == 1
+    assert run.summary.grades["correctness"] == GradeSummary(mean=1.0, ok=1, grader_error=0)
+
+
+def test_a_null_query_is_answered_and_graded_but_has_no_retrieval_metrics():
+    golden = [
+        GoldenQuestion(
+            id="mhr-null",
+            question="Unanswerable?",
+            expected_answer="Insufficient information.",
+            evidence=(),
+            slices=("null_query", "hops-0"),
+        )
+    ]
+    server = AnswerServer(
+        {"Unanswerable?": {"answer": "Insufficient information."}},
+    )
+
+    with make_client(server) as client:
+        run = run_answer_ablation(
+            client,
+            golden,
+            Manifest(source_by_document={}, completed_source_ids=frozenset()),
+            RetrievalConfig("dense", ("dense",)),
+            [CorrectnessGrader(ScriptedJudge())],
+        )
+
+    [result] = run.questions
+    assert result.status is QuestionStatus.SCORED
+    assert result.metrics is None
+    assert result.grades["correctness"].score == 1.0
+    assert run.summary.scored == 1
+    assert run.summary.skipped == 0
+    assert run.summary.metrics == {
+        "recall@5": None,
+        "recall@10": None,
+        "mrr": None,
+        "ndcg@10": None,
+    }
+    assert run.summary.grades["correctness"].mean == 1.0
+    assert len(server.requests) == 1
+
+
+def test_repeated_answer_question_errors_abort_the_run():
+    golden = [answer_question(f"q{i}") for i in range(4)]
+    server = AnswerServer(
+        {},
+        failing_queries={f"Question q{i}?" for i in range(4)},
+        failure_status=502,
+    )
+
+    with make_client(server) as client, pytest.raises(AblationAborted) as caught:
+        run_answer_ablation(
+            client,
+            golden,
+            answer_manifest(),
+            RetrievalConfig("dense", ("dense",)),
+            [CorrectnessGrader(ScriptedJudge())],
+            max_consecutive_errors=2,
+        )
+
+    assert "2 consecutive question errors" in str(caught.value)
+    assert len(server.requests) == 2
+
+
+def build_answer_run_file(tmp_path, golden, server, judge):
+    manifest_path = write_manifest_lines(
+        tmp_path / "manifest.jsonl",
+        [
+            {
+                "source_id": "https://example.com/a",
+                "document_id": "doc-a",
+                "file_name": "a.md",
+                "status": "completed",
+                "duplicate": False,
+                "error": "",
+            }
+        ],
+    )
+    manifest = load_manifest(manifest_path)
+    golden_path = tmp_path / "golden.jsonl"
+    write_golden_set(golden_path, golden)
+
+    with make_client(server) as client:
+        run = run_answer_ablation(
+            client,
+            golden,
+            manifest,
+            RetrievalConfig(name="dense", techniques=("dense",)),
+            [CorrectnessGrader(judge)],
+            judge_model="judge-model",
+            clock=scripted_clock([0.0, 0.007]),
+        )
+
+    return AblationRunFile(
+        run_id="20260101T000000Z",
+        golden_set=GoldenSetRef(
+            path=str(golden_path),
+            sha256=file_sha256(golden_path),
+            questions=len(golden),
+        ),
+        manifest=ManifestRef(path=str(manifest_path), sha256=file_sha256(manifest_path)),
+        base_url=BASE_URL,
+        harness_version=HARNESS_VERSION,
+        run=run,
+    )
+
+
+def test_an_answer_jsonl_round_trips_losslessly(tmp_path):
+    golden = [answer_question("q1")]
+    server = AnswerServer(
+        {
+            "Question q1?": {
+                "answer": "Paris [1]",
+                "results": [chunk("doc-a", "chunk-1")],
+                "citations": [{"marker": 1, "chunk_id": "chunk-1", "document_id": "doc-a"}],
+            }
+        }
+    )
+    run_file = build_answer_run_file(
+        tmp_path, golden, server, ScriptedJudge('{"correct": true, "rationale": "same"}')
+    )
+    path = tmp_path / "runs" / "answer" / "dense.jsonl"
+
+    write_ablation_run(path, run_file)
+
+    assert load_ablation_run(path) == run_file
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert lines[0]["schema_version"] == 2
+    assert lines[0]["kind"] == "answer"
+    assert lines[0]["judge_model"] == "judge-model"
+    assert lines[0]["graders"] == ["correctness"]
+    assert lines[1]["answer"] == "Paris [1]"
+    assert lines[1]["citations"] == [{"marker": 1, "chunk_id": "chunk-1", "document_id": "doc-a"}]
+    assert lines[1]["finish_reason"] == "stop"
+    assert lines[1]["usage"] == USAGE
+    assert lines[1]["grades"] == {
+        "correctness": {
+            "score": 1.0,
+            "rationale": "normalized match",
+            "status": "ok",
+        }
+    }
+    assert lines[-1]["grades"] == {"correctness": {"mean": 1.0, "ok": 1, "grader_error": 0}}
+
+
+def test_an_answer_error_question_round_trips(tmp_path):
+    golden = [answer_question("q1")]
+    server = AnswerServer(
+        {},
+        failing_queries={"Question q1?"},
+        failure_status=500,
+    )
+    run_file = build_answer_run_file(tmp_path, golden, server, ScriptedJudge())
+    path = tmp_path / "runs" / "answer-error" / "dense.jsonl"
+
+    write_ablation_run(path, run_file)
+
+    assert load_ablation_run(path) == run_file
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert lines[1]["status"] == "error"
+    assert lines[1]["answer"] is None
+    assert lines[1]["citations"] == []
+    assert lines[1]["finish_reason"] is None
+    assert lines[1]["usage"] is None
+    assert lines[1]["grades"] == {}
+
+
+def test_a_version_1_file_loads_as_a_retrieval_run(tmp_path):
+    path = tmp_path / "v1.jsonl"
+    header = {
+        "schema_version": 1,
+        "type": "run",
+        "run_id": "v1",
+        "config": {"name": "dense", "techniques": ["dense"]},
+        "top_k": 10,
+        "concurrency": 1,
+        "golden_set": {"path": "golden.jsonl", "sha256": "0" * 64, "questions": 0},
+        "manifest": {"path": "manifest.jsonl", "sha256": "0" * 64},
+        "base_url": BASE_URL,
+        "harness_version": HARNESS_VERSION,
+        "started_at": "2026-01-01T00:00:00+00:00",
+    }
+    summary = {
+        "schema_version": 1,
+        "type": "summary",
+        "metrics": {"recall@5": None, "recall@10": None, "mrr": None, "ndcg@10": None},
+        "counts": {"scored": 0, "skipped": 0, "error": 0},
+        "latency_ms": {"p50": None, "p95": None},
+        "finished_at": "2026-01-01T00:00:01+00:00",
+    }
+    path.write_text(
+        json.dumps(header) + "\n" + json.dumps(summary) + "\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_ablation_run(path)
+
+    assert loaded.run.kind is RunKind.RETRIEVAL
+    assert loaded.run.judge_model is None
+    assert loaded.run.graders == ()
+    assert loaded.run.summary.grades == {}

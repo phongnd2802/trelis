@@ -7,7 +7,8 @@ import os
 import sys
 import time
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 
 import httpx
@@ -19,20 +20,25 @@ from .ablation_run import (
     AblationRun,
     AblationRunFile,
     GoldenSetRef,
+    Manifest,
     ManifestRef,
     QuestionStatus,
+    RetrievalConfig,
     default_run_id,
     file_sha256,
     load_ablation_run,
     load_manifest,
     parse_retrieval_config,
     run_ablation,
+    run_answer_ablation,
     step_latencies,
     write_ablation_run,
 )
 from .client import TrelisClient, TrelisError
-from .golden import GoldenSetError, load_golden_set, write_golden_set
+from .golden import GoldenQuestion, GoldenSetError, load_golden_set, write_golden_set
+from .graders import build_graders, default_grader_names, graders_need_judge
 from .ingest import IngestRecord, IngestStatus, ingest, write_manifest
+from .judge import Judge, JudgeClient
 from .model_proxy import (
     FixtureError,
     FixtureStore,
@@ -170,50 +176,40 @@ def _build_parser() -> argparse.ArgumentParser:
     run_command = retrieval_commands.add_parser(
         "run", help="score a Golden Set under one or more Retrieval Configs"
     )
-    run_command.add_argument("--golden", type=Path, required=True)
-    run_command.add_argument("--manifest", type=Path, required=True)
-    run_command.add_argument(
-        "--config",
-        action="append",
-        dest="configs",
-        metavar="TECHNIQUES",
-        help="Retrieval Techniques joined with '+' (repeatable; default: dense)",
-    )
-    run_command.add_argument(
-        "--top-k",
-        type=int,
-        default=10,
-        help="Chunks to retrieve per question, between 10 and 100",
-    )
-    run_command.add_argument(
-        "--concurrency",
-        type=_concurrency,
-        default=1,
-        help=f"questions in flight at once, 1 to {MAX_CONCURRENCY} (recorded in the results "
-        "header, since latency is measured under it)",
-    )
-    run_command.add_argument(
-        "--max-consecutive-errors",
-        type=_non_negative_int,
-        default=10,
-        help="abort a config after this many question errors in a row, 0 disables (default: 10)",
-    )
-    run_command.add_argument(
-        "--request-timeout",
-        type=_positive_float,
-        default=DEFAULT_REQUEST_TIMEOUT,
-        help="seconds to wait for one POST /retrieve, including Trelis's own model call",
-    )
-    run_command.add_argument(
-        "--out-dir", type=Path, default=Path("eval/runs"), help="directory for results files"
-    )
-    run_command.add_argument(
-        "--run-id", default=None, help="results directory name (default: UTC timestamp)"
-    )
-    run_command.add_argument(
-        "--base-url", default=None, help="Trelis base URL (default: $TRELIS_BASE_URL)"
+    _add_run_options(
+        run_command,
+        request_help=("seconds to wait for one POST /retrieve, including Trelis's own model call"),
     )
     run_command.set_defaults(handler=_run_retrieval)
+
+    answer = commands.add_parser("answer", help="run answer ablations")
+    answer_commands = answer.add_subparsers(dest="answer_command", required=True)
+    answer_run = answer_commands.add_parser(
+        "run", help="ask a Golden Set and grade the answers under one or more Retrieval Configs"
+    )
+    _add_run_options(
+        answer_run,
+        request_help=(
+            "seconds to wait for one POST /answer or one judge call, including Trelis's "
+            "own model call"
+        ),
+    )
+    answer_run.add_argument(
+        "--graders",
+        default=None,
+        help="comma-separated Grader names (default: every registered Grader)",
+    )
+    answer_run.add_argument(
+        "--judge-base-url",
+        default=None,
+        help="judge base URL (default: $TRELIS_EVAL_JUDGE_BASE_URL)",
+    )
+    answer_run.add_argument(
+        "--judge-model",
+        default=None,
+        help="judge model (default: $TRELIS_EVAL_JUDGE_MODEL)",
+    )
+    answer_run.set_defaults(handler=_run_answer)
 
     report_command = commands.add_parser(
         "report",
@@ -306,6 +302,53 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _add_run_options(parser: argparse.ArgumentParser, *, request_help: str) -> None:
+    """Add the Golden Set, config, throughput and output options a run shares."""
+    parser.add_argument("--golden", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument(
+        "--config",
+        action="append",
+        dest="configs",
+        metavar="TECHNIQUES",
+        help="Retrieval Techniques joined with '+' (repeatable; default: dense)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=10,
+        help="Chunks to retrieve per question, between 10 and 100",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=_concurrency,
+        default=1,
+        help=f"questions in flight at once, 1 to {MAX_CONCURRENCY} (recorded in the results "
+        "header, since latency is measured under it)",
+    )
+    parser.add_argument(
+        "--max-consecutive-errors",
+        type=_non_negative_int,
+        default=10,
+        help="abort a config after this many question errors in a row, 0 disables (default: 10)",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=_positive_float,
+        default=DEFAULT_REQUEST_TIMEOUT,
+        help=request_help,
+    )
+    parser.add_argument(
+        "--out-dir", type=Path, default=Path("eval/runs"), help="directory for results files"
+    )
+    parser.add_argument(
+        "--run-id", default=None, help="results directory name (default: UTC timestamp)"
+    )
+    parser.add_argument(
+        "--base-url", default=None, help="Trelis base URL (default: $TRELIS_BASE_URL)"
+    )
+
+
 def _run_fetch(args: argparse.Namespace, transport: httpx.BaseTransport | None) -> int:
     """Download the MultiHop-RAG files that are not present yet."""
     del transport
@@ -374,25 +417,102 @@ def _run_ingest(args: argparse.Namespace, transport: httpx.BaseTransport | None)
     return 0
 
 
+PerConfigRun = Callable[
+    [TrelisClient, RetrievalConfig, Sequence[GoldenQuestion], Manifest], AblationRun
+]
+JudgeContextFactory = Callable[[], AbstractContextManager[Judge | None]]
+
+
 def _run_retrieval(args: argparse.Namespace, transport: httpx.BaseTransport | None) -> int:
     """Run every Retrieval Config in turn and write one results file each."""
-    configs = [parse_retrieval_config(value) for value in (args.configs or ["dense"])]
-    names = [config.name for config in configs]
-    duplicates = sorted({name for name in names if names.count(name) > 1})
-    if duplicates:
-        raise CliError(f"retrieval config {duplicates[0]!r} was given more than once")
-    if not 10 <= args.top_k <= 100:
-        raise CliError(f"--top-k must be between 10 and 100, got {args.top_k}")
+    configs = _run_configs(args)
 
+    def make_run(_judge: Judge | None) -> PerConfigRun:
+        def run_one(
+            client: TrelisClient,
+            config: RetrievalConfig,
+            golden: Sequence[GoldenQuestion],
+            manifest: Manifest,
+        ) -> AblationRun:
+            return run_ablation(
+                client,
+                golden,
+                manifest,
+                config,
+                args.top_k,
+                clock=time.monotonic,
+                concurrency=args.concurrency,
+                max_consecutive_errors=args.max_consecutive_errors,
+            )
+
+        return run_one
+
+    return _execute_run(
+        args,
+        transport,
+        configs,
+        make_run,
+        judge_context=lambda: nullcontext(None),
+    )
+
+
+def _run_answer(args: argparse.Namespace, transport: httpx.BaseTransport | None) -> int:
+    """Ask every question, grade the answers and write one results file each."""
+    configs = _run_configs(args)
+    selected = _grader_names(args.graders)
+    judge_base_url, judge_model, judge_key = _judge_settings(args, selected)
+
+    def judge_context() -> AbstractContextManager[Judge | None]:
+        if judge_base_url is None:
+            return nullcontext(None)
+        return JudgeClient(judge_base_url, judge_key, judge_model, timeout=args.request_timeout)
+
+    def make_run(judge: Judge | None) -> PerConfigRun:
+        graders = build_graders(selected, judge)
+
+        def run_one(
+            client: TrelisClient,
+            config: RetrievalConfig,
+            golden: Sequence[GoldenQuestion],
+            manifest: Manifest,
+        ) -> AblationRun:
+            return run_answer_ablation(
+                client,
+                golden,
+                manifest,
+                config,
+                graders,
+                args.top_k,
+                judge_model=judge_model,
+                clock=time.monotonic,
+                concurrency=args.concurrency,
+                max_consecutive_errors=args.max_consecutive_errors,
+            )
+
+        return run_one
+
+    return _execute_run(
+        args,
+        transport,
+        configs,
+        make_run,
+        judge_context=judge_context,
+    )
+
+
+def _execute_run(
+    args: argparse.Namespace,
+    transport: httpx.BaseTransport | None,
+    configs: Sequence[RetrievalConfig],
+    make_run: Callable[[Judge | None], PerConfigRun],
+    *,
+    judge_context: JudgeContextFactory,
+) -> int:
+    """Load the shared inputs and run each config under the judge context."""
     golden = load_golden_set(args.golden)
     manifest = load_manifest(args.manifest)
     run_id = args.run_id or default_run_id()
-    paths = [args.out_dir / run_id / f"{config.name}.jsonl" for config in configs]
-    existing = [str(path) for path in paths if path.exists()]
-    if existing:
-        raise CliError(
-            "results file(s) already exist; choose another --run-id: " + ", ".join(existing)
-        )
+    paths = _results_paths(args, configs, run_id)
 
     base_url, api_key = _connection(args.base_url)
     golden_set = GoldenSetRef(
@@ -403,21 +523,16 @@ def _run_retrieval(args: argparse.Namespace, transport: httpx.BaseTransport | No
     manifest_ref = ManifestRef(path=str(args.manifest), sha256=file_sha256(args.manifest))
 
     exit_code = 0
-    with TrelisClient(
-        base_url, api_key, transport=transport, timeout=args.request_timeout
-    ) as client:
+    with (
+        judge_context() as judge,
+        TrelisClient(
+            base_url, api_key, transport=transport, timeout=args.request_timeout
+        ) as client,
+    ):
+        run_one = make_run(judge)
         for config, path in zip(configs, paths, strict=True):
             try:
-                run = run_ablation(
-                    client,
-                    golden,
-                    manifest,
-                    config,
-                    args.top_k,
-                    clock=time.monotonic,
-                    concurrency=args.concurrency,
-                    max_consecutive_errors=args.max_consecutive_errors,
-                )
+                run = run_one(client, config, golden, manifest)
             except AblationAborted as exc:
                 print(f"config {config.name}: aborted: {exc}")
                 exit_code = 1
@@ -433,10 +548,68 @@ def _run_retrieval(args: argparse.Namespace, transport: httpx.BaseTransport | No
                     run=run,
                 ),
             )
-            _print_retrieval_summary(run, path)
+            _print_run_summary(run, path)
             if run.summary.scored == 0:
                 exit_code = 1
     return exit_code
+
+
+def _run_configs(args: argparse.Namespace) -> list[RetrievalConfig]:
+    """Parse --config into canonical configs whose names are unique."""
+    configs = [parse_retrieval_config(value) for value in (args.configs or ["dense"])]
+    names = [config.name for config in configs]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise CliError(f"retrieval config {duplicates[0]!r} was given more than once")
+    if not 10 <= args.top_k <= 100:
+        raise CliError(f"--top-k must be between 10 and 100, got {args.top_k}")
+    return configs
+
+
+def _results_paths(
+    args: argparse.Namespace, configs: Sequence[RetrievalConfig], run_id: str
+) -> list[Path]:
+    """Return one fresh results path per config, refusing to overwrite one."""
+    paths = [args.out_dir / run_id / f"{config.name}.jsonl" for config in configs]
+    existing = [str(path) for path in paths if path.exists()]
+    if existing:
+        raise CliError(
+            "results file(s) already exist; choose another --run-id: " + ", ".join(existing)
+        )
+    return paths
+
+
+def _grader_names(value: str | None) -> tuple[str, ...]:
+    """Split --graders, defaulting to every registered Grader."""
+    names = default_grader_names() if value is None else _comma_separated(value)
+    if not names:
+        raise CliError("--graders needs at least one Grader name")
+    return names
+
+
+def _judge_settings(
+    args: argparse.Namespace, selected: Sequence[str]
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve the judge config, refusing to run a judge-based Grader without it."""
+    if not graders_need_judge(selected):
+        return None, None, None
+    base_url = args.judge_base_url or os.environ.get("TRELIS_EVAL_JUDGE_BASE_URL")
+    model = args.judge_model or os.environ.get("TRELIS_EVAL_JUDGE_MODEL")
+    api_key = os.environ.get("TRELIS_EVAL_JUDGE_API_KEY")
+    missing = []
+    if not base_url:
+        missing.append("TRELIS_EVAL_JUDGE_BASE_URL (or --judge-base-url)")
+    if not model:
+        missing.append("TRELIS_EVAL_JUDGE_MODEL (or --judge-model)")
+    if not api_key:
+        missing.append("TRELIS_EVAL_JUDGE_API_KEY")
+    if missing:
+        raise CliError(
+            f"Grader(s) {', '.join(selected)} need a judge model; set "
+            + ", ".join(missing)
+            + " (the key is read from the environment, never a flag)"
+        )
+    return base_url, model, api_key
 
 
 def _run_report(args: argparse.Namespace, transport: httpx.BaseTransport | None) -> int:
@@ -517,8 +690,8 @@ def _run_proxy(args: argparse.Namespace, transport: httpx.BaseTransport | None) 
     return 0
 
 
-def _print_retrieval_summary(run: AblationRun, path: Path) -> None:
-    """Print one Ablation Run's counts, metric means, latencies and file."""
+def _print_run_summary(run: AblationRun, path: Path) -> None:
+    """Print one Ablation Run's counts, metric means, Grader means, latencies and file."""
     summary = run.summary
 
     def metric(value: float | None) -> str:
@@ -545,6 +718,15 @@ def _print_retrieval_summary(run: AblationRun, path: Path) -> None:
     if first_error is not None:
         line += f" first_error={first_error!r}"
     print(line)
+    if summary.grades:
+        print(
+            "  graders: "
+            + ", ".join(
+                f"{name} mean={metric(grades.mean)} ok={grades.ok} "
+                f"grader_error={grades.grader_error}"
+                for name, grades in summary.grades.items()
+            )
+        )
     steps = step_latencies(run)
     if steps:
         print(

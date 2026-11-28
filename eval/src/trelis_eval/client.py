@@ -152,6 +152,99 @@ class RetrievalAnswer:
         )
 
 
+@dataclass(frozen=True)
+class Citation:
+    """One source a Pipeline Answer cites: the marker and the Chunk it opens."""
+
+    marker: int
+    chunk_id: str
+    document_id: str
+
+    @classmethod
+    def from_json(cls, value: Any) -> Citation:
+        """Read one citation, rejecting a malformed object."""
+        if not isinstance(value, dict):
+            raise ValueError("citation must be a JSON object")
+        return cls(
+            marker=int_field(value, "marker"),
+            chunk_id=string_field(value, "chunk_id"),
+            document_id=string_field(value, "document_id"),
+        )
+
+
+@dataclass(frozen=True)
+class Usage:
+    """The chat call's token accounting from POST /answer."""
+
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+    @classmethod
+    def from_json(cls, value: Any) -> Usage:
+        """Read one usage object, rejecting a malformed one."""
+        if not isinstance(value, dict):
+            raise ValueError("usage must be a JSON object")
+        return cls(
+            prompt_tokens=int_field(value, "prompt_tokens"),
+            completion_tokens=int_field(value, "completion_tokens"),
+            total_tokens=int_field(value, "total_tokens"),
+        )
+
+
+@dataclass(frozen=True)
+class AnswerDebug:
+    """What POST /answer with debug adds: the retrieved Chunks, trace and usage."""
+
+    results: tuple[RetrievedChunk, ...]
+    trace: tuple[TraceStep, ...]
+    usage: Usage
+
+    @classmethod
+    def from_json(cls, value: Any) -> AnswerDebug:
+        """Read a debug object, rejecting a malformed one."""
+        if not isinstance(value, dict):
+            raise ValueError("debug data must be a JSON object")
+        raw_results = value.get("results")
+        if not isinstance(raw_results, list):
+            raise ValueError("field 'debug.results' must be a list")
+        raw_trace = value.get("trace")
+        if not isinstance(raw_trace, list):
+            raise ValueError("field 'debug.trace' must be a list")
+        return cls(
+            results=tuple(RetrievedChunk.from_json(item) for item in raw_results),
+            trace=tuple(TraceStep.from_json(item) for item in raw_trace),
+            usage=Usage.from_json(value.get("usage")),
+        )
+
+
+@dataclass(frozen=True)
+class AnswerResult:
+    """The answer text, its citations, the finish reason and the debug object."""
+
+    answer: str
+    citations: tuple[Citation, ...]
+    finish_reason: str
+    debug: AnswerDebug | None
+
+    @classmethod
+    def from_json(cls, value: Any) -> AnswerResult:
+        """Read an answer payload, rejecting a malformed one."""
+        if not isinstance(value, dict):
+            raise ValueError("answer data must be a JSON object")
+        raw_citations = value.get("citations")
+        if not isinstance(raw_citations, list):
+            raise ValueError("field 'citations' must be a list")
+        raw_debug = value.get("debug")
+        debug = None if raw_debug is None else AnswerDebug.from_json(raw_debug)
+        return cls(
+            answer=string_field(value, "answer"),
+            citations=tuple(Citation.from_json(item) for item in raw_citations),
+            finish_reason=string_field(value, "finish_reason"),
+            debug=debug,
+        )
+
+
 class TrelisClient:
     """Calls Trelis as one Principal, authenticated with that Principal's API key."""
 
@@ -244,6 +337,37 @@ class TrelisClient:
             raise TrelisError(
                 response.status_code, None, f"malformed retrieval answer: {exc}"
             ) from exc
+
+    def answer(
+        self,
+        query: str,
+        top_k: int,
+        techniques: Sequence[str],
+        debug: bool = True,
+    ) -> AnswerResult:
+        """Run the Pipeline Answer over POST /answer, optionally with its debug object."""
+        response = self._request(
+            "POST",
+            "/answer",
+            json={
+                "query": query,
+                "top_k": top_k,
+                "retrieval_config": {"techniques": list(techniques)},
+                "debug": debug,
+            },
+        )
+        data = self._data(response)
+        try:
+            result = AnswerResult.from_json(data)
+        except ValueError as exc:
+            raise TrelisError(response.status_code, None, f"malformed answer: {exc}") from exc
+        if debug and result.debug is None:
+            raise TrelisError(
+                response.status_code,
+                None,
+                "malformed answer: field 'debug' is missing although the request asked for it",
+            )
+        return result
 
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         return self._client.request(
