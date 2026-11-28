@@ -37,11 +37,12 @@ type IngestService interface {
 	// ParseAndChunk parses a Document's Source File, splits the Markdown into
 	// Chunks and, in one transaction, replaces the Document's Chunks and
 	// Parent Chunks and leaves it processing. It reports what it stored and
-	// how the tier chain chose it. A *types.UnparseableError means the Source
-	// File cannot be parsed, and a *types.DocumentNotFoundError means the
-	// Document is gone; neither can be fixed by retrying. Any other error is
-	// retryable.
-	ParseAndChunk(ctx context.Context, documentID uuid.UUID) (types.ChunkingResult, error)
+	// how the tier chain chose it. It records a parse_started Ingest Event for
+	// attempt and a parse_finished one in the transaction that commits the
+	// Chunks. A *types.UnparseableError means the Source File cannot be
+	// parsed, and a *types.DocumentNotFoundError means the Document is gone;
+	// neither can be fixed by retrying. Any other error is retryable.
+	ParseAndChunk(ctx context.Context, documentID uuid.UUID, attempt int) (types.ChunkingResult, error)
 	// EmbedBatch embeds the Chunks of a Document whose Seq is in [from, to)
 	// and that have no embedding yet, in one embedding call, and stores their
 	// vectors in one transaction. It returns how many Chunks it embedded; a

@@ -455,6 +455,71 @@
                 }
             }
         },
+        "/documents/{id}/events": {
+            "get": {
+                "security": [
+                    {
+                        "bearerAuth": []
+                    }
+                ],
+                "description": "Streams the Document's Ingest Events as Server-Sent Events while the caller can read it. Each frame's id is the event's seq within the Document, event is parse_started, parse_finished, embed_batch_finished, completed or failed, and data is {\"document_id\",\"type\",\"detail\",\"created_at\"}. detail is {\"attempt\"} for parse_started, {\"chunks\"} for parse_finished, {\"from\",\"to\",\"chunks\"} for embed_batch_finished, {\"reason\"} for failed, and {} for completed. Reconnecting with Last-Event-ID replays the events after that seq, then carries on live. The stream ends after completed or failed, when the Document is gone or no longer readable, when the client disconnects, when the server shuts down, or after 30 minutes so a Document stuck in processing cannot hold it forever; reconnecting with Last-Event-ID loses nothing.",
+                "produces": [
+                    "text/event-stream"
+                ],
+                "tags": [
+                    "documents"
+                ],
+                "summary": "Stream a Document's ingest progress",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Document ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Per-Document seq of the last event the client saw; only later events are sent",
+                        "name": "Last-Event-ID",
+                        "in": "header"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Server-Sent Events, one frame per Ingest Event; the stream ends after completed or failed, or after 30 minutes",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid Document ID or Last-Event-ID",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Missing or invalid API key",
+                        "schema": {
+                            "$ref": "#/definitions/router.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "No readable Document with that ID",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal server error; a failed API key check answers the router's error body instead",
+                        "schema": {
+                            "$ref": "#/definitions/handler.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/documents/{id}/file": {
             "get": {
                 "security": [

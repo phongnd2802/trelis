@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -44,12 +45,58 @@ const multipartMemory = 32 << 20
 type DocumentHandler struct {
 	service     interfaces.DocumentService
 	maxFileSize int64
+	// The ingest event stream timings. Zero uses the defaults in
+	// ingest_events.go; tests set them through the options below.
+	ingestEventPollInterval time.Duration
+	ingestEventKeepalive    time.Duration
+	ingestEventTimeout      time.Duration
+}
+
+// DocumentHandlerOption configures a DocumentHandler. The server uses the
+// defaults; tests shorten the ingest event stream timings.
+type DocumentHandlerOption func(*DocumentHandler)
+
+// WithIngestEventPollInterval sets how often an open ingest event stream looks
+// for new events. A non-positive duration is ignored.
+func WithIngestEventPollInterval(d time.Duration) DocumentHandlerOption {
+	return func(h *DocumentHandler) {
+		if d > 0 {
+			h.ingestEventPollInterval = d
+		}
+	}
+}
+
+// WithIngestEventKeepalive sets how long an idle ingest event stream waits
+// before writing a keepalive comment. A non-positive duration is ignored.
+func WithIngestEventKeepalive(d time.Duration) DocumentHandlerOption {
+	return func(h *DocumentHandler) {
+		if d > 0 {
+			h.ingestEventKeepalive = d
+		}
+	}
+}
+
+// WithIngestEventTimeout caps how long one ingest event stream stays open, so
+// a Document stuck in processing cannot hold it forever. A non-positive
+// duration is ignored.
+func WithIngestEventTimeout(d time.Duration) DocumentHandlerOption {
+	return func(h *DocumentHandler) {
+		if d > 0 {
+			h.ingestEventTimeout = d
+		}
+	}
 }
 
 // NewDocumentHandler creates a new Document handler. Uploads larger than
-// maxFileSize bytes are refused.
-func NewDocumentHandler(service interfaces.DocumentService, maxFileSize int64) *DocumentHandler {
-	return &DocumentHandler{service: service, maxFileSize: maxFileSize}
+// maxFileSize bytes are refused. opts set the ingest event stream timings.
+func NewDocumentHandler(service interfaces.DocumentService, maxFileSize int64,
+	opts ...DocumentHandlerOption,
+) *DocumentHandler {
+	h := &DocumentHandler{service: service, maxFileSize: maxFileSize}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 // CreateDocumentFromFile answers POST /documents: a multipart/form-data body

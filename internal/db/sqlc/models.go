@@ -55,6 +55,8 @@ type Document struct {
 	UploadID    uuid.UUID
 	// Why the last parse failed; NULL unless parse_status is failed
 	ParseError pgtype.Text
+	// Last Ingest Event seq allocated for the Document; advanced under the row lock so seq order is commit order
+	IngestEventSeq int64
 }
 
 type DocumentGroup struct {
@@ -76,6 +78,18 @@ type Group struct {
 type GroupMember struct {
 	GroupID     uuid.UUID
 	PrincipalID uuid.UUID
+}
+
+// Ingest Events of each Document, in seq order
+type IngestEvent struct {
+	DocumentID uuid.UUID
+	// Per-Document sequence number; the SSE event id and the resume cursor
+	Seq int64
+	// Step event: parse_started, parse_finished, embed_batch_finished, completed or failed
+	Type string
+	// Event detail carrying IDs and counts only, never Document content, file names or raw errors
+	Detail    []byte
+	CreatedAt time.Time
 }
 
 type ParentChunk struct {

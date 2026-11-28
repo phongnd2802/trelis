@@ -44,6 +44,19 @@ type Querier interface {
 	// mode, or before it was enabled, and the ID of the Parent Chunk the Chunk
 	// belongs to otherwise. A NULL means a reader falls back to the Chunk itself.
 	InsertChunk(ctx context.Context, arg InsertChunkParams) error
+	// Appends one Ingest Event to its Document's stream and returns it with the
+	// per-Document seq and created_at Postgres assigned. The UPDATE advances the
+	// Document's counter under its row lock, held until this transaction commits:
+	// the next event of that Document cannot take a seq until this one has
+	// committed, so seq order is commit order and a reader that resumes after a
+	// seq never misses an event. Zero rows means the Document is gone; the
+	// repository maps that to ErrDocumentNotFound.
+	//
+	// A caller inside a transaction inserts the event first: the UPDATE locks the
+	// Document row before the transaction touches any Chunk rows, the same order
+	// the delete cascade uses, so the two cannot deadlock. The lock is held until
+	// commit, which is what makes seq order commit order.
+	InsertIngestEvent(ctx context.Context, arg InsertIngestEventParams) (IngestEvent, error)
 	InsertParentChunk(ctx context.Context, arg InsertParentChunkParams) (uuid.UUID, error)
 	ListAPIKeys(ctx context.Context, principalID uuid.UUID) ([]ListAPIKeysRow, error)
 	ListDocumentGroups(ctx context.Context, documentID uuid.UUID) ([]string, error)
@@ -51,6 +64,10 @@ type Querier interface {
 	// The current upload ID of each of the given Documents. The reconciler
 	// treats objects under any other upload ID as a replaced upload (ADR-0006).
 	ListDocumentUploadIDs(ctx context.Context, documentIds []uuid.UUID) ([]ListDocumentUploadIDsRow, error)
+	// The events of one Document after the client's Last-Event-ID, in seq order.
+	// The primary-key index on (document_id, seq) serves both the filter and the
+	// order.
+	ListIngestEventsAfter(ctx context.Context, arg ListIngestEventsAfterParams) ([]IngestEvent, error)
 	// Parent Chunks of the readable Documents (#36): retrieval matches Chunks,
 	// then replaces them with the Parent Chunks they link to. The readable-ID
 	// filter is part of the query, so a Parent Chunk of a Document the caller

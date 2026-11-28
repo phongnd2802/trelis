@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/phongnd2802/trelis/internal/application/repository"
 	"github.com/phongnd2802/trelis/internal/application/service"
@@ -32,6 +33,13 @@ type server struct {
 	t          *testing.T
 	principals interfaces.PrincipalService
 	h          http.Handler
+	// docs is the Document handler, so a stream test can shorten its poll
+	// interval.
+	docs *handler.DocumentHandler
+	// store and pool are the database the server writes to; an events test
+	// seeds events and revokes grants directly.
+	store db.Store
+	pool  *pgxpool.Pool
 	// files is the object store the server writes Source Files to.
 	files *filetest.Memory
 	// ingest records the Documents uploads asked the ingest workflow to
@@ -83,10 +91,19 @@ func (f *fakeStarter) deletedIDs() []uuid.UUID {
 
 func newServer(t *testing.T, principals ...string) *server {
 	t.Helper()
-	store := db.NewStore(dbtest.Migrated(t))
+	return newServerWith(t, nil, principals...)
+}
+
+// newServerWith is newServer with extra DocumentHandler options, so a stream
+// test can shorten its timings.
+func newServerWith(t *testing.T, docOpts []handler.DocumentHandlerOption, principals ...string) *server {
+	t.Helper()
+	pool := dbtest.Migrated(t)
+	store := db.NewStore(pool)
 	principalRepo := repository.NewPrincipalRepository(store)
 	authn, principalSvc := realAuth(store)
-	c := &server{t: t, principals: principalSvc, keys: map[string]string{}, ctx: context.Background()}
+	c := &server{t: t, principals: principalSvc, keys: map[string]string{}, ctx: context.Background(),
+		store: store, pool: pool}
 	for _, name := range principals {
 		if _, err := c.principals.CreatePrincipal(c.ctx, name); err != nil {
 			t.Fatal(err)
@@ -100,9 +117,11 @@ func newServer(t *testing.T, principals ...string) *server {
 	c.files = filetest.NewMemory()
 	c.ingest = &fakeStarter{}
 	docs := service.NewDocumentService(store,
-		repository.NewDocumentRepository(store), principalRepo, c.files, c.ingest, c.ingest)
+		repository.NewDocumentRepository(store), principalRepo,
+		repository.NewIngestEventRepository(store), c.files, c.ingest, c.ingest)
+	c.docs = handler.NewDocumentHandler(docs, testMaxFileSize, docOpts...)
 	c.h = New(Readiness{}, authn, handler.NewPrincipalHandler(principalSvc),
-		handler.NewDocumentHandler(docs, testMaxFileSize), nil, nil, nil, false)
+		c.docs, nil, nil, nil, false)
 	return c
 }
 

@@ -22,6 +22,10 @@ _Avoid_: Media, image (in prose), picture, asset
 A contiguous piece of a Document's text that is retrieved and cited on its own.
 _Avoid_: Passage, segment
 
+**Ingest Event**:
+One step of a Document's ingest, recorded in order with a sequence number per Document, so a client can follow the progress as a Server-Sent Events stream and resume from the last event it saw.
+_Avoid_: Ingest log, progress message, progress event
+
 **Parent Chunk**:
 A wider window of a Document's text around consecutive Chunks, stored to give an answer more context; it is never embedded or searched itself.
 _Avoid_: Parent document, context chunk

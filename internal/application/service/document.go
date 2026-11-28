@@ -30,6 +30,7 @@ type documentService struct {
 	store      db.Store
 	repo       interfaces.DocumentRepository
 	principals interfaces.PrincipalRepository
+	events     interfaces.IngestEventRepository
 	fileSvc    interfaces.FileService
 	ingest     interfaces.IngestStarter
 	cleanup    interfaces.DocumentDeleteStarter
@@ -37,11 +38,12 @@ type documentService struct {
 
 // NewDocumentService returns the Document use cases.
 func NewDocumentService(store db.Store, repo interfaces.DocumentRepository,
-	principals interfaces.PrincipalRepository, fileSvc interfaces.FileService,
-	ingest interfaces.IngestStarter, cleanup interfaces.DocumentDeleteStarter,
+	principals interfaces.PrincipalRepository, events interfaces.IngestEventRepository,
+	fileSvc interfaces.FileService, ingest interfaces.IngestStarter,
+	cleanup interfaces.DocumentDeleteStarter,
 ) interfaces.DocumentUseCases {
-	return &documentService{store: store, repo: repo, principals: principals, fileSvc: fileSvc,
-		ingest: ingest, cleanup: cleanup}
+	return &documentService{store: store, repo: repo, principals: principals, events: events,
+		fileSvc: fileSvc, ingest: ingest, cleanup: cleanup}
 }
 
 // CreateDocumentFromFile creates a pending Document from an uploaded file and
@@ -264,4 +266,16 @@ func (s *documentService) ListPagedDocuments(ctx context.Context, page *types.Pa
 		return nil, err
 	}
 	return types.NewPageResult(total, page, docs), nil
+}
+
+// IngestEventsAfter returns the Ingest Events of a Document the caller can
+// read whose Seq is greater than afterSeq, in order. The Access List is read
+// on every call, so a revoked grant or a deleted Document ends an open
+// progress stream on its next poll; a caller who cannot read it gets the same
+// not-found error as for a missing Document (ADR-0004).
+func (s *documentService) IngestEventsAfter(ctx context.Context, id uuid.UUID, afterSeq int64) ([]*types.IngestEvent, error) {
+	if _, _, err := s.readableDocument(ctx, id); err != nil {
+		return nil, err
+	}
+	return s.events.ListIngestEventsAfter(ctx, id, afterSeq)
 }
