@@ -541,7 +541,7 @@
                         "bearerAuth": []
                     }
                 ],
-                "description": "Runs every candidate Retrieval Technique named in retrieval_config (dense and/or bm25) over the Documents the caller can read. One technique answers in its own order with its own score; several run concurrently over max(top_k, 50) candidates each and are fused with Reciprocal Rank Fusion, score = the sum of 1/(rrf_k + rank) over the lists that carry the Chunk, then cut to top_k with equal fused scores ordered by chunk_id. rrf_k defaults to 60 and must be between 1 and 1000; it has no effect with one technique. Naming rerank adds a second stage: the candidate pool (the single list or the fused list, cut to rerank_candidates) is scored once by the rerank model, ordered by that score with ties by chunk_id, then cut to top_k; rerank cannot run alone. rerank_candidates defaults to 50, must be between 1 and 100 and at least top_k, and has no effect without rerank. Every result carries the score and 1-based rank of each technique whose list carried it, plus the rerank score and rank when it ran. A bm25 request needs no embedding model. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values, an unknown or duplicate technique, rerank on its own and an out-of-range rrf_k or rerank_candidates are 400; a body over 64 KiB is 413; without models.embedding, a dense request is 503, and without models.rerank a request naming rerank is 503. A model provider's rejection of the call (its credentials, credit, permission or rate limit) is 502 and names the model role in its message; any other model failure is a generic 500.",
+                "description": "Runs every candidate Retrieval Technique named in retrieval_config (dense and/or bm25) over the Documents the caller can read. One technique answers in its own order with its own score; several run concurrently over max(top_k, 50) candidates each and are fused with Reciprocal Rank Fusion, score = the sum of 1/(rrf_k + rank) over the lists that carry the Chunk, then cut to top_k with equal fused scores ordered by chunk_id. rrf_k defaults to 60 and must be between 1 and 1000; it has no effect with one technique. Naming rerank adds a second stage: the candidate pool (the single list or the fused list, cut to rerank_candidates) is scored once by the rerank model, ordered by that score with ties by chunk_id; rerank cannot run alone. rerank_candidates defaults to 50, must be between 1 and 100 and at least top_k, and has no effect without rerank. Naming parent_child adds a final stage: each matched Chunk is replaced by its Parent Chunk, several matched Chunks of one Parent Chunk collapse into the position of the best-ranked matched Chunk, and a Chunk with no Parent Chunk stands alone; chunk_id, document_id, seq, score, scores and ranks stay the best-ranked matched Chunk's, content and context_header become the Parent Chunk's, and parent_chunk_id names it (absent for a standalone Chunk). Without rerank parent_child searches max(top_k, 50) deep; with rerank the pool stays rerank_candidates and the cut to top_k happens after the collapse. Every result carries the score and 1-based rank of each technique whose list carried it, plus the rerank score and rank when it ran. A bm25 request needs no embedding model. A caller who can read nothing gets 200 with an empty results list. Malformed JSON, unknown fields, invalid values, an unknown or duplicate technique, a config whose only techniques are stages (rerank, parent_child), an out-of-range rrf_k or rerank_candidates are 400; a body over 64 KiB is 413; without models.embedding, a dense request is 503, and without models.rerank a request naming rerank is 503. A model provider's rejection of the call (its credentials, credit, permission or rate limit) is 502 and names the model role in its message; any other model failure is a generic 500.",
                 "consumes": [
                     "application/json"
                 ],
@@ -554,7 +554,7 @@
                 "summary": "Retrieve Chunks for a query",
                 "parameters": [
                     {
-                        "description": "The query, how many Chunks to return, which Retrieval Techniques to run, the RRF constant and the rerank candidate pool",
+                        "description": "The query, how many Chunks to return, which Retrieval Techniques to run (dense, bm25, rerank, parent_child), the RRF constant and the rerank candidate pool",
                         "name": "request",
                         "in": "body",
                         "required": true,
@@ -583,7 +583,7 @@
                         }
                     },
                     "400": {
-                        "description": "Body that is not one JSON object, an unknown field or wrong value type, a blank or too-long query, an out-of-range top_k or an invalid retrieval_config (an unknown or duplicate technique, rerank on its own, an rrf_k outside 1..1000, or a rerank_candidates outside 1..100 or below top_k)",
+                        "description": "Body that is not one JSON object, an unknown field or wrong value type, a blank or too-long query, an out-of-range top_k or an invalid retrieval_config (an unknown or duplicate technique, only stage techniques such as rerank or parent_child, an rrf_k outside 1..1000, or a rerank_candidates outside 1..100 or below top_k)",
                         "schema": {
                             "$ref": "#/definitions/handler.ErrorResponse"
                         }
@@ -979,6 +979,26 @@
                 }
             }
         },
+        "types.ParentExpansion": {
+            "type": "object",
+            "properties": {
+                "chunk_id": {
+                    "description": "ChunkID is the result's chunk_id, the best-ranked matched Chunk.",
+                    "type": "string"
+                },
+                "matched_chunk_ids": {
+                    "description": "MatchedChunkIDs is every matched Chunk that collapsed into the result,\nin rank order; the first is ChunkID.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "parent_chunk_id": {
+                    "description": "ParentChunkID is the Parent Chunk that supplied the content; nil when\nthe result is a Chunk with no Parent Chunk.",
+                    "type": "string"
+                }
+            }
+        },
         "types.Principal": {
             "type": "object",
             "properties": {
@@ -1008,7 +1028,7 @@
                     "type": "integer"
                 },
                 "techniques": {
-                    "description": "Techniques is the set of Retrieval Techniques to run, without\nduplicates. More than one candidate technique makes the request a\nfusion: each runs over the readable Documents and their lists are\ncombined with Reciprocal Rank Fusion. Rerank reorders whatever the\ncandidate techniques found.",
+                    "description": "Techniques is the set of Retrieval Techniques to run, without\nduplicates. More than one candidate technique makes the request a\nfusion: each runs over the readable Documents and their lists are\ncombined with Reciprocal Rank Fusion. Rerank reorders whatever the\ncandidate techniques found; parent_child then replaces the ordered\nChunks with their Parent Chunks.",
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/types.RetrievalTechnique"
@@ -1060,12 +1080,14 @@
                 "dense",
                 "bm25",
                 "rerank",
+                "parent_child",
                 "rrf"
             ],
             "x-enum-varnames": [
                 "RetrievalTechniqueDense",
                 "RetrievalTechniqueBM25",
                 "RetrievalTechniqueRerank",
+                "RetrievalTechniqueParentChild",
                 "RetrievalTechniqueRRF"
             ]
         },
@@ -1073,15 +1095,21 @@
             "type": "object",
             "properties": {
                 "chunk_id": {
+                    "description": "ChunkID, DocumentID and Seq are the best-ranked matched Chunk's, so a\ncitation or GET /chunks/{id} still reaches a real Chunk.",
                     "type": "string"
                 },
                 "content": {
+                    "description": "Content and ContextHeader are the Parent Chunk's when the request\nexpanded to parents, else the Chunk's own.",
                     "type": "string"
                 },
                 "context_header": {
                     "type": "string"
                 },
                 "document_id": {
+                    "type": "string"
+                },
+                "parent_chunk_id": {
+                    "description": "ParentChunkID is the Parent Chunk the content came from; it is absent\nwhen the Chunk stands alone.",
                     "type": "string"
                 },
                 "ranks": {
@@ -1123,12 +1151,19 @@
             "type": "object",
             "properties": {
                 "candidates": {
-                    "description": "Candidates is how many Chunks the step returned: the search step's own\nmatches, the distinct Chunks a fuse step combined, or the pool size sent\nto the reranker. It is a pointer so a step with no candidate count\nleaves the field out.",
+                    "description": "Candidates is how many Chunks the step returned: the search step's own\nmatches, the distinct Chunks a fuse step combined, the pool size sent\nto the reranker, or the results the expand_parents step produced before\nthe cut. It is a pointer so a step with no candidate count leaves the\nfield out.",
                     "type": "integer"
                 },
                 "duration_ms": {
                     "description": "DurationMS is how long the step took, in milliseconds.",
                     "type": "integer"
+                },
+                "expanded": {
+                    "description": "Expanded says which Chunks collapsed into which result, one entry per\nreturned result in result order, on the expand_parents step. It is a\npointer so an expand step with no results still answers expanded: []\nwhile every other step leaves the field out.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/types.ParentExpansion"
+                    }
                 },
                 "model": {
                     "description": "Model is the embedding or rerank model, on the step that called one.",

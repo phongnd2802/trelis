@@ -63,11 +63,13 @@ func NewRetrievalService(documents interfaces.DocumentRepository, chunks interfa
 // answers with its own score and rank; several run concurrently and their
 // ranks are fused with Reciprocal Rank Fusion. When the config also names
 // rerank, the candidate pool (fused when there are several) is reordered by
-// the rerank model before the answer is cut to top_k. Reads only, so no
-// transaction is needed: the readable set is resolved on every request, never
-// cached. A Principal who can read nothing still gets the trace of the steps
-// that ran, with empty results, so the answer has the same shape as one that
-// matched nothing.
+// the rerank model. When it names parent_child, the ordered pool is replaced
+// by the Parent Chunks its Chunks link to, siblings collapse into the best
+// child's position, and only then is the answer cut to top_k. Reads only, so
+// no transaction is needed: the readable set is resolved on every request,
+// never cached. A Principal who can read nothing still gets the trace of the
+// steps that ran, with empty results, so the answer has the same shape as one
+// that matched nothing.
 func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalRequest) (*types.RetrievalResult, error) {
 	principal, err := caller(ctx)
 	if err != nil {
@@ -83,6 +85,7 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 	}
 	candidateTechniques := req.RetrievalConfig.CandidateTechniques()
 	rerankOn := req.RetrievalConfig.Reranks()
+	parentChildOn := req.RetrievalConfig.ExpandsParents()
 	if rerankOn && s.reranker == nil {
 		return nil, apperrors.NewServiceUnavailableError(
 			"rerank needs models.rerank to be configured")
@@ -90,7 +93,7 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 	// Non-nil slices keep an empty answer as "results": [] rather than null.
 	result := &types.RetrievalResult{
 		Results: []types.RetrievedChunk{},
-		Trace:   make([]types.TraceStep, 0, len(candidateTechniques)*2+2),
+		Trace:   make([]types.TraceStep, 0, len(candidateTechniques)*2+3),
 	}
 
 	documentIDs, err := s.documents.ListReadableDocumentIDs(ctx, principal.ID)
@@ -99,12 +102,17 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 	}
 	// One technique fetches exactly top_k, as it always has. Fusion needs a
 	// deeper pool per list so a Chunk that every list places low can still
-	// reach the fused top_k. Rerank needs a pool of its own size to score
-	// before the cut to top_k.
+	// reach the fused top_k. Parent-child needs the same depth without rerank,
+	// because collapsing siblings can empty as many places as it merges.
+	// Rerank needs a pool of its own size to score before the cut.
 	poolSize := *req.TopK
 	depth := *req.TopK
 	if len(candidateTechniques) > 1 {
 		depth = max(depth, types.RetrievalFusionCandidates)
+	}
+	if parentChildOn && !rerankOn {
+		depth = max(depth, types.RetrievalFusionCandidates)
+		poolSize = max(poolSize, types.RetrievalFusionCandidates)
 	}
 	if rerankOn {
 		poolSize = *req.RetrievalConfig.RerankCandidates
@@ -140,17 +148,30 @@ func (s *retrievalService) Retrieve(ctx context.Context, req *types.RetrievalReq
 			Candidates: &distinct,
 		})
 	}
-	if !rerankOn {
+	if rerankOn {
+		reranked, step, err := s.rerank(ctx, req.Query, pool)
+		if err != nil {
+			return nil, err
+		}
+		result.Trace = append(result.Trace, step)
+		pool = reranked
+	}
+	if !parentChildOn {
+		// Rerank returns its whole sorted pool, so the cut to top_k lives
+		// here when there is no expansion to do first.
+		if len(pool) > *req.TopK {
+			pool = pool[:*req.TopK]
+		}
 		result.Results = retrievedChunks(pool)
 		return result, nil
 	}
 
-	reranked, step, err := s.rerank(ctx, req.Query, pool, *req.TopK)
+	expanded, step, err := s.expandParents(ctx, documentIDs, pool, *req.TopK)
 	if err != nil {
 		return nil, err
 	}
 	result.Trace = append(result.Trace, step)
-	result.Results = retrievedChunks(reranked)
+	result.Results = expandedResults(expanded)
 	return result, nil
 }
 
@@ -253,13 +274,15 @@ func (s *retrievalService) runBM25(ctx context.Context, documentIDs []uuid.UUID,
 	}}, nil
 }
 
-// fusedChunk is one Chunk after fusion: the Chunk, the score that orders it,
-// and the score and 1-based rank every list that carried it gave it.
+// fusedChunk is one Chunk after fusion: the Chunk, its Parent Chunk when it
+// has one, the score that orders it, and the score and 1-based rank every
+// list that carried it gave it.
 type fusedChunk struct {
-	chunk  *types.Chunk
-	score  float64
-	scores map[types.RetrievalTechnique]float64
-	ranks  map[types.RetrievalTechnique]int
+	chunk    *types.Chunk
+	parentID *uuid.UUID
+	score    float64
+	scores   map[types.RetrievalTechnique]float64
+	ranks    map[types.RetrievalTechnique]int
 }
 
 // singleTechniqueChunks turns one technique's matches into fusedChunks in the
@@ -270,13 +293,28 @@ func singleTechniqueChunks(technique types.RetrievalTechnique, matches []*types.
 	out := make([]fusedChunk, 0, len(matches))
 	for i, match := range matches {
 		out = append(out, fusedChunk{
-			chunk:  match.Chunk,
-			score:  match.Score,
-			scores: map[types.RetrievalTechnique]float64{technique: match.Score},
-			ranks:  map[types.RetrievalTechnique]int{technique: i + 1},
+			chunk:    match.Chunk,
+			parentID: match.ParentID,
+			score:    match.Score,
+			scores:   map[types.RetrievalTechnique]float64{technique: match.Score},
+			ranks:    map[types.RetrievalTechnique]int{technique: i + 1},
 		})
 	}
 	return out
+}
+
+// retrievedChunk renders one fused entry as a result.
+func retrievedChunk(entry fusedChunk) types.RetrievedChunk {
+	return types.RetrievedChunk{
+		ChunkID:       entry.chunk.ID,
+		DocumentID:    entry.chunk.DocumentID,
+		Seq:           entry.chunk.Seq,
+		Content:       entry.chunk.Content,
+		ContextHeader: entry.chunk.ContextHeader,
+		Score:         entry.score,
+		Scores:        entry.scores,
+		Ranks:         entry.ranks,
+	}
 }
 
 // retrievedChunks renders fusedChunks as the answer's results, in their
@@ -284,27 +322,147 @@ func singleTechniqueChunks(technique types.RetrievalTechnique, matches []*types.
 func retrievedChunks(chunks []fusedChunk) []types.RetrievedChunk {
 	out := make([]types.RetrievedChunk, 0, len(chunks))
 	for _, entry := range chunks {
-		out = append(out, types.RetrievedChunk{
-			ChunkID:       entry.chunk.ID,
-			DocumentID:    entry.chunk.DocumentID,
-			Seq:           entry.chunk.Seq,
-			Content:       entry.chunk.Content,
-			ContextHeader: entry.chunk.ContextHeader,
-			Score:         entry.score,
-			Scores:        entry.scores,
-			Ranks:         entry.ranks,
+		out = append(out, retrievedChunk(entry))
+	}
+	return out
+}
+
+// parentExpansion is one parent_child result: the best matching child, the
+// Parent Chunk that supplies the content (nil when the child stands alone),
+// and every child that collapsed into it in rank order.
+type parentExpansion struct {
+	entry   fusedChunk
+	parent  *types.ParentChunk
+	matched []uuid.UUID
+}
+
+// expandParents replaces each Chunk in pool with its Parent Chunk, collapses
+// several Chunks of one Parent Chunk into the first (best) one's position, and
+// cuts the collapsed list to topK. A Chunk with no Parent Chunk, or one whose
+// Parent Chunk is no longer there, stands alone. The returned step names the
+// children behind every returned result; its candidate count is the results
+// before the cut, so a caller can see what the cut removed.
+func (s *retrievalService) expandParents(ctx context.Context, documentIDs []uuid.UUID,
+	pool []fusedChunk, topK int,
+) ([]parentExpansion, types.TraceStep, error) {
+	start := time.Now()
+	parents := make(map[uuid.UUID]*types.ParentChunk)
+	// A fallback-only pool has nothing to look up, so it costs no query.
+	if parentIDs := distinctParentIDs(pool); len(parentIDs) > 0 {
+		found, err := s.chunks.ListParentChunks(ctx, documentIDs, parentIDs)
+		if err != nil {
+			return nil, types.TraceStep{}, fmt.Errorf("list parent chunks: %w", err)
+		}
+		for _, parent := range found {
+			parents[parent.ID] = parent
+		}
+	}
+	expanded := collapseParents(pool, parents)
+	candidates := len(expanded)
+	if len(expanded) > topK {
+		expanded = expanded[:topK]
+	}
+	expandedTrace := parentExpansions(expanded)
+	step := types.TraceStep{
+		Step:       types.TraceStepExpandParents,
+		Technique:  types.RetrievalTechniqueParentChild,
+		DurationMS: time.Since(start).Milliseconds(),
+		Candidates: &candidates,
+		Expanded:   &expandedTrace,
+	}
+	return expanded, step, nil
+}
+
+// distinctParentIDs returns the Parent Chunk IDs pool's Chunks link to, in
+// first-match order, without duplicates.
+func distinctParentIDs(pool []fusedChunk) []uuid.UUID {
+	seen := make(map[uuid.UUID]struct{}, len(pool))
+	ids := make([]uuid.UUID, 0, len(pool))
+	for _, entry := range pool {
+		if entry.parentID == nil {
+			continue
+		}
+		if _, ok := seen[*entry.parentID]; ok {
+			continue
+		}
+		seen[*entry.parentID] = struct{}{}
+		ids = append(ids, *entry.parentID)
+	}
+	return ids
+}
+
+// collapseParents walks pool in rank order and keeps one expansion per Parent
+// Chunk at its best child's position; a child with no parent, or whose parent
+// is missing from parents, stands alone.
+func collapseParents(pool []fusedChunk, parents map[uuid.UUID]*types.ParentChunk) []parentExpansion {
+	expanded := make([]parentExpansion, 0, len(pool))
+	position := make(map[uuid.UUID]int, len(pool))
+	for _, entry := range pool {
+		var parent *types.ParentChunk
+		if entry.parentID != nil {
+			parent = parents[*entry.parentID]
+		}
+		if parent != nil {
+			if i, ok := position[parent.ID]; ok {
+				expanded[i].matched = append(expanded[i].matched, entry.chunk.ID)
+				continue
+			}
+			position[parent.ID] = len(expanded)
+		}
+		expanded = append(expanded, parentExpansion{
+			entry:   entry,
+			parent:  parent,
+			matched: []uuid.UUID{entry.chunk.ID},
 		})
+	}
+	return expanded
+}
+
+// expandedResults renders parent_child expansions as the answer's results:
+// ids, score, scores and ranks from the best-ranked matched Chunk, content
+// and context header from the Parent Chunk when there is one.
+func expandedResults(expanded []parentExpansion) []types.RetrievedChunk {
+	out := make([]types.RetrievedChunk, 0, len(expanded))
+	for _, expansion := range expanded {
+		result := retrievedChunk(expansion.entry)
+		if expansion.parent != nil {
+			result.Content = expansion.parent.Content
+			result.ContextHeader = expansion.parent.ContextHeader
+			parentID := expansion.parent.ID
+			result.ParentChunkID = &parentID
+		}
+		out = append(out, result)
+	}
+	return out
+}
+
+// parentExpansions renders the trace entries for expansions, one per result
+// in result order.
+func parentExpansions(expanded []parentExpansion) []types.ParentExpansion {
+	out := make([]types.ParentExpansion, 0, len(expanded))
+	for _, expansion := range expanded {
+		entry := types.ParentExpansion{
+			ChunkID:         expansion.entry.chunk.ID,
+			MatchedChunkIDs: expansion.matched,
+		}
+		if expansion.parent != nil {
+			parentID := expansion.parent.ID
+			entry.ParentChunkID = &parentID
+		}
+		out = append(out, entry)
 	}
 	return out
 }
 
 // rerank orders the candidate pool by the rerank model's score, adds that
-// score and rank beside the first stage's, cuts the pool to topK and returns
-// the step that recorded the call. Ties order by Chunk ID, the same way the
-// other stages break them. An empty pool makes no model call but still records
-// the step, so the answer keeps its shape.
-func (s *retrievalService) rerank(ctx context.Context, query string, pool []fusedChunk,
-	topK int,
+// score and 1-based rank beside the first stage's, and returns the whole
+// sorted pool. The caller cuts to top_k, after parent-child expansion when
+// that stage runs, so collapsing siblings still sees every scored Chunk. Ties
+// order by Chunk ID, the same way the other stages break them. An empty pool
+// makes no model call but still records the step, so the answer keeps its
+// shape.
+func (s *retrievalService) rerank(ctx context.Context, query string,
+	pool []fusedChunk,
 ) ([]fusedChunk, types.TraceStep, error) {
 	poolSize := len(pool)
 	step := types.TraceStep{
@@ -340,9 +498,6 @@ func (s *retrievalService) rerank(ctx context.Context, query string, pool []fuse
 		}
 		return bytes.Compare(a.chunk.ID[:], b.chunk.ID[:])
 	})
-	if len(pool) > topK {
-		pool = pool[:topK]
-	}
 	for i := range pool {
 		pool[i].ranks[types.RetrievalTechniqueRerank] = i + 1
 	}
@@ -368,9 +523,10 @@ func fuseRRF(lists map[types.RetrievalTechnique][]*types.ChunkMatch, k, topK int
 			entry, ok := byChunk[match.Chunk.ID]
 			if !ok {
 				entry = &fusedChunk{
-					chunk:  match.Chunk,
-					scores: make(map[types.RetrievalTechnique]float64, len(lists)),
-					ranks:  make(map[types.RetrievalTechnique]int, len(lists)),
+					chunk:    match.Chunk,
+					parentID: match.ParentID,
+					scores:   make(map[types.RetrievalTechnique]float64, len(lists)),
+					ranks:    make(map[types.RetrievalTechnique]int, len(lists)),
 				}
 				byChunk[match.Chunk.ID] = entry
 			}

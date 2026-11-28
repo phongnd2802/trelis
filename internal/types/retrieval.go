@@ -26,6 +26,11 @@ const (
 	// with the rerank model's relevance score. It is a second stage, not a
 	// candidate source, so a request must name at least one other technique.
 	RetrievalTechniqueRerank RetrievalTechnique = "rerank"
+	// RetrievalTechniqueParentChild replaces the Chunks another technique
+	// found with their Parent Chunks, collapsing several Chunks of one Parent
+	// Chunk into one result. It is a final stage, not a candidate source, so a
+	// request must name at least one other technique.
+	RetrievalTechniqueParentChild RetrievalTechnique = "parent_child"
 )
 
 // RetrievalTechniqueRRF labels the step that fuses several techniques' lists
@@ -67,7 +72,12 @@ const RetrievalQueryMaxRunes = 2000
 // KnownRetrievalTechniques returns the Retrieval Techniques this build
 // implements, in the order an error message names them.
 func KnownRetrievalTechniques() []RetrievalTechnique {
-	return []RetrievalTechnique{RetrievalTechniqueDense, RetrievalTechniqueBM25, RetrievalTechniqueRerank}
+	return []RetrievalTechnique{
+		RetrievalTechniqueDense,
+		RetrievalTechniqueBM25,
+		RetrievalTechniqueRerank,
+		RetrievalTechniqueParentChild,
+	}
 }
 
 // Known reports whether this build implements the technique. A technique a
@@ -81,27 +91,55 @@ func (t RetrievalTechnique) Known() bool {
 	return false
 }
 
-// knownTechniqueList names the techniques this build implements, as an error
-// message lists them.
-func knownTechniqueList() string {
-	names := make([]string, 0, len(KnownRetrievalTechniques()))
-	for _, t := range KnownRetrievalTechniques() {
+// IsStage reports whether the technique only transforms another technique's
+// candidates, rather than finding candidates of its own.
+func (t RetrievalTechnique) IsStage() bool {
+	return t == RetrievalTechniqueRerank || t == RetrievalTechniqueParentChild
+}
+
+// quotedTechniqueList names techniques as an error message lists them.
+func quotedTechniqueList(techniques []RetrievalTechnique) string {
+	names := make([]string, 0, len(techniques))
+	for _, t := range techniques {
 		names = append(names, fmt.Sprintf("%q", string(t)))
 	}
 	return strings.Join(names, ", ")
 }
 
+// knownTechniqueList names the techniques this build implements, as an error
+// message lists them.
+func knownTechniqueList() string {
+	return quotedTechniqueList(KnownRetrievalTechniques())
+}
+
 // knownCandidateTechniqueList names the techniques that find candidates, all
-// but rerank, as the rerank-alone error lists them.
+// but the stage techniques, as an error that rejects a stage-only config
+// lists them.
 func knownCandidateTechniqueList() string {
-	names := make([]string, 0, len(KnownRetrievalTechniques()))
+	candidates := make([]RetrievalTechnique, 0, len(KnownRetrievalTechniques()))
 	for _, t := range KnownRetrievalTechniques() {
-		if t == RetrievalTechniqueRerank {
-			continue
+		if !t.IsStage() {
+			candidates = append(candidates, t)
 		}
-		names = append(names, fmt.Sprintf("%q", string(t)))
 	}
-	return strings.Join(names, ", ")
+	return quotedTechniqueList(candidates)
+}
+
+// stageOnlyMessage says why a config whose techniques are all stages cannot
+// run, naming the techniques it named.
+func stageOnlyMessage(techniques []RetrievalTechnique) string {
+	if len(techniques) == 1 {
+		switch techniques[0] {
+		case RetrievalTechniqueRerank:
+			return fmt.Sprintf("retrieval technique %q reorders the Chunks another technique finds",
+				RetrievalTechniqueRerank)
+		case RetrievalTechniqueParentChild:
+			return fmt.Sprintf("retrieval technique %q expands the Chunks another technique finds into their Parent Chunks",
+				RetrievalTechniqueParentChild)
+		}
+	}
+	return fmt.Sprintf("retrieval techniques %s only reorder or expand the Chunks another technique finds",
+		quotedTechniqueList(techniques))
 }
 
 // RetrievalConfig is a named combination of Retrieval Techniques switched on
@@ -111,7 +149,8 @@ type RetrievalConfig struct {
 	// duplicates. More than one candidate technique makes the request a
 	// fusion: each runs over the readable Documents and their lists are
 	// combined with Reciprocal Rank Fusion. Rerank reorders whatever the
-	// candidate techniques found.
+	// candidate techniques found; parent_child then replaces the ordered
+	// Chunks with their Parent Chunks.
 	Techniques []RetrievalTechnique `json:"techniques"`
 	// RRFK is the Reciprocal Rank Fusion constant k; nil means the default.
 	// It only affects a request that runs more than one technique, so it is
@@ -124,13 +163,13 @@ type RetrievalConfig struct {
 }
 
 // CandidateTechniques returns the techniques that find candidates: every
-// requested technique except rerank, which only reorders them. Validation
-// rejects a config that names rerank alone, so a valid config's result is
-// never empty.
+// requested technique except the stage techniques, rerank and parent_child.
+// Validation rejects a config that names only stage techniques, so a valid
+// config's result is never empty.
 func (c *RetrievalConfig) CandidateTechniques() []RetrievalTechnique {
 	out := make([]RetrievalTechnique, 0, len(c.Techniques))
 	for _, technique := range c.Techniques {
-		if technique != RetrievalTechniqueRerank {
+		if !technique.IsStage() {
 			out = append(out, technique)
 		}
 	}
@@ -140,6 +179,11 @@ func (c *RetrievalConfig) CandidateTechniques() []RetrievalTechnique {
 // Reranks reports whether the config names the rerank technique.
 func (c *RetrievalConfig) Reranks() bool {
 	return slices.Contains(c.Techniques, RetrievalTechniqueRerank)
+}
+
+// ExpandsParents reports whether the config names the parent_child technique.
+func (c *RetrievalConfig) ExpandsParents() bool {
+	return slices.Contains(c.Techniques, RetrievalTechniqueParentChild)
 }
 
 // DefaultRetrievalConfig returns the config a request that leaves it out
@@ -155,11 +199,11 @@ func DefaultRetrievalConfig() *RetrievalConfig {
 }
 
 // Validate rejects an empty list, a technique this build does not implement,
-// a technique listed twice, rerank on its own, an rrf_k outside
-// 1..RetrievalRRFKMax and a rerank_candidates outside
-// 1..RetrievalRerankCandidatesMax. It fills an omitted rrf_k with
-// RetrievalRRFKDefault and an omitted rerank_candidates with
-// RetrievalRerankCandidatesDefault. The messages are fit for the client.
+// a technique listed twice, a config whose only techniques are stage
+// techniques (rerank, parent_child), an rrf_k outside 1..RetrievalRRFKMax and
+// a rerank_candidates outside 1..RetrievalRerankCandidatesMax. It fills an
+// omitted rrf_k with RetrievalRRFKDefault and an omitted rerank_candidates
+// with RetrievalRerankCandidatesDefault. The messages are fit for the client.
 func (c *RetrievalConfig) Validate() error {
 	if c == nil || len(c.Techniques) == 0 {
 		return fmt.Errorf("retrieval_config.techniques must name at least one technique (known techniques: %s)",
@@ -176,9 +220,9 @@ func (c *RetrievalConfig) Validate() error {
 		}
 		seen[technique] = struct{}{}
 	}
-	if c.Reranks() && len(c.CandidateTechniques()) == 0 {
-		return fmt.Errorf("retrieval technique %q reorders the Chunks another technique finds, so techniques must name at least one candidate technique as well (candidate techniques: %s)",
-			RetrievalTechniqueRerank, knownCandidateTechniqueList())
+	if len(c.CandidateTechniques()) == 0 {
+		return fmt.Errorf("%s, so techniques must name at least one candidate technique as well (candidate techniques: %s)",
+			stageOnlyMessage(c.Techniques), knownCandidateTechniqueList())
 	}
 	if c.RRFK == nil {
 		rrfK := RetrievalRRFKDefault
@@ -249,21 +293,32 @@ func (r *RetrievalRequest) Validate() error {
 // technique gave it. Higher is more relevant.
 type ChunkMatch struct {
 	Chunk *Chunk
-	Score float64
+	// ParentID is the Parent Chunk the Chunk belongs to, or nil when the
+	// Document was ingested without parent-child mode.
+	ParentID *uuid.UUID
+	Score    float64
 }
 
-// RetrievedChunk is one Chunk in the answer to POST /retrieve, with the
-// final score that orders the results and, for every technique whose list
-// carried it, that technique's own score and 1-based rank.
+// RetrievedChunk is one result in the answer to POST /retrieve, with the
+// final score that orders it and, for every technique whose list carried it,
+// that technique's own score and 1-based rank. With parent-child it carries
+// the best-ranked matched Chunk's ids and the Parent Chunk's text.
 type RetrievedChunk struct {
-	ChunkID       uuid.UUID                      `json:"chunk_id"`
-	DocumentID    uuid.UUID                      `json:"document_id"`
-	Seq           int                            `json:"seq"`
+	// ChunkID, DocumentID and Seq are the best-ranked matched Chunk's, so a
+	// citation or GET /chunks/{id} still reaches a real Chunk.
+	ChunkID    uuid.UUID `json:"chunk_id"`
+	DocumentID uuid.UUID `json:"document_id"`
+	Seq        int       `json:"seq"`
+	// Content and ContextHeader are the Parent Chunk's when the request
+	// expanded to parents, else the Chunk's own.
 	Content       string                         `json:"content"`
 	ContextHeader string                         `json:"context_header"`
 	Score         float64                        `json:"score"`
 	Scores        map[RetrievalTechnique]float64 `json:"scores"`
 	Ranks         map[RetrievalTechnique]int     `json:"ranks"`
+	// ParentChunkID is the Parent Chunk the content came from; it is absent
+	// when the Chunk stands alone.
+	ParentChunkID *uuid.UUID `json:"parent_chunk_id,omitempty"`
 }
 
 // The steps a retrieval run records in its trace.
@@ -277,6 +332,9 @@ const (
 	TraceStepFuse = "fuse"
 	// TraceStepRerank reorders the candidate pool with the rerank model.
 	TraceStepRerank = "rerank"
+	// TraceStepExpandParents replaces matched Chunks with their Parent Chunks
+	// and collapses Chunks of one Parent Chunk into one result.
+	TraceStepExpandParents = "expand_parents"
 )
 
 // TraceStep is one step of a retrieval run, timed so a caller can see where
@@ -292,10 +350,30 @@ type TraceStep struct {
 	// Model is the embedding or rerank model, on the step that called one.
 	Model string `json:"model,omitempty"`
 	// Candidates is how many Chunks the step returned: the search step's own
-	// matches, the distinct Chunks a fuse step combined, or the pool size sent
-	// to the reranker. It is a pointer so a step with no candidate count
-	// leaves the field out.
+	// matches, the distinct Chunks a fuse step combined, the pool size sent
+	// to the reranker, or the results the expand_parents step produced before
+	// the cut. It is a pointer so a step with no candidate count leaves the
+	// field out.
 	Candidates *int `json:"candidates,omitempty"`
+	// Expanded says which Chunks collapsed into which result, one entry per
+	// returned result in result order, on the expand_parents step. It is a
+	// pointer so an expand step with no results still answers expanded: []
+	// while every other step leaves the field out.
+	Expanded *[]ParentExpansion `json:"expanded,omitempty"`
+}
+
+// ParentExpansion records how one parent_child result was built: its
+// best-ranked matched Chunk, the Parent Chunk that supplied the content, and
+// every matched Chunk that collapsed into it.
+type ParentExpansion struct {
+	// ChunkID is the result's chunk_id, the best-ranked matched Chunk.
+	ChunkID uuid.UUID `json:"chunk_id"`
+	// ParentChunkID is the Parent Chunk that supplied the content; nil when
+	// the result is a Chunk with no Parent Chunk.
+	ParentChunkID *uuid.UUID `json:"parent_chunk_id"`
+	// MatchedChunkIDs is every matched Chunk that collapsed into the result,
+	// in rank order; the first is ChunkID.
+	MatchedChunkIDs []uuid.UUID `json:"matched_chunk_ids"`
 }
 
 // RetrievalResult is the payload of a successful POST /retrieve: the ranked

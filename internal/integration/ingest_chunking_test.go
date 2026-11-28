@@ -21,6 +21,7 @@ import (
 
 // storedChunk is one chunk row the ingest tests read straight from Postgres.
 type storedChunk struct {
+	id       string
 	seq      int
 	content  string
 	header   string
@@ -40,7 +41,7 @@ func (tr *trelis) chunks(t *testing.T, documentID string) []storedChunk {
 	}
 	defer func() { _ = conn.Close(ctx) }()
 
-	rows, err := conn.Query(ctx, `SELECT seq, content, context_header, start_offset, parent_id
+	rows, err := conn.Query(ctx, `SELECT id, seq, content, context_header, start_offset, parent_id
 FROM chunks WHERE document_id = $1 ORDER BY seq`, documentID)
 	if err != nil {
 		t.Fatalf("select chunks of %s: %v", documentID, err)
@@ -50,7 +51,7 @@ FROM chunks WHERE document_id = $1 ORDER BY seq`, documentID)
 	for rows.Next() {
 		var c storedChunk
 		var parentID pgtype.UUID
-		if err := rows.Scan(&c.seq, &c.content, &c.header, &c.start, &parentID); err != nil {
+		if err := rows.Scan(&c.id, &c.seq, &c.content, &c.header, &c.start, &parentID); err != nil {
 			t.Fatal(err)
 		}
 		if parentID.Valid {

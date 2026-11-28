@@ -32,15 +32,25 @@ type retrievedChunk struct {
 	Score         float64            `json:"score"`
 	Scores        map[string]float64 `json:"scores"`
 	Ranks         map[string]int     `json:"ranks"`
+	ParentChunkID string             `json:"parent_chunk_id"`
+}
+
+// parentExpansionView is one expand_parents trace entry: the result's best
+// child, its Parent Chunk and every child that collapsed into it.
+type parentExpansionView struct {
+	ChunkID         string   `json:"chunk_id"`
+	ParentChunkID   *string  `json:"parent_chunk_id"`
+	MatchedChunkIDs []string `json:"matched_chunk_ids"`
 }
 
 // traceStep is one timed step of a retrieval run.
 type traceStep struct {
-	Step       string `json:"step"`
-	Technique  string `json:"technique"`
-	DurationMS int64  `json:"duration_ms"`
-	Model      string `json:"model"`
-	Candidates int    `json:"candidates"`
+	Step       string                `json:"step"`
+	Technique  string                `json:"technique"`
+	DurationMS int64                 `json:"duration_ms"`
+	Model      string                `json:"model"`
+	Candidates int                   `json:"candidates"`
+	Expanded   []parentExpansionView `json:"expanded"`
 }
 
 // retrievalAnswer is the envelope POST /retrieve answers with.
@@ -178,6 +188,246 @@ func checkTrace(t *testing.T, trace []traceStep, candidates int) {
 	}
 	if step := trace[1]; step.Step != "search" || step.Technique != "dense" || step.Candidates != candidates || step.DurationMS < 0 {
 		t.Errorf("trace[1] = %+v, want the search step with %d candidates", step, candidates)
+	}
+}
+
+// storedParent is one Parent Chunk row the retrieval tests read straight from
+// Postgres.
+type storedParent struct {
+	id              string
+	seq             int
+	content, header string
+}
+
+// parentChunks returns documentID's Parent Chunks in seq order.
+func (tr *trelis) parentChunks(t *testing.T, documentID string) []storedParent {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
+		pgUser, pgPassword, deps.pg.host, deps.pg.port, tr.dbname))
+	if err != nil {
+		t.Fatalf("connect to database %s: %v", tr.dbname, err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	rows, err := conn.Query(ctx,
+		`SELECT id, seq, content, context_header FROM parent_chunks WHERE document_id = $1 ORDER BY seq`, documentID)
+	if err != nil {
+		t.Fatalf("select Parent Chunks of %s: %v", documentID, err)
+	}
+	defer rows.Close()
+	var parents []storedParent
+	for rows.Next() {
+		var p storedParent
+		if err := rows.Scan(&p.id, &p.seq, &p.content, &p.header); err != nil {
+			t.Fatal(err)
+		}
+		parents = append(parents, p)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return parents
+}
+
+// TestRetrieveParentChildReturnsParentChunksAndTheTraceThatMatchedThem is the
+// acceptance case for parent-child retrieval: a Document ingested with the
+// mode on answers with Parent Chunk content, its results collapse several
+// matching children, and the expand_parents step names them.
+func TestRetrieveParentChildReturnsParentChunksAndTheTraceThatMatchedThem(t *testing.T) {
+	tr := startWith(t,
+		"TRELIS_CHUNKING_STRATEGY=auto",
+		"TRELIS_CHUNKING_PARENT_CHILD=true",
+	)
+	alice := tr.principalKey(t, "alice")
+	documentID := tr.upload(t, alice, "luat_mau.md", legalSample(t))
+	if doc := tr.waitForIngest(t, alice, documentID); doc.ParseStatus != "completed" {
+		t.Fatalf("parse_status = %q (%q), want completed", doc.ParseStatus, doc.ParseError)
+	}
+
+	parents := tr.parentChunks(t, documentID)
+	if len(parents) < 2 {
+		t.Fatalf("stored %d Parent Chunks, want the sample split across several", len(parents))
+	}
+	parentByID := make(map[string]storedParent, len(parents))
+	for _, p := range parents {
+		parentByID[p.id] = p
+	}
+	childByID := make(map[string]storedChunk)
+	for _, c := range tr.chunks(t, documentID) {
+		childByID[c.id] = c
+	}
+
+	answer := tr.retrieveConfig(t, alice, "Điều", 10, map[string]any{
+		"techniques": []string{"bm25", "parent_child"},
+	})
+	results := answer.Data.Results
+	if len(results) == 0 {
+		t.Fatal("parent-child retrieval returned no results")
+	}
+	for i, result := range results {
+		if result.ParentChunkID == "" {
+			t.Errorf("result %d has no parent_chunk_id", i)
+			continue
+		}
+		parent, ok := parentByID[result.ParentChunkID]
+		if !ok {
+			t.Errorf("result %d names Parent Chunk %s, want one of the Document's", i, result.ParentChunkID)
+			continue
+		}
+		if result.Content != parent.content || result.ContextHeader != parent.header {
+			t.Errorf("result %d content/header = %q/%q, want the Parent Chunk's %q/%q",
+				i, result.Content, result.ContextHeader, parent.content, parent.header)
+		}
+		child, ok := childByID[result.ChunkID]
+		if !ok {
+			t.Errorf("result %d chunk_id %s is not a stored Chunk", i, result.ChunkID)
+			continue
+		}
+		if child.parentID == nil || child.parentID.String() != result.ParentChunkID {
+			t.Errorf("result %d chunk_id %s links to parent %v, want %s",
+				i, result.ChunkID, child.parentID, result.ParentChunkID)
+		}
+	}
+
+	// The expand step is last: its candidates are the results before the cut,
+	// and its Expanded list names every child behind each result in rank
+	// order.
+	trace := answer.Data.Trace
+	if len(trace) != 2 {
+		t.Fatalf("trace = %+v, want the bm25 search and the expand step", trace)
+	}
+	step := trace[1]
+	if step.Step != "expand_parents" || step.Technique != "parent_child" || step.DurationMS < 0 {
+		t.Fatalf("trace[1] = %+v, want the expand_parents step naming parent_child", step)
+	}
+	if step.Candidates < len(results) {
+		t.Errorf("expand candidates = %d, want at least the %d returned results", step.Candidates, len(results))
+	}
+	if len(step.Expanded) != len(results) {
+		t.Fatalf("expanded = %+v, want one entry per returned result", step.Expanded)
+	}
+	collapsed := false
+	for i, expansion := range step.Expanded {
+		result := results[i]
+		if expansion.ChunkID != result.ChunkID {
+			t.Errorf("expanded[%d] chunk_id = %s, want the result's %s", i, expansion.ChunkID, result.ChunkID)
+		}
+		if expansion.ParentChunkID == nil || *expansion.ParentChunkID != result.ParentChunkID {
+			t.Errorf("expanded[%d] parent_chunk_id = %v, want %s", i, expansion.ParentChunkID, result.ParentChunkID)
+		}
+		if len(expansion.MatchedChunkIDs) == 0 || expansion.MatchedChunkIDs[0] != expansion.ChunkID {
+			t.Errorf("expanded[%d] matched_chunk_ids = %v, want the result's chunk first",
+				i, expansion.MatchedChunkIDs)
+		}
+		if len(expansion.MatchedChunkIDs) > 1 {
+			collapsed = true
+		}
+	}
+	if !collapsed {
+		t.Errorf("no result collapsed several matching Chunks: %+v", step.Expanded)
+	}
+}
+
+// TestRetrieveParentChildKeepsRestrictedParentChunksOut is the leakage test
+// for parent-child retrieval: Bob's answer and its expand_parents step never
+// name or carry Alice's Restricted Document's Chunks or Parent Chunks, while
+// Alice's answer does.
+func TestRetrieveParentChildKeepsRestrictedParentChunksOut(t *testing.T) {
+	tr := startWith(t,
+		"TRELIS_CHUNKING_STRATEGY=auto",
+		"TRELIS_CHUNKING_PARENT_CHILD=true",
+	)
+	alice := tr.principalKey(t, "alice")
+	bob := tr.principalKey(t, "bob")
+
+	const query = "thue tncn"
+	secretID := tr.upload(t, alice, "secret.md",
+		"# Secret\n\nThuế TNCN thuế TNCN thuế TNCN thuế TNCN thuế TNCN là thuế thu nhập cá nhân.\n")
+	// A Document Alice shares with Bob through its Access List.
+	sharedID := tr.uploadBytesWithFields(t, alice, "shared.md",
+		[]byte("# Shared\n\nThuế TNCN được khấu trừ tại nguồn.\n"), map[string]string{"principals": "bob"})
+	bobID := tr.upload(t, bob, "bob.md", "# Bob\n\nThuế TNCN của bob.\n")
+
+	for _, doc := range []struct{ id, key, name string }{
+		{secretID, alice, "Alice's secret"},
+		{sharedID, alice, "Alice's shared"},
+		{bobID, bob, "Bob's own"},
+	} {
+		if got := tr.waitForIngest(t, doc.key, doc.id); got.ParseStatus != "completed" {
+			t.Fatalf("%s Document parse_status = %q (%q), want completed", doc.name, got.ParseStatus, got.ParseError)
+		}
+	}
+
+	secretParents := tr.parentChunks(t, secretID)
+	if len(secretParents) == 0 {
+		t.Fatal("the secret Document has no Parent Chunk")
+	}
+	secretParentIDs := make(map[string]bool, len(secretParents))
+	for _, p := range secretParents {
+		secretParentIDs[p.id] = true
+	}
+	secretChunkIDs := make(map[string]bool)
+	for _, c := range tr.chunks(t, secretID) {
+		secretChunkIDs[c.id] = true
+	}
+
+	config := map[string]any{"techniques": []string{"bm25", "parent_child"}}
+	bobAnswer := tr.retrieveConfig(t, bob, query, 10, config)
+	if len(bobAnswer.Data.Results) == 0 {
+		t.Fatal("bob received no results, want the Documents he can read")
+	}
+	bobDocs := map[string]bool{}
+	for _, result := range bobAnswer.Data.Results {
+		bobDocs[result.DocumentID] = true
+		if result.DocumentID == secretID || secretChunkIDs[result.ChunkID] {
+			t.Errorf("bob received Chunk %s of alice's Restricted Document", result.ChunkID)
+		}
+		if result.ParentChunkID != "" && secretParentIDs[result.ParentChunkID] {
+			t.Errorf("bob received Parent Chunk %s of alice's Restricted Document", result.ParentChunkID)
+		}
+		if strings.Contains(strings.ToLower(result.Content), "thuế thu nhập cá nhân") {
+			t.Errorf("bob received the Restricted Document's content: %q", result.Content)
+		}
+	}
+	if !bobDocs[sharedID] || !bobDocs[bobID] {
+		t.Errorf("bob's results = %v, want the shared %s and his own %s", bobDocs, sharedID, bobID)
+	}
+
+	// The trace names no Chunk or Parent Chunk of the Restricted Document.
+	trace := bobAnswer.Data.Trace
+	step := trace[len(trace)-1]
+	if step.Step != "expand_parents" {
+		t.Fatalf("last trace step = %+v, want expand_parents", step)
+	}
+	for _, expansion := range step.Expanded {
+		if secretChunkIDs[expansion.ChunkID] {
+			t.Errorf("bob's expand_parents step names restricted Chunk %s", expansion.ChunkID)
+		}
+		if expansion.ParentChunkID != nil && secretParentIDs[*expansion.ParentChunkID] {
+			t.Errorf("bob's expand_parents step names restricted Parent Chunk %s", *expansion.ParentChunkID)
+		}
+		for _, id := range expansion.MatchedChunkIDs {
+			if secretChunkIDs[id] {
+				t.Errorf("bob's expand_parents step matched restricted Chunk %s", id)
+			}
+		}
+	}
+
+	// Alice does receive the secret's Parent Chunk.
+	aliceAnswer := tr.retrieveConfig(t, alice, query, 10, config)
+	sawSecretParent := false
+	for _, result := range aliceAnswer.Data.Results {
+		if result.ParentChunkID != "" && secretParentIDs[result.ParentChunkID] {
+			sawSecretParent = true
+			if result.DocumentID != secretID {
+				t.Errorf("result over Parent Chunk %s has Document %s, want %s",
+					result.ParentChunkID, result.DocumentID, secretID)
+			}
+		}
+	}
+	if !sawSecretParent {
+		t.Errorf("alice's results = %+v, want a Parent Chunk of her secret Document %s",
+			aliceAnswer.Data.Results, secretID)
 	}
 }
 

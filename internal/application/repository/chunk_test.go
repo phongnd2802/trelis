@@ -107,6 +107,37 @@ func chunkIDs(matches []*types.ChunkMatch) []uuid.UUID {
 	return ids
 }
 
+// parentRow is one Parent Chunk read straight from Postgres.
+type parentRow struct {
+	id              uuid.UUID
+	seq             int
+	content, header string
+	start, end      int
+}
+
+// storedParents returns docID's Parent Chunks in seq order.
+func storedParents(t *testing.T, pool *pgxpool.Pool, docID uuid.UUID) []parentRow {
+	t.Helper()
+	rows, err := pool.Query(context.Background(), `SELECT id, seq, content, context_header, start_offset, end_offset
+FROM parent_chunks WHERE document_id = $1 ORDER BY seq`, docID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var parents []parentRow
+	for rows.Next() {
+		var p parentRow
+		if err := rows.Scan(&p.id, &p.seq, &p.content, &p.header, &p.start, &p.end); err != nil {
+			t.Fatal(err)
+		}
+		parents = append(parents, p)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return parents
+}
+
 func TestReplaceChunksLeavesTheSameSetOnEveryRun(t *testing.T) {
 	s, ids := seeded(t)
 	ctx := context.Background()
@@ -183,28 +214,7 @@ func TestReplaceChunksStoresParentChunksAndLinksChunksToThem(t *testing.T) {
 		t.Fatalf("ReplaceChunks with Parent Chunks: %v", err)
 	}
 
-	type parentRow struct {
-		id              uuid.UUID
-		seq             int
-		content, header string
-		start, end      int
-	}
-	rows, err := pool.Query(ctx, `SELECT id, seq, content, context_header, start_offset, end_offset
-FROM parent_chunks WHERE document_id = $1 ORDER BY seq`, doc.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var parents []parentRow
-	for rows.Next() {
-		var p parentRow
-		if err := rows.Scan(&p.id, &p.seq, &p.content, &p.header, &p.start, &p.end); err != nil {
-			t.Fatal(err)
-		}
-		parents = append(parents, p)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
+	parents := storedParents(t, pool, doc.ID)
 	if len(parents) != len(set.Parents) {
 		t.Fatalf("parent_chunks = %d rows, want %d", len(parents), len(set.Parents))
 	}
@@ -218,7 +228,7 @@ FROM parent_chunks WHERE document_id = $1 ORDER BY seq`, doc.ID)
 	}
 
 	var parentIDs []uuid.UUID
-	rows, err = pool.Query(ctx, `SELECT parent_id FROM chunks WHERE document_id = $1 ORDER BY seq`, doc.ID)
+	rows, err := pool.Query(ctx, `SELECT parent_id FROM chunks WHERE document_id = $1 ORDER BY seq`, doc.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,6 +268,171 @@ FROM parent_chunks WHERE document_id = $1 ORDER BY seq`, doc.ID)
 	}
 	if linked != 0 {
 		t.Errorf("%d Chunks still have a parent_id, want 0", linked)
+	}
+}
+
+func TestChunkSearchesReturnTheParentID(t *testing.T) {
+	ctx := context.Background()
+	pool := dbtest.Migrated(t)
+	s := db.NewStore(pool)
+	owner, err := s.Querier(ctx).CreatePrincipal(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	withParent := document(t, s, owner.ID)
+	withoutParent := document(t, s, owner.ID)
+	chunks := NewChunkRepository(s)
+
+	if err := s.ExecTx(ctx, func(ctx context.Context) error {
+		return chunks.ReplaceChunks(ctx, withParent.ID, types.ChunkSet{
+			Parents: []*types.ParentChunk{
+				{Seq: 0, Content: "Điều 1. Phạm vi điều chỉnh", StartOffset: 0, EndOffset: 28},
+			},
+			Chunks: []*types.Chunk{
+				{Seq: 0, Content: "Điều 1. Phạm vi", StartOffset: 0, EndOffset: 16},
+			},
+			ParentOf: []int{0},
+		})
+	}); err != nil {
+		t.Fatalf("ReplaceChunks with a Parent Chunk: %v", err)
+	}
+	if err := s.ExecTx(ctx, func(ctx context.Context) error {
+		return chunks.ReplaceChunks(ctx, withoutParent.ID, types.ChunkSet{
+			Chunks: []*types.Chunk{
+				{Seq: 0, Content: "Điều 2. Đối tượng", StartOffset: 0, EndOffset: 20},
+			},
+		})
+	}); err != nil {
+		t.Fatalf("ReplaceChunks without Parent Chunks: %v", err)
+	}
+
+	parents := storedParents(t, pool, withParent.ID)
+	if len(parents) != 1 {
+		t.Fatalf("parent_chunks = %d rows, want 1", len(parents))
+	}
+	storedWith, err := chunks.ListUnembeddedChunks(ctx, withParent.ID, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedWithout, err := chunks.ListUnembeddedChunks(ctx, withoutParent.ID, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(storedWith) != 1 || len(storedWithout) != 1 {
+		t.Fatalf("stored Chunks = %d/%d, want one each", len(storedWith), len(storedWithout))
+	}
+	for _, c := range []*types.Chunk{storedWith[0], storedWithout[0]} {
+		if err := chunks.SetChunkEmbedding(ctx, c.ID, []float32{1, 0}, "test-embedding"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	searcher := NewChunkSearcher(s)
+	documentIDs := []uuid.UUID{withParent.ID, withoutParent.ID}
+	dense, err := searcher.SearchDense(ctx, documentIDs, []float32{1, 0}, "test-embedding", 10)
+	if err != nil {
+		t.Fatalf("SearchDense: %v", err)
+	}
+	bm25, err := searcher.SearchBM25(ctx, documentIDs, "Điều", 10)
+	if err != nil {
+		t.Fatalf("SearchBM25: %v", err)
+	}
+
+	for name, matches := range map[string][]*types.ChunkMatch{"dense": dense, "bm25": bm25} {
+		t.Run(name, func(t *testing.T) {
+			byID := make(map[uuid.UUID]*types.ChunkMatch, len(matches))
+			for _, match := range matches {
+				byID[match.Chunk.ID] = match
+			}
+			linked, ok := byID[storedWith[0].ID]
+			if !ok {
+				t.Fatal("the search did not return the Chunk stored with a parent")
+			}
+			if linked.ParentID == nil || *linked.ParentID != parents[0].id {
+				t.Errorf("Chunk with a parent has ParentID = %v, want %s", linked.ParentID, parents[0].id)
+			}
+			standalone, ok := byID[storedWithout[0].ID]
+			if !ok {
+				t.Fatal("the search did not return the Chunk stored without a parent")
+			}
+			if standalone.ParentID != nil {
+				t.Errorf("Chunk without a parent has ParentID = %v, want nil", *standalone.ParentID)
+			}
+		})
+	}
+}
+
+func TestListParentChunksReturnsOnlyReadableDocumentsParents(t *testing.T) {
+	ctx := context.Background()
+	pool := dbtest.Migrated(t)
+	s := db.NewStore(pool)
+	owner, err := s.Querier(ctx).CreatePrincipal(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readable := document(t, s, owner.ID)
+	restricted := document(t, s, owner.ID)
+	chunks := NewChunkRepository(s)
+
+	for _, doc := range []*types.Document{readable, restricted} {
+		set := types.ChunkSet{
+			Parents: []*types.ParentChunk{
+				{Seq: 0, Content: "Điều 1. Phạm vi điều chỉnh", ContextHeader: "Chương I", StartOffset: 0, EndOffset: 28},
+			},
+			Chunks: []*types.Chunk{
+				{Seq: 0, Content: "Điều 1. Phạm vi", ContextHeader: "Chương I", StartOffset: 0, EndOffset: 16},
+			},
+			ParentOf: []int{0},
+		}
+		if doc == readable {
+			set.Parents = append(set.Parents, &types.ParentChunk{
+				Seq: 1, Content: "Điều 2. Đối tượng áp dụng", StartOffset: 29, EndOffset: 55})
+		}
+		if err := s.ExecTx(ctx, func(ctx context.Context) error {
+			return chunks.ReplaceChunks(ctx, doc.ID, set)
+		}); err != nil {
+			t.Fatalf("ReplaceChunks: %v", err)
+		}
+	}
+
+	readableParents := storedParents(t, pool, readable.ID)
+	restrictedParents := storedParents(t, pool, restricted.ID)
+	if len(readableParents) != 2 || len(restrictedParents) != 1 {
+		t.Fatalf("Parent Chunks = %d/%d, want 2 readable and 1 restricted",
+			len(readableParents), len(restrictedParents))
+	}
+
+	got, err := NewChunkSearcher(s).ListParentChunks(ctx, []uuid.UUID{readable.ID},
+		[]uuid.UUID{readableParents[0].id, restrictedParents[0].id, readableParents[1].id})
+	if err != nil {
+		t.Fatalf("ListParentChunks: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ListParentChunks returned %d Parent Chunks, want the 2 readable ones", len(got))
+	}
+	for i, want := range readableParents {
+		parent := got[i]
+		if parent.ID != want.id || parent.DocumentID != readable.ID || parent.Seq != want.seq ||
+			parent.Content != want.content || parent.ContextHeader != want.header ||
+			parent.StartOffset != want.start || parent.EndOffset != want.end {
+			t.Errorf("Parent Chunk %d = %+v, want the stored %+v of Document %s",
+				i, parent, want, readable.ID)
+		}
+		if parent.CreatedAt.IsZero() {
+			t.Errorf("Parent Chunk %d created_at = zero, want the stored creation time", i)
+		}
+	}
+
+	// A parent of a Document outside documentIDs is left out even when its ID
+	// was asked for, which is the defense in depth for ADR-0004.
+	none, err := NewChunkSearcher(s).ListParentChunks(ctx, []uuid.UUID{restricted.ID},
+		[]uuid.UUID{readableParents[0].id})
+	if err != nil || len(none) != 0 {
+		t.Errorf("ListParentChunks with another Document's parent = %+v, %v; want nothing", none, err)
+	}
+	if unknown, err := NewChunkSearcher(s).ListParentChunks(ctx, []uuid.UUID{readable.ID},
+		[]uuid.UUID{uuid.New()}); err != nil || len(unknown) != 0 {
+		t.Errorf("ListParentChunks with an unknown parent = %+v, %v; want nothing", unknown, err)
 	}
 }
 
